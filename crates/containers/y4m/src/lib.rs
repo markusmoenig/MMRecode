@@ -155,6 +155,7 @@ fn parse_chroma(value: &str) -> Result<PixelFormat> {
     match value {
         "mono" => Ok(PixelFormat::Gray8),
         "420jpeg" | "420" => Ok(PixelFormat::Yuv420p8),
+        "411" => Ok(PixelFormat::Yuv411p8),
         "422" => Ok(PixelFormat::Yuv422p8),
         "444" => Ok(PixelFormat::Yuv444p8),
         _ => Err(Error::Unsupported(format!(
@@ -257,6 +258,7 @@ fn chroma_tag(format: PixelFormat) -> Result<&'static str> {
     match format {
         PixelFormat::Gray8 => Ok("Cmono"),
         PixelFormat::Yuv420p8 => Ok("C420jpeg"),
+        PixelFormat::Yuv411p8 => Ok("C411"),
         PixelFormat::Yuv422p8 => Ok("C422"),
         PixelFormat::Yuv444p8 => Ok("C444"),
         PixelFormat::Rgb24 => Err(Error::Unsupported(
@@ -311,6 +313,7 @@ fn plane_dimensions(
     height: usize,
 ) -> Result<Vec<(usize, usize)>> {
     let half_width = width.div_ceil(2);
+    let quarter_width = width.div_ceil(4);
     let half_height = height.div_ceil(2);
     match format {
         PixelFormat::Gray8 => Ok(vec![(width, height)]),
@@ -318,6 +321,11 @@ fn plane_dimensions(
             (width, height),
             (half_width, half_height),
             (half_width, half_height),
+        ]),
+        PixelFormat::Yuv411p8 => Ok(vec![
+            (width, height),
+            (quarter_width, height),
+            (quarter_width, height),
         ]),
         PixelFormat::Yuv422p8 => Ok(vec![
             (width, height),

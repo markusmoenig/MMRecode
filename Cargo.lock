@@ -1405,6 +1405,7 @@ name = "mmrecode-capi"
 version = "0.0.1"
 dependencies = [
  "mmrecode-core",
+ "mmrecode-dv",
  "mmrecode-mjpeg",
 ]
 
@@ -1413,6 +1414,7 @@ name = "mmrecode-cli"
 version = "0.0.1"
 dependencies = [
  "mmrecode-core",
+ "mmrecode-dv",
  "mmrecode-mjpeg",
  "mmrecode-quality",
  "mmrecode-y4m",
@@ -1421,6 +1423,14 @@ dependencies = [
 [[package]]
 name = "mmrecode-core"
 version = "0.0.1"
+
+[[package]]
+name = "mmrecode-dv"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-bitstream",
+ "mmrecode-core",
+]
 
 [[package]]
 name = "mmrecode-mjpeg"
@@ -1452,6 +1462,7 @@ version = "0.0.1"
 dependencies = [
  "eframe",
  "mmrecode-core",
+ "mmrecode-dv",
  "mmrecode-mjpeg",
  "mmrecode-y4m",
 ]

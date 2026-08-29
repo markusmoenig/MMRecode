@@ -8,6 +8,8 @@ pub enum PixelFormat {
     Gray8,
     /// Planar 8-bit 4:2:0 YCbCr.
     Yuv420p8,
+    /// Planar 8-bit 4:1:1 YCbCr.
+    Yuv411p8,
     /// Planar 8-bit 4:2:2 YCbCr.
     Yuv422p8,
     /// Planar 8-bit 4:4:4 YCbCr.

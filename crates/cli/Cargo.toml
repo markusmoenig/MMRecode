@@ -14,10 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 mmrecode-core.workspace = true
+mmrecode-dv.workspace = true
 mmrecode-mjpeg.workspace = true
 mmrecode-quality.workspace = true
 mmrecode-y4m.workspace = true
 
 [lints]
 workspace = true
-

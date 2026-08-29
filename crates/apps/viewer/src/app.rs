@@ -5,7 +5,7 @@ use mmrecode_mjpeg::{HuffmanTableClass, Marker, QuantizationPrecision, SegmentDa
 
 use crate::{
     display::{self, DisplayMode},
-    document::{Document, JpegInspection},
+    document::{Document, DvInspection, JpegInspection},
 };
 
 pub(crate) struct ViewerApp {
@@ -18,6 +18,7 @@ pub(crate) struct ViewerApp {
     fit_to_window: bool,
     zoom: f32,
     block_grid: bool,
+    dv_structure: bool,
     pixel_description: Option<String>,
     status: Status,
 }
@@ -46,6 +47,7 @@ impl ViewerApp {
             fit_to_window: true,
             zoom: 1.0,
             block_grid: false,
+            dv_structure: false,
             pixel_description: None,
             status: Status::Ready,
         };
@@ -64,6 +66,7 @@ impl ViewerApp {
                 self.document = Some(document);
                 self.frame_index = 0;
                 self.display_mode = DisplayMode::Composite;
+                self.dv_structure = false;
                 self.pixel_description = None;
                 self.status = Status::Info(format!("Loaded {frame_count} {kind} frame(s)"));
                 self.refresh_texture(context);
@@ -88,7 +91,8 @@ impl ViewerApp {
             self.texture = None;
             return;
         };
-        match display::color_image(&record.frame, self.display_mode) {
+        let frame = display_frame(record, self.dv_structure);
+        match display::color_image(frame, self.display_mode) {
             Ok(image) => {
                 self.texture_generation += 1;
                 let name = format!("mmrecode-frame-{}", self.texture_generation);
@@ -120,7 +124,7 @@ impl ViewerApp {
             let path_response = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
                     .desired_width(360.0)
-                    .hint_text("JPEG, MJPEG, or Y4M path"),
+                    .hint_text("Raw DV, JPEG, MJPEG, or Y4M path"),
             );
             let open_requested = ui.button("Open").clicked()
                 || (path_response.lost_focus()
@@ -148,14 +152,20 @@ impl ViewerApp {
 
             ui.separator();
             let old_mode = self.display_mode;
-            let plane_count = self
+            let current_record = self
                 .document
                 .as_ref()
-                .and_then(|document| document.frames.get(self.frame_index))
-                .map_or(0, |record| record.frame.planes.len());
+                .and_then(|document| document.frames.get(self.frame_index));
+            let current_frame =
+                current_record.map(|record| display_frame(record, self.dv_structure));
+            let plane_count = current_frame.map_or(0, |frame| frame.planes.len());
+            let packed_rgb = current_frame
+                .is_some_and(|frame| frame.format == mmrecode_core::PixelFormat::Rgb24);
+            let has_dv = current_record.is_some_and(|record| record.dv.is_some());
             for mode in DisplayMode::ALL {
                 let enabled = match mode {
-                    DisplayMode::Composite | DisplayMode::Luma => plane_count >= 1,
+                    DisplayMode::Composite => plane_count >= 1,
+                    DisplayMode::Luma => plane_count >= 1 && !packed_rgb,
                     DisplayMode::ChromaBlue => plane_count >= 2,
                     DisplayMode::ChromaRed => plane_count >= 3,
                 };
@@ -177,6 +187,14 @@ impl ViewerApp {
                     .suffix("×"),
             );
             ui.checkbox(&mut self.block_grid, "8×8 grid");
+            let old_structure = self.dv_structure;
+            ui.add_enabled_ui(has_dv, |ui| {
+                ui.checkbox(&mut self.dv_structure, "DIF map");
+            });
+            if old_structure != self.dv_structure {
+                self.display_mode = DisplayMode::Composite;
+                self.refresh_texture(ui.ctx());
+            }
         });
     }
 
@@ -200,7 +218,7 @@ impl ViewerApp {
                     self.refresh_texture(ui.ctx());
                 }
             } else {
-                ui.label("Drop a JPEG, MJPEG, or Y4M file here, or enter its path above.");
+                ui.label("Drop a raw DV, JPEG, MJPEG, or Y4M file here, or enter its path above.");
             }
 
             ui.separator();
@@ -278,6 +296,9 @@ impl ViewerApp {
         if let Some(jpeg) = &record.jpeg {
             show_jpeg_inspection(ui, jpeg);
         }
+        if let Some(dv) = &record.dv {
+            show_dv_inspection(ui, dv);
+        }
     }
 
     #[allow(
@@ -293,7 +314,8 @@ impl ViewerApp {
             return;
         };
         let record = &document.frames[self.frame_index];
-        let Some((width, height)) = display::dimensions(&record.frame, self.display_mode) else {
+        let frame = display_frame(record, self.dv_structure);
+        let Some((width, height)) = display::dimensions(frame, self.display_mode) else {
             return;
         };
         let Some(texture) = &self.texture else {
@@ -330,12 +352,8 @@ impl ViewerApp {
                         .clamp(0.0, 0.999_999);
                     let x = (relative_x * width as f32) as usize;
                     let y = (relative_y * height as f32) as usize;
-                    pixel_description = Some(display::pixel_description(
-                        &record.frame,
-                        self.display_mode,
-                        x,
-                        y,
-                    ));
+                    pixel_description =
+                        Some(display::pixel_description(frame, self.display_mode, x, y));
                 }
             });
         self.pixel_description = pixel_description;
@@ -365,6 +383,61 @@ impl ViewerApp {
         if direction != 0 {
             self.move_frame(direction, context);
         }
+    }
+}
+
+fn display_frame(
+    record: &crate::document::FrameRecord,
+    dv_structure: bool,
+) -> &mmrecode_core::VideoFrame {
+    if dv_structure && let Some(dv) = &record.dv {
+        &dv.dif_map
+    } else {
+        &record.frame
+    }
+}
+
+fn show_dv_inspection(ui: &mut egui::Ui, dv: &DvInspection) {
+    ui.separator();
+    ui.label(RichText::new("DV structure").strong());
+    let rate = dv.profile.frame_rate();
+    ui.monospace(format!(
+        "source 0x{:08x}..0x{:08x} ({} bytes)",
+        dv.source_range.start,
+        dv.source_range.end,
+        dv.source_range.len()
+    ));
+    ui.monospace(format!(
+        "{:?}: {}×{} {:?}, {}/{} fps",
+        dv.profile.system,
+        dv.profile.width,
+        dv.profile.height,
+        dv.profile.pixel_format,
+        rate.numerator(),
+        rate.denominator()
+    ));
+    ui.monospace(format!(
+        "{} DIF sequences, {} packs, {} issue(s), {} concealed segment(s)",
+        dv.profile.dif_sequences,
+        dv.pack_count,
+        dv.issues.len(),
+        dv.concealed_video_segments
+    ));
+    if let Some(timecode) = dv.timecode {
+        let separator = if timecode.drop_frame { ';' } else { ':' };
+        ui.monospace(format!(
+            "TC {:02}:{:02}:{:02}{separator}{:02}",
+            timecode.hours, timecode.minutes, timecode.seconds, timecode.frames
+        ));
+    }
+    if let Some((pairs, rate, samples)) = dv.audio {
+        ui.monospace(format!(
+            "Audio: {pairs} stereo pair(s), {rate} Hz, {samples} samples/ch"
+        ));
+    }
+    ui.small("DIF map: header blue, subcode violet, VAUX cyan, audio amber, video green, reserved/error red.");
+    for issue in dv.issues.iter().take(8) {
+        ui.monospace(format!("0x{:08x}: {:?}", issue.offset, issue.kind));
     }
 }
 

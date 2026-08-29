@@ -32,6 +32,7 @@ const PIXEL_FORMAT_GRAY8: u32 = 1;
 const PIXEL_FORMAT_YUV420P8: u32 = 2;
 const PIXEL_FORMAT_YUV422P8: u32 = 3;
 const PIXEL_FORMAT_YUV444P8: u32 = 4;
+const PIXEL_FORMAT_YUV411P8: u32 = 5;
 
 const COLOR_RANGE_UNSPECIFIED: u32 = 0;
 const COLOR_RANGE_FULL: u32 = 1;
@@ -322,6 +323,24 @@ pub unsafe extern "C" fn mmr_mjpeg_decode(
     })
 }
 
+/// Decodes one complete raw DV25 frame into library-owned planes.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes. `out_frame` must be writable,
+/// zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_dv_decode(
+    data: *const u8,
+    len: usize,
+    out_frame: *mut MmrVideoFrame,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { dv_decode_impl(data, len, out_frame) }
+    })
+}
+
 /// Releases all allocations held by a decoded C video frame.
 ///
 /// A null pointer is ignored. A valid frame is reset so repeated calls are
@@ -361,6 +380,23 @@ pub unsafe extern "C" fn mmr_mjpeg_encode(
         // SAFETY: pointer validation and all dereferences are centralized in
         // the implementation, under the caller contract above.
         unsafe { mjpeg_encode_impl(frame, quality, out_buffer) }
+    })
+}
+
+/// Encodes one borrowed native-layout frame as a raw DV25 frame.
+///
+/// # Safety
+///
+/// `frame` and its planes must remain readable for the call. `out_buffer`
+/// must be writable, zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_dv_encode(
+    frame: *const MmrVideoFrameView,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { dv_encode_impl(frame, out_buffer) }
     })
 }
 
@@ -432,6 +468,31 @@ unsafe fn mjpeg_decode_impl(
     Ok(())
 }
 
+unsafe fn dv_decode_impl(
+    data: *const u8,
+    len: usize,
+    out_frame: *mut MmrVideoFrame,
+) -> ApiResult<()> {
+    if out_frame.is_null() {
+        return Err(ApiError::InvalidArgument("out_frame is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output pointer.
+    let out_frame = unsafe { &mut *out_frame };
+    if out_frame.struct_size != size_of::<MmrVideoFrame>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "out_frame struct_size is {}, expected {}",
+            out_frame.struct_size,
+            size_of::<MmrVideoFrame>()
+        )));
+    }
+    *out_frame = MmrVideoFrame::empty();
+    let input = unsafe { borrowed_bytes(data, len, "data")? };
+    let parsed = mmrecode_dv::parse_frame(input)?;
+    let decoded = mmrecode_dv::decode_video(&parsed)?;
+    *out_frame = MmrVideoFrame::from_video_frame(decoded)?;
+    Ok(())
+}
+
 unsafe fn mjpeg_encode_impl(
     frame: *const MmrVideoFrameView,
     quality: u8,
@@ -467,6 +528,39 @@ unsafe fn mjpeg_encode_impl(
     Ok(())
 }
 
+unsafe fn dv_encode_impl(
+    frame: *const MmrVideoFrameView,
+    out_buffer: *mut MmrBuffer,
+) -> ApiResult<()> {
+    if frame.is_null() {
+        return Err(ApiError::InvalidArgument("frame is null".into()));
+    }
+    if out_buffer.is_null() {
+        return Err(ApiError::InvalidArgument("out_buffer is null".into()));
+    }
+    // SAFETY: the caller guarantees readable/writable structure pointers.
+    let (frame, out_buffer) = unsafe { (&*frame, &mut *out_buffer) };
+    if frame.struct_size != size_of::<MmrVideoFrameView>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "frame struct_size is {}, expected {}",
+            frame.struct_size,
+            size_of::<MmrVideoFrameView>()
+        )));
+    }
+    if out_buffer.struct_size != size_of::<MmrBuffer>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "out_buffer struct_size is {}, expected {}",
+            out_buffer.struct_size,
+            size_of::<MmrBuffer>()
+        )));
+    }
+    *out_buffer = MmrBuffer::empty();
+    let frame = unsafe { video_frame_from_view(frame)? };
+    let encoded = mmrecode_dv::encode_video(&frame)?;
+    *out_buffer = MmrBuffer::from_vec(encoded.data);
+    Ok(())
+}
+
 unsafe fn video_frame_from_view(view: &MmrVideoFrameView) -> ApiResult<VideoFrame> {
     if view.plane_count > MAX_PLANES {
         return Err(ApiError::InvalidArgument(format!(
@@ -478,7 +572,10 @@ unsafe fn video_frame_from_view(view: &MmrVideoFrameView) -> ApiResult<VideoFram
     let range = color_range_from_c(view.range)?;
     let expected_planes = match format {
         PixelFormat::Gray8 => 1,
-        PixelFormat::Yuv420p8 | PixelFormat::Yuv422p8 | PixelFormat::Yuv444p8 => 3,
+        PixelFormat::Yuv420p8
+        | PixelFormat::Yuv411p8
+        | PixelFormat::Yuv422p8
+        | PixelFormat::Yuv444p8 => 3,
         PixelFormat::Rgb24 => unreachable!("C API does not expose packed RGB"),
         _ => {
             return Err(ApiError::InvalidArgument(
@@ -565,6 +662,7 @@ fn pixel_format_from_c(format: u32) -> ApiResult<PixelFormat> {
     match format {
         PIXEL_FORMAT_GRAY8 => Ok(PixelFormat::Gray8),
         PIXEL_FORMAT_YUV420P8 => Ok(PixelFormat::Yuv420p8),
+        PIXEL_FORMAT_YUV411P8 => Ok(PixelFormat::Yuv411p8),
         PIXEL_FORMAT_YUV422P8 => Ok(PixelFormat::Yuv422p8),
         PIXEL_FORMAT_YUV444P8 => Ok(PixelFormat::Yuv444p8),
         _ => Err(ApiError::InvalidArgument(format!(
@@ -577,6 +675,7 @@ fn pixel_format_to_c(format: PixelFormat) -> ApiResult<u32> {
     match format {
         PixelFormat::Gray8 => Ok(PIXEL_FORMAT_GRAY8),
         PixelFormat::Yuv420p8 => Ok(PIXEL_FORMAT_YUV420P8),
+        PixelFormat::Yuv411p8 => Ok(PIXEL_FORMAT_YUV411P8),
         PixelFormat::Yuv422p8 => Ok(PIXEL_FORMAT_YUV422P8),
         PixelFormat::Yuv444p8 => Ok(PIXEL_FORMAT_YUV444P8),
         PixelFormat::Rgb24 => Err(ApiError::Core(Error::Unsupported(
@@ -612,6 +711,7 @@ mod tests {
     use super::*;
 
     const JPEG: &[u8] = include_bytes!("../../../testdata/jpeg/valid/baseline-420.jpg");
+    const DV: &[u8] = include_bytes!("../../../testdata/dv/valid/dv25-525-60-one-frame.dv");
 
     #[test]
     fn c_boundary_decodes_and_reencodes_a_frame() {
@@ -654,6 +754,46 @@ mod tests {
         }
         assert!(encoded.data.is_null());
         assert!(decoded.planes[0].data.is_null());
+    }
+
+    #[test]
+    fn c_boundary_decodes_and_reencodes_dv25() {
+        let mut decoded = MmrVideoFrame::empty();
+        // SAFETY: all input and output pointers refer to live Rust objects.
+        let status = unsafe { mmr_dv_decode(DV.as_ptr(), DV.len(), &raw mut decoded) };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(decoded.format, PIXEL_FORMAT_YUV411P8);
+        assert_eq!((decoded.width, decoded.height), (720, 480));
+
+        let mut views = [MmrPlaneView::empty(); MAX_PLANES];
+        for (view, plane) in views.iter_mut().zip(decoded.planes) {
+            *view = MmrPlaneView {
+                data: plane.data,
+                data_len: plane.data_len,
+                stride: plane.stride,
+                width: plane.width,
+                height: plane.height,
+            };
+        }
+        let view = MmrVideoFrameView {
+            struct_size: size_of::<MmrVideoFrameView>(),
+            format: decoded.format,
+            range: decoded.range,
+            width: decoded.width,
+            height: decoded.height,
+            plane_count: decoded.plane_count,
+            planes: views,
+        };
+        let mut encoded = MmrBuffer::empty();
+        // SAFETY: all borrowed input storage remains live for the call.
+        let status = unsafe { mmr_dv_encode(&raw const view, &raw mut encoded) };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(encoded.len, 120_000);
+        // SAFETY: both allocations originated from this library and are freed once.
+        unsafe {
+            mmr_buffer_free(&raw mut encoded);
+            mmr_video_frame_free(&raw mut decoded);
+        }
     }
 
     #[test]

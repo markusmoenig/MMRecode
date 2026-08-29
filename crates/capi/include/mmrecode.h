@@ -37,6 +37,7 @@ typedef uint32_t mmr_pixel_format;
 #define MMR_PIXEL_FORMAT_YUV420P8 ((mmr_pixel_format)2u)
 #define MMR_PIXEL_FORMAT_YUV422P8 ((mmr_pixel_format)3u)
 #define MMR_PIXEL_FORMAT_YUV444P8 ((mmr_pixel_format)4u)
+#define MMR_PIXEL_FORMAT_YUV411P8 ((mmr_pixel_format)5u)
 
 typedef uint32_t mmr_color_range;
 
@@ -112,6 +113,12 @@ MMR_API mmr_status mmr_mjpeg_decode(
     size_t len,
     mmr_video_frame *out_frame);
 
+/* Decodes one complete 120000- or 144000-byte raw DV25 frame. */
+MMR_API mmr_status mmr_dv_decode(
+    const uint8_t *data,
+    size_t len,
+    mmr_video_frame *out_frame);
+
 /* Releases all allocations in a frame returned by mmr_mjpeg_decode. */
 MMR_API void mmr_video_frame_free(mmr_video_frame *frame);
 
@@ -123,6 +130,11 @@ MMR_API void mmr_video_frame_free(mmr_video_frame *frame);
 MMR_API mmr_status mmr_mjpeg_encode(
     const mmr_video_frame_view *frame,
     uint8_t quality,
+    mmr_buffer *out_buffer);
+
+/* Encodes a native 720x480 YUV411P8 or 720x576 YUV420P8 frame as raw DV25. */
+MMR_API mmr_status mmr_dv_encode(
+    const mmr_video_frame_view *frame,
     mmr_buffer *out_buffer);
 
 /* Releases the allocation in a buffer returned by mmr_mjpeg_encode. */

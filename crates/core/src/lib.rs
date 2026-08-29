@@ -4,6 +4,7 @@
 //! that allow demuxers, codecs, renderers, and muxers to exchange data without depending on one
 //! another.
 
+mod audio;
 mod codec;
 mod container;
 mod dependency;
@@ -14,6 +15,7 @@ mod pixel;
 mod stream;
 mod time;
 
+pub use audio::{AudioFrame, AudioSampleFormat};
 pub use codec::{Decoder, Encoder, VideoEncoderSettings};
 pub use container::{Demuxer, Muxer, SeekResult};
 pub use dependency::{

@@ -23,21 +23,23 @@ fn run() -> Result<(), String> {
         Some("inspect") => {
             let path = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode inspect <jpeg-file>".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode inspect <media-file>".to_owned())?;
             if arguments.next().is_some() {
-                return Err("usage: mmrecode inspect <jpeg-file>".to_owned());
+                return Err("usage: mmrecode inspect <media-file>".to_owned());
             }
             inspect(std::path::Path::new(&path))
         }
+        Some("extract-dv-audio") => extract_dv_audio_command(&mut arguments),
+        Some("encode-dv") => encode_dv_command(&mut arguments),
         Some("decode") => {
             let input = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode decode <jpeg-file> <output.y4m>".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned())?;
             let output = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode decode <jpeg-file> <output.y4m>".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned())?;
             if arguments.next().is_some() {
-                return Err("usage: mmrecode decode <jpeg-file> <output.y4m>".to_owned());
+                return Err("usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned());
             }
             decode(std::path::Path::new(&input), std::path::Path::new(&output))
         }
@@ -102,6 +104,105 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn encode_dv_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode encode-dv <input.y4m> <output.dv>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    encode_dv(std::path::Path::new(&input), std::path::Path::new(&output))
+}
+
+fn encode_dv(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let file = std::fs::File::open(input)
+        .map_err(|error| format!("cannot open '{}': {error}", input.display()))?;
+    let mut reader = mmrecode_y4m::Y4mReader::new(std::io::BufReader::new(file));
+    let mut encoded_stream = Vec::new();
+    let mut frame_count = 0;
+    while let Some(frame) = reader.read_frame().map_err(|error| error.to_string())? {
+        let encoded = mmrecode_dv::encode_video(&frame).map_err(|error| error.to_string())?;
+        let report = mmrecode_quality::compare_video_frames(&frame, &encoded.reconstructed)
+            .map_err(|error| error.to_string())?;
+        println!("Frame {}: {}", frame_count + 1, quality_summary(&report));
+        encoded_stream.extend_from_slice(&encoded.data);
+        frame_count += 1;
+    }
+    if frame_count == 0 {
+        return Err("Y4M input contains no frames".to_owned());
+    }
+    std::fs::File::create(output)
+        .and_then(|mut file| file.write_all(&encoded_stream))
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    println!(
+        "Encoded {frame_count} Y4M frame(s) as raw DV to {} ({} bytes)",
+        output.display(),
+        encoded_stream.len()
+    );
+    Ok(())
+}
+
+fn extract_dv_audio_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode extract-dv-audio <input.dv> <output.s16le>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    extract_dv_audio(std::path::Path::new(&input), std::path::Path::new(&output))
+}
+
+fn extract_dv_audio(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let bytes = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let profile = mmrecode_dv::detect_profile_prefix(&bytes).map_err(|error| error.to_string())?;
+    if !bytes.len().is_multiple_of(profile.frame_size) {
+        return Err("raw DV input ends with an incomplete frame".to_owned());
+    }
+    let mut pcm = Vec::new();
+    let mut sample_rate = None;
+    let mut samples_per_channel = 0_usize;
+    for (index, data) in bytes.chunks_exact(profile.frame_size).enumerate() {
+        let frame = mmrecode_dv::parse_frame(data).map_err(|error| error.to_string())?;
+        let audio = mmrecode_dv::extract_audio(&frame).map_err(|error| error.to_string())?;
+        if audio.len() != 1 {
+            return Err(format!(
+                "frame {} contains {} stereo pairs; raw extraction currently requires one",
+                index + 1,
+                audio.len()
+            ));
+        }
+        let audio = &audio[0];
+        if sample_rate.is_some_and(|rate| rate != audio.sample_rate) {
+            return Err(format!("audio sample rate changes at frame {}", index + 1));
+        }
+        sample_rate = Some(audio.sample_rate);
+        samples_per_channel += audio.samples_per_channel;
+        pcm.reserve(audio.samples.len() * 2);
+        for sample in &audio.samples {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    std::fs::File::create(output)
+        .and_then(|mut file| file.write_all(&pcm))
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    println!(
+        "Extracted {} stereo samples/channel at {} Hz to {} (signed 16-bit little-endian)",
+        samples_per_channel,
+        sample_rate.unwrap_or(0),
+        output.display()
+    );
+    Ok(())
+}
+
 fn decode(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -109,6 +210,9 @@ fn decode(input: &std::path::Path, output: &std::path::Path) -> Result<(), Strin
         .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
     if bytes.is_empty() {
         return Err("input contains no JPEG frames".to_owned());
+    }
+    if mmrecode_dv::detect_profile_prefix(&bytes).is_ok() {
+        return decode_dv(input, output, &bytes);
     }
     let file = std::fs::File::create(output)
         .map_err(|error| format!("cannot create '{}': {error}", output.display()))?;
@@ -133,6 +237,40 @@ fn decode(input: &std::path::Path, output: &std::path::Path) -> Result<(), Strin
         .map_err(|error| format!("cannot finish '{}': {error}", output.display()))?;
     println!(
         "Decoded {frame_count} JPEG frame(s) to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn decode_dv(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let profile = mmrecode_dv::detect_profile_prefix(bytes).map_err(|error| error.to_string())?;
+    if !bytes.len().is_multiple_of(profile.frame_size) {
+        return Err(format!(
+            "'{}' ends with an incomplete raw DV frame",
+            input.display()
+        ));
+    }
+    let file = std::fs::File::create(output)
+        .map_err(|error| format!("cannot create '{}': {error}", output.display()))?;
+    let mut y4m = mmrecode_y4m::Y4mWriter::new(std::io::BufWriter::new(file));
+    let mut frame_count = 0;
+    for data in bytes.chunks_exact(profile.frame_size) {
+        let parsed = mmrecode_dv::parse_frame(data).map_err(|error| error.to_string())?;
+        let frame = mmrecode_dv::decode_video(&parsed).map_err(|error| error.to_string())?;
+        y4m.write_frame(&frame).map_err(|error| error.to_string())?;
+        frame_count += 1;
+    }
+    y4m.into_inner()
+        .flush()
+        .map_err(|error| format!("cannot finish '{}': {error}", output.display()))?;
+    println!(
+        "Decoded {frame_count} raw DV frame(s) to {}",
         output.display()
     );
     Ok(())
@@ -304,7 +442,10 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("cannot read '{}': {error}", path.display()))?;
     if bytes.is_empty() {
-        return Err("input contains no JPEG frames".to_owned());
+        return Err("input is empty".to_owned());
+    }
+    if mmrecode_dv::detect_profile_prefix(&bytes).is_ok() {
+        return inspect_dv(path, &bytes);
     }
     let multiple_frames = !mmrecode_mjpeg::parse_jpeg(&bytes)
         .map_err(|error| error.to_string())?
@@ -331,6 +472,108 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     if multiple_frames {
         println!("Motion JPEG frames: {frame_count}");
     }
+    Ok(())
+}
+
+fn inspect_dv(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::fmt::Write as _;
+
+    use mmrecode_dv::{DifSection, DvPackData};
+
+    let profile = mmrecode_dv::detect_profile_prefix(bytes).map_err(|error| error.to_string())?;
+    if !bytes.len().is_multiple_of(profile.frame_size) {
+        return Err(format!(
+            "raw DV stream has {} trailing byte(s) after complete {}-byte frames",
+            bytes.len() % profile.frame_size,
+            profile.frame_size
+        ));
+    }
+    let mut report = String::new();
+    let frame_count = bytes.len() / profile.frame_size;
+    let rate = profile.frame_rate();
+    let _ = writeln!(report, "DV: {}", path.display());
+    let _ = writeln!(report, "File size: {} bytes", bytes.len());
+    let _ = writeln!(
+        report,
+        "Profile: {:?}, {}x{} {:?}, {}/{} fps",
+        profile.system,
+        profile.width,
+        profile.height,
+        profile.pixel_format,
+        rate.numerator(),
+        rate.denominator()
+    );
+    let _ = writeln!(
+        report,
+        "Frames: {frame_count}, {} bytes/frame, {} DIF sequences/frame",
+        profile.frame_size, profile.dif_sequences
+    );
+    for (frame_index, data) in bytes.chunks_exact(profile.frame_size).enumerate() {
+        let frame = mmrecode_dv::parse_frame(data)
+            .map_err(|error| format!("DV frame {} cannot be parsed: {error}", frame_index + 1))?;
+        let counts = [
+            DifSection::Header,
+            DifSection::Subcode,
+            DifSection::Vaux,
+            DifSection::Audio,
+            DifSection::Video,
+        ]
+        .map(|section| {
+            frame
+                .blocks()
+                .iter()
+                .filter(|block| block.id.section == section)
+                .count()
+        });
+        let timecode = frame.packs().iter().find_map(|pack| match pack.data {
+            DvPackData::Timecode(value) => Some(value),
+            _ => None,
+        });
+        let audio = mmrecode_dv::extract_audio(&frame).ok();
+        let _ = writeln!(
+            report,
+            "Frame {} @ 0x{:08x}: DIF H/S/V/A/Video = {}/{}/{}/{}/{}, {} issue(s), {} pack(s)",
+            frame_index + 1,
+            frame_index * profile.frame_size,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            frame.issues().len(),
+            frame.packs().len()
+        );
+        if let Some(timecode) = timecode {
+            let separator = if timecode.drop_frame { ';' } else { ':' };
+            let _ = writeln!(
+                report,
+                "  Timecode: {:02}:{:02}:{:02}{separator}{:02}",
+                timecode.hours, timecode.minutes, timecode.seconds, timecode.frames
+            );
+        }
+        if let Some(audio) = audio
+            && let Some(first) = audio.first()
+        {
+            let _ = writeln!(
+                report,
+                "  Audio: {} stereo pair(s), {} Hz, {} samples/channel",
+                audio.len(),
+                first.sample_rate,
+                first.samples_per_channel
+            );
+        }
+        for issue in frame.issues().iter().take(8) {
+            let _ = writeln!(
+                report,
+                "  Issue at frame byte 0x{:08x}: {:?}",
+                issue.offset, issue.kind
+            );
+        }
+        if frame.issues().len() > 8 {
+            let _ = writeln!(report, "  … {} more issue(s)", frame.issues().len() - 8);
+        }
+    }
+    print!("{report}");
     Ok(())
 }
 
@@ -470,8 +713,10 @@ fn print_help() {
     println!(
         "MMRecode media-codec tools\n\n\
          Usage: mmrecode <command> [arguments]\n\n\
-         Available commands:\n  inspect <jpeg-file>  Inspect JPEG syntax without decoding pixels\n  \
-         decode <mjpg> <y4m>  Decode baseline JPEG frame(s) to YUV4MPEG2\n  \
+         Available commands:\n  inspect <media-file>  Inspect JPEG/MJPEG or raw DV syntax\n  \
+         extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
+         decode <mjpg-or-dv> <y4m>  Decode JPEG or raw DV frame(s) to YUV4MPEG2\n  \
+         encode-dv <y4m> <dv>  Encode native-layout Y4M frame(s) as raw DV25\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <mjpg> [reference.y4m]  Verify syntax, reconstruction, and optional quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \

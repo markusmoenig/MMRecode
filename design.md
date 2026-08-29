@@ -77,7 +77,8 @@ crates/
 ├── core/                    mmrecode-core
 ├── bitstream/               mmrecode-bitstream
 ├── codecs/
-│   └── mjpeg/               mmrecode-mjpeg
+│   ├── mjpeg/               mmrecode-mjpeg
+│   └── dv/                  mmrecode-dv; active raw-DV25 slice
 ├── containers/
 │   └── y4m/                 mmrecode-y4m
 ├── quality/                 mmrecode-quality
@@ -146,8 +147,9 @@ The scaffold uses owned `Vec<u8>` planes to keep the first API understandable. A
 abstraction may add reference-counted pools, aligned allocations, hardware surfaces, and borrowed
 views. Such optimization must not leak backend-specific behavior into codec algorithms.
 
-Audio frames will be added before container editing. Containers must already allow audio and data
-streams even while the first codec is video-only.
+`AudioFrame` uses owned interleaved sample storage for the same clarity-first reason as
+`VideoFrame`. DV is the first consumer because its audio is embedded and physically shuffled among
+DIF blocks. Containers must allow audio and data streams without depending on the DV crate.
 
 ### Packets
 

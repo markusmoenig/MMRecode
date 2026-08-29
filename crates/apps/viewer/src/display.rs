@@ -56,6 +56,16 @@ pub(crate) fn pixel_description(
 ) -> String {
     match mode {
         DisplayMode::Composite => {
+            if frame.format == PixelFormat::Rgb24 {
+                let plane = &frame.planes[0];
+                let offset = y * plane.stride + x * 3;
+                return format!(
+                    "DIF block {x}, sequence {y}  RGB {}, {}, {}",
+                    plane.data[offset],
+                    plane.data[offset + 1],
+                    plane.data[offset + 2]
+                );
+            }
             let y_value = sample_scaled(&frame.planes[0], x, y, frame.width, frame.height);
             if frame.planes.len() == 1 {
                 return format!("x {x}, y {y}  Y {y_value}");
@@ -83,7 +93,10 @@ fn composite_image(frame: &VideoFrame) -> Result<ColorImage, String> {
                 }
             }
         }
-        PixelFormat::Yuv420p8 | PixelFormat::Yuv422p8 | PixelFormat::Yuv444p8 => {
+        PixelFormat::Yuv420p8
+        | PixelFormat::Yuv411p8
+        | PixelFormat::Yuv422p8
+        | PixelFormat::Yuv444p8 => {
             let names = ["Y", "Cb", "Cr"];
             if frame.planes.len() != names.len() {
                 return Err(format!(
@@ -105,7 +118,20 @@ fn composite_image(frame: &VideoFrame) -> Result<ColorImage, String> {
             }
         }
         PixelFormat::Rgb24 => {
-            return Err("packed RGB display is not implemented yet".into());
+            let plane = &frame.planes[0];
+            if plane.stride < frame.width * 3 || plane.height < frame.height {
+                return Err("packed RGB plane has an invalid layout".into());
+            }
+            for y in 0..frame.height {
+                for x in 0..frame.width {
+                    let offset = y * plane.stride + x * 3;
+                    let values = plane
+                        .data
+                        .get(offset..offset + 3)
+                        .ok_or_else(|| "packed RGB plane is truncated".to_owned())?;
+                    pixels.push(Color32::from_rgb(values[0], values[1], values[2]));
+                }
+            }
         }
         _ => return Err("pixel format is not supported by the viewer".into()),
     }
