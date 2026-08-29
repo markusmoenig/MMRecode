@@ -25,6 +25,44 @@ impl<'a> BitReader<'a> {
         self.data.len() * 8 - self.bit_position
     }
 
+    /// Returns the absolute bit position from the beginning of the input.
+    #[must_use]
+    pub const fn bit_position(&self) -> usize {
+        self.bit_position
+    }
+
+    /// Returns the byte containing the next unread bit.
+    #[must_use]
+    pub const fn byte_position(&self) -> usize {
+        self.bit_position / 8
+    }
+
+    /// Reads bits without advancing the reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::read_bits`].
+    pub fn peek_bits(&self, count: u8) -> Result<u64> {
+        let mut copy = self.clone();
+        copy.read_bits(count)
+    }
+
+    /// Skips a fixed number of bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input does not contain enough bits.
+    pub fn skip_bits(&mut self, count: usize) -> Result<()> {
+        if count > self.bits_remaining() {
+            return Err(Error::InvalidData(format!(
+                "cannot skip {count} bits with {} remaining",
+                self.bits_remaining()
+            )));
+        }
+        self.bit_position += count;
+        Ok(())
+    }
+
     /// Reads one bit.
     ///
     /// # Errors
@@ -74,5 +112,17 @@ mod tests {
         assert_eq!(reader.read_bits(8).unwrap(), 0b0101_1100);
         assert_eq!(reader.read_bits(4).unwrap(), 0b0011);
         assert_eq!(reader.bits_remaining(), 0);
+    }
+
+    #[test]
+    fn peeks_and_skips_without_losing_position() {
+        let mut reader = BitReader::new(&[0b1010_0101, 0b1100_0011]);
+        assert_eq!(reader.peek_bits(4).unwrap(), 0b1010);
+        assert_eq!(reader.bit_position(), 0);
+        reader.skip_bits(3).unwrap();
+        assert_eq!(reader.bit_position(), 3);
+        assert_eq!(reader.byte_position(), 0);
+        assert_eq!(reader.read_bits(5).unwrap(), 0b0_0101);
+        assert_eq!(reader.byte_position(), 1);
     }
 }

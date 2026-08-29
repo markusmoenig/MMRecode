@@ -92,6 +92,19 @@ typedef struct mmr_buffer {
     size_t len;
 } mmr_buffer;
 
+/* Settings for a complete MPEG-2 Video elementary-stream encode. */
+typedef struct mmr_mpeg2_encode_options {
+    size_t struct_size;
+    uint32_t frame_rate_numerator;
+    uint32_t frame_rate_denominator;
+    uint32_t gop_size;
+    uint32_t b_frames;
+    uint32_t quantiser_scale_code;
+    uint32_t motion_search_range;
+    uint32_t progressive;
+    uint32_t top_field_first;
+} mmr_mpeg2_encode_options;
+
 /* Returns the ABI version implemented by this library. */
 MMR_API uint32_t mmr_abi_version(void);
 
@@ -119,7 +132,23 @@ MMR_API mmr_status mmr_dv_decode(
     size_t len,
     mmr_video_frame *out_frame);
 
-/* Releases all allocations in a frame returned by mmr_mjpeg_decode. */
+/* Returns the number of pictures in a complete MPEG-2 Video elementary stream. */
+MMR_API mmr_status mmr_mpeg2_picture_count(
+    const uint8_t *data,
+    size_t len,
+    size_t *out_count);
+
+/*
+ * Decodes one picture by zero-based presentation order from a complete
+ * MPEG-2 Video elementary stream.
+ */
+MMR_API mmr_status mmr_mpeg2_decode_picture(
+    const uint8_t *data,
+    size_t len,
+    size_t presentation_index,
+    mmr_video_frame *out_frame);
+
+/* Releases all allocations in a frame returned by any MMRecode decoder. */
 MMR_API void mmr_video_frame_free(mmr_video_frame *frame);
 
 /*
@@ -137,7 +166,29 @@ MMR_API mmr_status mmr_dv_encode(
     const mmr_video_frame_view *frame,
     mmr_buffer *out_buffer);
 
-/* Releases the allocation in a buffer returned by mmr_mjpeg_encode. */
+/*
+ * Encodes a complete array of YUV420P8 frames as an MPEG-2 Video elementary
+ * stream. All frames and their plane storage remain caller-owned.
+ */
+MMR_API mmr_status mmr_mpeg2_encode(
+    const mmr_video_frame_view *frames,
+    size_t frame_count,
+    const mmr_mpeg2_encode_options *options,
+    mmr_buffer *out_buffer);
+
+/* Wraps a complete MPEG-2 Video elementary stream in a single-program MPEG-TS. */
+MMR_API mmr_status mmr_mpegts_mux_mpeg2(
+    const uint8_t *data,
+    size_t len,
+    mmr_buffer *out_buffer);
+
+/* Extracts the first MPEG-2 Video elementary stream from a complete MPEG-TS. */
+MMR_API mmr_status mmr_mpegts_demux_mpeg2(
+    const uint8_t *data,
+    size_t len,
+    mmr_buffer *out_buffer);
+
+/* Releases the allocation in a buffer returned by any MMRecode encoder or muxer. */
 MMR_API void mmr_buffer_free(mmr_buffer *buffer);
 
 #ifdef __cplusplus

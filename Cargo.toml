@@ -6,6 +6,8 @@ members = [
     "crates/cli",
     "crates/codecs/dv",
     "crates/codecs/mjpeg",
+    "crates/codecs/mpeg2",
+    "crates/containers/mpegts",
     "crates/containers/y4m",
     "crates/core",
     "crates/quality",
@@ -28,6 +30,8 @@ mmrecode-capi = { path = "crates/capi" }
 mmrecode-core = { path = "crates/core" }
 mmrecode-dv = { path = "crates/codecs/dv" }
 mmrecode-mjpeg = { path = "crates/codecs/mjpeg" }
+mmrecode-mpeg2 = { path = "crates/codecs/mpeg2" }
+mmrecode-mpegts = { path = "crates/containers/mpegts" }
 mmrecode-quality = { path = "crates/quality" }
 mmrecode-testkit = { path = "crates/testkit" }
 mmrecode-y4m = { path = "crates/containers/y4m" }

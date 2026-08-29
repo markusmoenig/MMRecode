@@ -271,6 +271,26 @@ The native `mmrecode-viewer` application provides direct visual inspection of de
 component planes, pixel samples, block boundaries, and JPEG structure. It remains above the codec
 and container libraries in the dependency graph so UI choices cannot shape normative media APIs.
 
+### Subsequent vertical slices
+
+The DV25 slice now covers both 525/60 4:1:1 and 625/50 4:2:0 systems: DIF structure, typed packs,
+timecode, embedded 16-bit and nonlinear 12-bit audio, video reconstruction, deterministic video and
+audio encoding, damage reporting, CLI/viewer/C integration, and independent FFmpeg comparison.
+
+The first MPEG-2 Video slice now covers typed elementary-stream structure, sequence display and
+quant matrices, progressive and interlaced Main Profile 4:2:0 frame pictures, I/P/B reconstruction,
+deterministic constrained Main Profile/Main Level encoding, open/closed GOP references, clean and
+recovery entry points, and explainable bridge-encode propagation. It deliberately stops short of a
+generic timeline/render crate: the dependency data and codec-local smart-render plan prove that the
+future editor can be codec-independent without pretending that packet copy, timestamps, muxing,
+field pictures, dual-prime prediction, or production VBV control are already solved.
+
+The first container slice now covers 188-byte MPEG-2 Transport Stream structure, PAT/PMT program
+discovery, PES and 90 kHz timestamp reconstruction, and deterministic single-program MPEG-2 Video
+muxing. It proves the intended `Packet` boundary in both directions without coupling H.222.0
+systems syntax to the MPEG-2 codec. Audio interleaving, broadcast service tables, live CBR output,
+M2TS, seeking, and other container families remain explicit later work.
+
 ### Continuation criteria
 
 Continue when:

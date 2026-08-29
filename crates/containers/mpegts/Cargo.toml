@@ -1,6 +1,6 @@
 [package]
-name = "mmrecode-viewer"
-description = "Visual codec and frame inspection tool for MMRecode"
+name = "mmrecode-mpegts"
+description = "MPEG-2 Transport Stream demuxing and muxing for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,13 +9,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-eframe.workspace = true
 mmrecode-core.workspace = true
-mmrecode-dv.workspace = true
-mmrecode-mjpeg.workspace = true
+
+[dev-dependencies]
 mmrecode-mpeg2.workspace = true
-mmrecode-mpegts.workspace = true
-mmrecode-y4m.workspace = true
 
 [lints]
 workspace = true

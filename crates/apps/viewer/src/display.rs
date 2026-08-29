@@ -60,7 +60,7 @@ pub(crate) fn pixel_description(
                 let plane = &frame.planes[0];
                 let offset = y * plane.stride + x * 3;
                 return format!(
-                    "DIF block {x}, sequence {y}  RGB {}, {}, {}",
+                    "x {x}, y {y}  RGB {}, {}, {}",
                     plane.data[offset],
                     plane.data[offset + 1],
                     plane.data[offset + 2]

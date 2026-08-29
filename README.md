@@ -4,7 +4,7 @@ MMRecode is an experimental, professional media-codec and editing ecosystem writ
 It begins with independently coded production formats and grows toward inter-frame codecs,
 container support, verification, and minimal-recompression editing.
 
-The project is building its first complete vertical slice. Its purpose and intended scope are described in
+The project is growing through bounded, complete vertical slices. Its purpose and intended scope are described in
 [`concept.md`](concept.md); crate boundaries and dependency rules are described in
 [`design.md`](design.md).
 
@@ -14,6 +14,8 @@ The project is building its first complete vertical slice. Its purpose and inten
 - `mmrecode-bitstream`: bit-level readers, writers, VLC support, and start-code utilities
 - `mmrecode-mjpeg`: the first codec implementation
 - `mmrecode-dv`: raw DV25 DIF parsing, validation, metadata, and embedded audio
+- `mmrecode-mpeg2`: MPEG-2 Video parsing, I/P/B reconstruction/encoding, and dependency planning
+- `mmrecode-mpegts`: 188-byte MPEG-2 Transport Stream demuxing and deterministic muxing
 - `mmrecode-y4m`: simple uncompressed test input and output
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
@@ -36,6 +38,23 @@ embedded audio, reconstructs native 4:1:1/4:2:0 video, and deterministically enc
 samples differ by at most one and extracted PCM is byte-identical for both systems. Raw DV25 is
 also connected to the codec/dependency APIs, CLI, native viewer, and experimental C ABI.
 
+The third vertical slice is implemented in `mmrecode-mpeg2`. It parses MPEG-2 Video elementary
+streams into typed sequence/display/quant-matrix, GOP, picture, extension, and slice structures;
+reconstructs progressive and interlaced Main Profile 4:2:0 frame pictures in presentation order;
+and deterministically encodes constrained Main Profile/Main Level closed-GOP I/P/B streams. Open
+GOP dependencies, recovery points, and bridge-encode propagation are exposed through an
+explainable smart-render plan. Progressive, interlaced, open-GOP, malformed-input, nonzero-motion,
+and native-encoder vectors are checked against FFmpeg. Current limits—including field pictures,
+dual-prime prediction, chroma profiles, and production VBV rate control—are explicit in
+[`crates/codecs/mpeg2/README.md`](crates/codecs/mpeg2/README.md).
+
+The first container slice is implemented in `mmrecode-mpegts`. It validates 188-byte transport
+packets, continuity, PAT/PMT PSI and CRCs; discovers programs and streams; reassembles MPEG-2 PES
+with PTS/DTS and PCR timing; and deterministically muxes a timed single-program MPEG-2 Video stream.
+Native output is accepted by FFmpeg, while an independent FFmpeg vector exercises demuxing. The
+current audio, M2TS, service-table, scrambling, CBR, and seeking boundaries are documented in
+[`crates/containers/mpegts/README.md`](crates/containers/mpegts/README.md).
+
 The current codec subset is eight-bit baseline sequential JPEG with a single interleaved scan.
 Progressive and multi-scan JPEG, unusual component layouts, CMYK conversion, optimized Huffman
 tables, and production-speed integer/SIMD transforms remain future work.
@@ -48,6 +67,18 @@ licensing, sizes, and SHA-256 digests recorded in corpus manifests.
 ```sh
 cargo run -p mmrecode-cli -- inspect testdata/jpeg/valid/baseline-420.jpg
 cargo run -p mmrecode-cli -- inspect testdata/dv/valid/dv25-525-60-one-frame.dv
+cargo run -p mmrecode-cli -- \
+  inspect testdata/mpeg2/valid/main-ml-progressive-ibp.m2v
+cargo run -p mmrecode-cli -- \
+  plan-mpeg2 testdata/mpeg2/valid/main-ml-progressive-open-gop.m2v 9 10
+cargo run -p mmrecode-cli -- \
+  decode testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode-mpeg2.y4m
+cargo run -p mmrecode-cli -- \
+  encode-mpeg2 /tmp/mmrecode-mpeg2.y4m /tmp/mmrecode-roundtrip.m2v 8
+cargo run -p mmrecode-cli -- \
+  mux-mpegts testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode.ts
+cargo run -p mmrecode-cli -- inspect /tmp/mmrecode.ts
+cargo run -p mmrecode-cli -- demux-mpegts /tmp/mmrecode.ts /tmp/mmrecode-extracted.m2v
 cargo run -p mmrecode-cli -- extract-dv-audio \
   testdata/dv/valid/dv25-525-60-one-frame.dv /tmp/mmrecode-dv.s16le
 cargo run -p mmrecode-cli -- \
@@ -61,7 +92,8 @@ cargo run -p mmrecode-cli -- \
   verify /tmp/mmrecode.mjpg testdata/y4m/valid/two-frame-420.y4m
 ```
 
-The experimental C API currently exposes one-shot baseline MJPEG and raw DV25 decode and encode. Its checked-in
+The experimental C API currently exposes one-shot baseline MJPEG, raw DV25, complete MPEG-2
+elementary-stream decode/encode, and MPEG-TS mux/demux. Its checked-in
 header is [`crates/capi/include/mmrecode.h`](crates/capi/include/mmrecode.h). Run its compiled C
 smoke test with:
 
@@ -75,11 +107,14 @@ experiments but is not yet a compatibility promise.
 
 ## Visual inspection
 
-Launch the native viewer with raw DV, a JPEG, concatenated raw MJPEG stream, or Y4M file:
+Launch the native viewer with MPEG-TS, MPEG-2 Video, raw DV, JPEG/MJPEG, or Y4M:
 
 ```sh
 cargo run -p mmrecode-viewer -- testdata/jpeg/valid/baseline-420.jpg
 cargo run -p mmrecode-viewer -- testdata/dv/valid/dv25-625-50-one-frame.dv
+cargo run -p mmrecode-viewer -- \
+  testdata/mpeg2/valid/main-ml-progressive-open-gop.m2v
+cargo run -p mmrecode-viewer -- testdata/mpegts/valid/single-program-mpeg2.ts
 ```
 
 Files can also be dropped onto the window or opened by entering a path. The viewer provides frame
@@ -91,6 +126,14 @@ can reveal decoder and sampling problems.
 For raw DV, the viewer displays decoded pixels and can switch to a color-coded physical DIF map
 with frame profile, timecode, embedded-audio layout, metadata-pack count, and byte-localized
 structural issues.
+
+For MPEG-2, frames are presented in display order while the inspector retains decode order,
+temporal reference, I/P/B type, byte range, random-access strength, references, slices, profile,
+VBV, field flags, and colour metadata. A macroblock-map view distinguishes intra, predicted,
+skipped, B-picture, and field-predicted regions.
+
+For MPEG-TS, the same decoded picture and macroblock views are augmented with transport-packet,
+PAT/PMT, program, PID, stream-type, PES, and PCR summaries.
 
 The workspace minimum supported Rust version is 1.92. `mmrecode-viewer` pins `eframe` 0.35 because
 the following release raised its MSRV beyond 1.92.

@@ -1407,6 +1407,8 @@ dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
  "mmrecode-mjpeg",
+ "mmrecode-mpeg2",
+ "mmrecode-mpegts",
 ]
 
 [[package]]
@@ -1416,6 +1418,8 @@ dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
  "mmrecode-mjpeg",
+ "mmrecode-mpeg2",
+ "mmrecode-mpegts",
  "mmrecode-quality",
  "mmrecode-y4m",
 ]
@@ -1443,6 +1447,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmrecode-mpeg2"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-bitstream",
+ "mmrecode-core",
+ "mmrecode-quality",
+ "mmrecode-testkit",
+ "mmrecode-y4m",
+]
+
+[[package]]
+name = "mmrecode-mpegts"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-core",
+ "mmrecode-mpeg2",
+]
+
+[[package]]
 name = "mmrecode-quality"
 version = "0.0.1"
 dependencies = [
@@ -1464,6 +1487,8 @@ dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
  "mmrecode-mjpeg",
+ "mmrecode-mpeg2",
+ "mmrecode-mpegts",
  "mmrecode-y4m",
 ]
 

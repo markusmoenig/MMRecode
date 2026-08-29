@@ -15,6 +15,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 mmrecode-core.workspace = true
 mmrecode-dv.workspace = true
 mmrecode-mjpeg.workspace = true
+mmrecode-mpeg2.workspace = true
+mmrecode-mpegts.workspace = true
 
 # The C boundary necessarily dereferences raw pointers. Unsafe code remains
 # allowed only in this crate rather than weakening the workspace-wide rule.

@@ -5,14 +5,20 @@ use std::{
 };
 
 use mmrecode_core::{
-    ColorDescription, ColorRange, FieldOrder, FrameTiming, PixelFormat, Plane, VideoFrame,
+    ColorDescription, ColorRange, FieldOrder, FrameTiming, PixelFormat, Plane, RandomAccessKind,
+    VideoFrame,
 };
 use mmrecode_dv::{DifSection, DvIssue, DvPackData, DvProfile, Timecode};
 use mmrecode_mjpeg::JpegImage;
+use mmrecode_mpeg2::{
+    MacroblockCoding, MacroblockInfo, MotionType, PictureStructure, PictureType, SequenceParameters,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaKind {
     MotionJpeg,
+    Mpeg2Elementary,
+    Mpeg2Transport,
     RawDv,
     Y4m,
 }
@@ -21,6 +27,8 @@ impl MediaKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::MotionJpeg => "Motion JPEG",
+            Self::Mpeg2Elementary => "MPEG-2 Video",
+            Self::Mpeg2Transport => "MPEG-2 Transport Stream",
             Self::RawDv => "Raw DV",
             Self::Y4m => "YUV4MPEG2",
         }
@@ -36,6 +44,41 @@ pub(crate) struct FrameRecord {
     pub(crate) frame: VideoFrame,
     pub(crate) jpeg: Option<JpegInspection>,
     pub(crate) dv: Option<DvInspection>,
+    pub(crate) mpeg2: Option<Mpeg2Inspection>,
+}
+
+pub(crate) struct TransportInspection {
+    pub(crate) packet_count: usize,
+    pub(crate) pat_count: usize,
+    pub(crate) pmt_count: usize,
+    pub(crate) pes_count: usize,
+    pub(crate) pcr_count: usize,
+    pub(crate) programs: Vec<TransportProgramInspection>,
+}
+
+pub(crate) struct TransportProgramInspection {
+    pub(crate) program_number: u16,
+    pub(crate) pmt_pid: u16,
+    pub(crate) pcr_pid: u16,
+    pub(crate) streams: Vec<(u16, u8)>,
+}
+
+pub(crate) struct Mpeg2Inspection {
+    pub(crate) source_range: Range<usize>,
+    pub(crate) sequence: SequenceParameters,
+    pub(crate) picture_type: PictureType,
+    pub(crate) picture_structure: PictureStructure,
+    pub(crate) temporal_reference: u16,
+    pub(crate) decode_order: i64,
+    pub(crate) presentation_order: i64,
+    pub(crate) references: Vec<u64>,
+    pub(crate) random_access: RandomAccessKind,
+    pub(crate) slice_count: usize,
+    pub(crate) macroblocks: Vec<MacroblockInfo>,
+    pub(crate) macroblock_map: VideoFrame,
+    pub(crate) progressive_frame: bool,
+    pub(crate) top_field_first: bool,
+    pub(crate) repeat_first_field: bool,
 }
 
 pub(crate) struct DvInspection {
@@ -54,6 +97,7 @@ pub(crate) struct Document {
     pub(crate) byte_length: usize,
     pub(crate) kind: MediaKind,
     pub(crate) frames: Vec<FrameRecord>,
+    pub(crate) transport: Option<TransportInspection>,
 }
 
 impl Document {
@@ -64,12 +108,16 @@ impl Document {
             Self::load_y4m(path, &bytes)
         } else if bytes.starts_with(&[0xff, 0xd8]) {
             Self::load_mjpeg(path, &bytes)
+        } else if bytes.len() >= mmrecode_mpegts::TS_PACKET_SIZE && bytes[0] == 0x47 {
+            Self::load_mpegts(path, &bytes)
+        } else if mmrecode_mpeg2::parse_stream(&bytes).is_ok() {
+            Self::load_mpeg2(path, &bytes)
         } else if mmrecode_dv::detect_profile_prefix(&bytes).is_ok() {
             Self::load_dv(path, &bytes)
         } else if bytes.is_empty() {
             Err("input file is empty".into())
         } else {
-            Err("input is neither raw DV, YUV4MPEG2, nor a JPEG/MJPEG stream".into())
+            Err("input is neither MPEG-TS, MPEG-2 Video, raw DV, YUV4MPEG2, nor a JPEG/MJPEG stream".into())
         }
     }
 
@@ -99,6 +147,7 @@ impl Document {
                     image,
                 }),
                 dv: None,
+                mpeg2: None,
             });
             file_offset = end;
             remaining = &remaining[consumed..];
@@ -111,6 +160,7 @@ impl Document {
             byte_length,
             kind: MediaKind::MotionJpeg,
             frames,
+            transport: None,
         })
     }
 
@@ -156,6 +206,7 @@ impl Document {
                     dif_map: dif_map(&parsed),
                     concealed_video_segments: decoded.concealed_segments.len(),
                 }),
+                mpeg2: None,
             });
         }
         Ok(Self {
@@ -163,6 +214,7 @@ impl Document {
             byte_length: bytes.len(),
             kind: MediaKind::RawDv,
             frames,
+            transport: None,
         })
     }
 
@@ -178,6 +230,7 @@ impl Document {
                 frame,
                 jpeg: None,
                 dv: None,
+                mpeg2: None,
             });
         }
         if frames.is_empty() {
@@ -188,7 +241,165 @@ impl Document {
             byte_length,
             kind: MediaKind::Y4m,
             frames,
+            transport: None,
         })
+    }
+
+    fn load_mpeg2(path: &Path, bytes: &[u8]) -> Result<Self, String> {
+        let stream = mmrecode_mpeg2::parse_stream(bytes).map_err(|error| error.to_string())?;
+        let dependencies =
+            mmrecode_mpeg2::analyze_dependencies(&stream).map_err(|error| error.to_string())?;
+        let mut decoded =
+            mmrecode_mpeg2::decode_stream(bytes).map_err(|error| error.to_string())?;
+        decoded.sort_by_key(|picture| picture.decode_order);
+        if decoded.len() != stream.pictures().len() || decoded.len() != dependencies.len() {
+            return Err(
+                "MPEG-2 parser, dependency analyzer, and decoder disagree on picture count".into(),
+            );
+        }
+
+        let mut frames = Vec::with_capacity(decoded.len());
+        for ((picture, access), decoded) in stream.pictures().iter().zip(&dependencies).zip(decoded)
+        {
+            let macroblock_map = macroblock_map(
+                picture.sequence.width,
+                picture.sequence.height,
+                picture.header.picture_coding_type,
+                &decoded.macroblocks,
+            );
+            frames.push(FrameRecord {
+                frame: decoded.frame,
+                jpeg: None,
+                dv: None,
+                mpeg2: Some(Mpeg2Inspection {
+                    source_range: picture.source_range.clone(),
+                    sequence: picture.sequence.clone(),
+                    picture_type: picture.header.picture_coding_type,
+                    picture_structure: picture.coding_extension.picture_structure,
+                    temporal_reference: picture.header.temporal_reference,
+                    decode_order: access.decode_order,
+                    presentation_order: access.presentation_order,
+                    references: access
+                        .references
+                        .iter()
+                        .map(|reference| reference.0)
+                        .collect(),
+                    random_access: access.random_access,
+                    slice_count: picture.slices.len(),
+                    macroblocks: decoded.macroblocks,
+                    macroblock_map,
+                    progressive_frame: picture.coding_extension.progressive_frame,
+                    top_field_first: picture.coding_extension.top_field_first,
+                    repeat_first_field: picture.coding_extension.repeat_first_field,
+                }),
+            });
+        }
+        frames.sort_by_key(|record| {
+            record
+                .mpeg2
+                .as_ref()
+                .map_or(i64::MAX, |mpeg2| mpeg2.presentation_order)
+        });
+        Ok(Self {
+            path: path.to_owned(),
+            byte_length: bytes.len(),
+            kind: MediaKind::Mpeg2Elementary,
+            frames,
+            transport: None,
+        })
+    }
+
+    fn load_mpegts(path: &Path, bytes: &[u8]) -> Result<Self, String> {
+        let transport =
+            mmrecode_mpegts::demux_transport_stream(bytes).map_err(|error| error.to_string())?;
+        let elementary = transport
+            .mpeg2_video_bytes()
+            .map_err(|error| error.to_string())?;
+        let programs = transport
+            .program_map_tables
+            .iter()
+            .map(|table| TransportProgramInspection {
+                program_number: table.program_number,
+                pmt_pid: table.pid,
+                pcr_pid: table.pcr_pid,
+                streams: table
+                    .streams
+                    .iter()
+                    .map(|stream| (stream.elementary_pid, stream.stream_type))
+                    .collect(),
+            })
+            .collect();
+        let inspection = TransportInspection {
+            packet_count: transport.packets.len(),
+            pat_count: transport.program_association_tables.len(),
+            pmt_count: transport.program_map_tables.len(),
+            pes_count: transport.elementary_packets.len(),
+            pcr_count: transport
+                .packets
+                .iter()
+                .filter(|packet| packet.pcr.is_some())
+                .count(),
+            programs,
+        };
+        let mut document = Self::load_mpeg2(path, &elementary)?;
+        document.byte_length = bytes.len();
+        document.kind = MediaKind::Mpeg2Transport;
+        document.transport = Some(inspection);
+        Ok(document)
+    }
+}
+
+fn macroblock_map(
+    width: usize,
+    height: usize,
+    picture_type: PictureType,
+    macroblocks: &[MacroblockInfo],
+) -> VideoFrame {
+    let mut data = vec![0_u8; width * height * 3];
+    for macroblock in macroblocks {
+        let color = macroblock_color(picture_type, macroblock);
+        let start_x = macroblock.x * 16;
+        let start_y = macroblock.y * 16;
+        for y in start_y..(start_y + 16).min(height) {
+            for x in start_x..(start_x + 16).min(width) {
+                let border = x == start_x || y == start_y;
+                let pixel = if border { [25, 25, 25] } else { color };
+                let offset = (y * width + x) * 3;
+                data[offset..offset + 3].copy_from_slice(&pixel);
+            }
+        }
+    }
+    VideoFrame {
+        format: PixelFormat::Rgb24,
+        width,
+        height,
+        planes: vec![Plane {
+            data,
+            stride: width * 3,
+            width,
+            height,
+        }],
+        timing: FrameTiming::default(),
+        color: ColorDescription {
+            range: ColorRange::Full,
+            primaries: None,
+            transfer: None,
+            matrix: None,
+        },
+        field_order: FieldOrder::Unspecified,
+    }
+}
+
+fn macroblock_color(picture_type: PictureType, macroblock: &MacroblockInfo) -> [u8; 3] {
+    match (macroblock.coding, picture_type, macroblock.motion_type) {
+        (MacroblockCoding::Intra, _, _) => [55, 190, 105],
+        (MacroblockCoding::Skipped, PictureType::B, _) => [95, 70, 155],
+        (MacroblockCoding::Skipped, _, _) => [70, 110, 175],
+        (MacroblockCoding::Predicted, PictureType::B, MotionType::Field) => [180, 80, 210],
+        (MacroblockCoding::Predicted, PictureType::B, _) => [145, 85, 195],
+        (MacroblockCoding::Predicted, _, MotionType::Field) => [55, 175, 205],
+        (MacroblockCoding::Predicted, _, MotionType::DualPrime) => [220, 90, 150],
+        (MacroblockCoding::Predicted, _, _) => [235, 155, 55],
     }
 }
 
@@ -267,5 +478,38 @@ mod tests {
         let document = Document::load_y4m(Path::new("two.y4m"), bytes).expect("valid Y4M stream");
         assert_eq!(document.frames.len(), 2);
         assert_eq!(document.kind, MediaKind::Y4m);
+    }
+
+    #[test]
+    fn loads_mpeg2_in_presentation_order_with_macroblock_maps() {
+        let bytes = include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
+        let document =
+            Document::load_mpeg2(Path::new("progressive.m2v"), bytes).expect("valid MPEG-2");
+        assert_eq!(document.kind, MediaKind::Mpeg2Elementary);
+        assert_eq!(document.frames.len(), 12);
+        let presentation: Vec<_> = document
+            .frames
+            .iter()
+            .map(|frame| frame.mpeg2.as_ref().unwrap().presentation_order)
+            .collect();
+        assert_eq!(presentation, (0..12).collect::<Vec<_>>());
+        let first = document.frames[0].mpeg2.as_ref().unwrap();
+        assert_eq!(first.picture_type, PictureType::I);
+        assert_eq!(first.macroblock_map.width, 96);
+        assert_eq!(first.macroblock_map.height, 64);
+        assert!(!first.macroblocks.is_empty());
+    }
+
+    #[test]
+    fn loads_mpegts_with_container_and_video_inspection() {
+        let bytes = include_bytes!("../../../../testdata/mpegts/valid/single-program-mpeg2.ts");
+        let document =
+            Document::load_mpegts(Path::new("program.ts"), bytes).expect("valid MPEG-TS");
+        assert_eq!(document.kind, MediaKind::Mpeg2Transport);
+        assert_eq!(document.frames.len(), 12);
+        let transport = document.transport.as_ref().expect("transport inspection");
+        assert!(transport.packet_count > 10);
+        assert_eq!(transport.programs[0].pmt_pid, 0x1000);
+        assert_eq!(transport.programs[0].streams, vec![(0x0100, 0x02)]);
     }
 }

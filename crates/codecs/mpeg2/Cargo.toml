@@ -1,6 +1,6 @@
 [package]
-name = "mmrecode-cli"
-description = "Command-line tools for MMRecode"
+name = "mmrecode-mpeg2"
+description = "Native MPEG-2 Video elementary-stream codec for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,17 +8,13 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "mmrecode"
-path = "src/main.rs"
-
 [dependencies]
+mmrecode-bitstream.workspace = true
 mmrecode-core.workspace = true
-mmrecode-dv.workspace = true
-mmrecode-mjpeg.workspace = true
-mmrecode-mpeg2.workspace = true
-mmrecode-mpegts.workspace = true
+
+[dev-dependencies]
 mmrecode-quality.workspace = true
+mmrecode-testkit.workspace = true
 mmrecode-y4m.workspace = true
 
 [lints]

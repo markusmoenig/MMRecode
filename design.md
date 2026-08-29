@@ -2,9 +2,9 @@
 
 ## Status
 
-This document describes the intended architecture and the initial scaffold. APIs are unstable
-until at least one complete codec, container/test format, and verification path have exercised the
-boundaries.
+This document describes the intended architecture and the implemented Motion JPEG, DV25,
+MPEG-2 Video, and MPEG-2 Transport Stream vertical slices. APIs remain unstable while more
+containers and editing operations exercise the boundaries.
 
 ## Design goals
 
@@ -68,7 +68,7 @@ Forbidden dependencies include:
 
 ## Repository layout
 
-The initial workspace contains only crates needed for the first vertical slice:
+The current workspace contains the crates exercised by implemented vertical slices:
 
 ```text
 crates/
@@ -78,8 +78,10 @@ crates/
 ├── bitstream/               mmrecode-bitstream
 ├── codecs/
 │   ├── mjpeg/               mmrecode-mjpeg
-│   └── dv/                  mmrecode-dv; active raw-DV25 slice
+│   ├── dv/                  mmrecode-dv; raw-DV25 slice
+│   └── mpeg2/               mmrecode-mpeg2; MPEG-2 Video elementary-stream slice
 ├── containers/
+│   ├── mpegts/              mmrecode-mpegts; H.222.0 transport slice
 │   └── y4m/                 mmrecode-y4m
 ├── quality/                 mmrecode-quality
 ├── testkit/                 mmrecode-testkit
@@ -93,7 +95,6 @@ Planned crates are added only when implementation begins:
 crates/
 ├── codecs/
 │   ├── dv/                  mmrecode-dv
-│   ├── mpeg2/               mmrecode-mpeg2
 │   ├── h264/                mmrecode-h264
 │   ├── hevc/                mmrecode-hevc
 │   ├── av1/                 mmrecode-av1
@@ -101,7 +102,6 @@ crates/
 ├── containers/
 │   ├── avi/                 mmrecode-avi
 │   ├── isobmff/             mmrecode-isobmff
-│   ├── mpegts/              mmrecode-mpegts
 │   └── mxf/                 mmrecode-mxf
 ├── render/                  mmrecode-render
 ├── edit/                    mmrecode-edit
@@ -265,6 +265,26 @@ mmrecode-mpeg2/src/
 The exact module structure should follow the codec. A JPEG crate does not need artificial motion
 or rate-control modules simply to resemble MPEG-2.
 
+### Implemented MPEG-2 slice
+
+`mmrecode-mpeg2` keeps MPEG syntax and reconstruction codec-local while exposing generic
+`AccessUnitInfo` records to the rest of the workspace. Its current public surface includes typed
+sequence/display/quant-matrix, GOP, picture, extension, and slice parsing; presentation/decode
+ordering; open/closed-GOP references; portable Main Profile 4:2:0 frame-picture reconstruction;
+deterministic Main Profile/Main Level encoding; and an explainable affected-picture smart-render
+plan.
+
+The smart-render plan is intentionally not the future generic `mmrecode-render` crate. It proves
+the codec-specific propagation rule—including B pictures that precede a changed future reference
+in display order and leading B pictures that cross an open GOP—without prematurely defining mux,
+timestamp, multi-source timeline, or effect operations.
+
+Current decoder exclusions are field pictures, dual-prime prediction, non-4:2:0 profiles,
+scalability extensions, and damaged-slice concealment. The encoder emits frame pictures, closed
+GOPs, zero-vector B prediction, and VBR delay signalling; adaptive rate control and a normative VBV
+scheduler remain follow-on work. These limits are explicit API errors and documented in the crate
+README rather than silent approximations.
+
 ### Avoid premature algorithm abstraction
 
 Codecs may share concepts without sharing implementations.
@@ -308,6 +328,20 @@ Container implementations do not own:
 - MPEG-2 GOP semantics
 - H.264 SPS/PPS interpretation
 - Codec reconstruction
+
+### Implemented MPEG-2 Transport Stream slice
+
+`mmrecode-mpegts` implements strict 188-byte packet parsing, adaptation/PCR fields, per-PID
+continuity, pointer-aware PAT/PMT section reassembly with CRC validation, program and stream
+discovery, and PES reassembly with PTS/DTS. Its muxer accepts generic MPEG-2 Video packets and
+emits a deterministic single-program stream with repeated PSI, PCR, random-access flags, and exact
+90 kHz timestamp rescaling. The CLI supplies picture boundaries and codec dependency timing; the
+container crate never parses MPEG-2 picture syntax.
+
+The slice deliberately does not claim live broadcast-system coverage: audio interleaving,
+multi-program muxing, 192/204-byte variants, DVB/ATSC service information, scrambling, CBR
+null-packet scheduling, jitter recovery, indexing, and timestamp-wrap-aware seeking remain future
+work. Program Stream and MXF are separate container families rather than modes of this crate.
 - Encoder decisions
 
 ## Dependency analysis and smart rendering
@@ -398,8 +432,8 @@ keeps the initial implementation easy to validate. A later GPU presentation modu
 planar textures and apply matrix, range, transfer, chroma-siting, and HDR transforms in shaders.
 That display transform remains non-normative and separate from decoder reconstruction.
 
-Codec-specific overlays—JPEG blocks today, later MPEG-2 macroblocks, motion vectors, quantizers,
-slice boundaries, and dependency information—read public inspection structures rather than placing
+Codec-specific overlays—JPEG blocks, DV DIF maps, and MPEG-2 macroblock/dependency maps today;
+later motion-vector arrows and slice overlays—read public inspection structures rather than placing
 GUI concerns inside codec implementations. Reusable presentation machinery should be extracted to
 a library crate only when the editor or another application actually needs it.
 
@@ -413,11 +447,12 @@ should be considered only after a stable C ABI exists; Rust trait-object ABI is 
 
 ## C ABI and bindings
 
-`mmrecode-capi` begins experimentally after the first end-to-end MJPEG slice. This gives non-Rust
-integration code something real to exercise without declaring the ABI stable. The first surface is
-deliberately narrow: one-shot baseline JPEG decode and encode, planar frame views, owned output
-buffers, version queries, and thread-local diagnostics. Streaming codec handles follow only after
-another codec has tested their lifecycle requirements.
+`mmrecode-capi` began experimentally after the first end-to-end MJPEG slice and now exercises
+baseline JPEG, raw DV25, complete MPEG-2 elementary-stream decode/encode, and MPEG-TS mux/demux
+ownership.
+It exposes planar frame views, owned output buffers, version queries, structure-size validation,
+and thread-local diagnostics without declaring the ABI stable. Stateful streaming handles remain a
+later design step rather than wrappers around unproven lifecycle assumptions.
 
 The C layer should:
 

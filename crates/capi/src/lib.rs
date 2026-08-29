@@ -17,6 +17,7 @@ use mmrecode_core::{
     ColorDescription, ColorRange, Error, FieldOrder, FrameTiming, PixelFormat, Plane, VideoFrame,
 };
 use mmrecode_mjpeg::{JpegEncodeOptions, decode_jpeg, encode_jpeg};
+use mmrecode_mpeg2::{FrameRate, Mpeg2EncodeOptions};
 
 const ABI_VERSION: u32 = 1;
 const MAX_PLANES: usize = 3;
@@ -232,6 +233,20 @@ pub struct MmrBuffer {
     pub len: usize,
 }
 
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct MmrMpeg2EncodeOptions {
+    pub struct_size: usize,
+    pub frame_rate_numerator: u32,
+    pub frame_rate_denominator: u32,
+    pub gop_size: u32,
+    pub b_frames: u32,
+    pub quantiser_scale_code: u32,
+    pub motion_search_range: u32,
+    pub progressive: u32,
+    pub top_field_first: u32,
+}
+
 impl MmrBuffer {
     const fn empty() -> Self {
         Self {
@@ -341,6 +356,42 @@ pub unsafe extern "C" fn mmr_dv_decode(
     })
 }
 
+/// Counts pictures in a complete MPEG-2 Video elementary stream.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes and `out_count` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpeg2_picture_count(
+    data: *const u8,
+    len: usize,
+    out_count: *mut usize,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpeg2_picture_count_impl(data, len, out_count) }
+    })
+}
+
+/// Decodes one MPEG-2 picture selected by presentation order.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes. `out_frame` must be writable,
+/// zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpeg2_decode_picture(
+    data: *const u8,
+    len: usize,
+    presentation_index: usize,
+    out_frame: *mut MmrVideoFrame,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpeg2_decode_picture_impl(data, len, presentation_index, out_frame) }
+    })
+}
+
 /// Releases all allocations held by a decoded C video frame.
 ///
 /// A null pointer is ignored. A valid frame is reset so repeated calls are
@@ -397,6 +448,63 @@ pub unsafe extern "C" fn mmr_dv_encode(
     ffi_status(|| {
         // SAFETY: pointer validation is centralized in the implementation.
         unsafe { dv_encode_impl(frame, out_buffer) }
+    })
+}
+
+/// Encodes complete borrowed frames as an MPEG-2 Video elementary stream.
+///
+/// # Safety
+///
+/// `frames` must identify `frame_count` readable frame views whose plane
+/// storage remains readable for the call. `options` must be readable.
+/// `out_buffer` must be writable, zero-initialized, and carry the correct
+/// structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpeg2_encode(
+    frames: *const MmrVideoFrameView,
+    frame_count: usize,
+    options: *const MmrMpeg2EncodeOptions,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpeg2_encode_impl(frames, frame_count, options, out_buffer) }
+    })
+}
+
+/// Wraps a complete MPEG-2 Video elementary stream in MPEG-TS.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes. `out_buffer` must be writable,
+/// zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpegts_mux_mpeg2(
+    data: *const u8,
+    len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpegts_transform_impl(data, len, out_buffer, true) }
+    })
+}
+
+/// Extracts the first MPEG-2 Video elementary stream from MPEG-TS.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes. `out_buffer` must be writable,
+/// zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpegts_demux_mpeg2(
+    data: *const u8,
+    len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpegts_transform_impl(data, len, out_buffer, false) }
     })
 }
 
@@ -493,6 +601,48 @@ unsafe fn dv_decode_impl(
     Ok(())
 }
 
+unsafe fn mpeg2_picture_count_impl(
+    data: *const u8,
+    len: usize,
+    out_count: *mut usize,
+) -> ApiResult<()> {
+    if out_count.is_null() {
+        return Err(ApiError::InvalidArgument("out_count is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output pointer.
+    unsafe { *out_count = 0 };
+    let input = unsafe { borrowed_bytes(data, len, "data")? };
+    let stream = mmrecode_mpeg2::parse_stream(input)?;
+    // SAFETY: the pointer remains valid for the call.
+    unsafe { *out_count = stream.pictures().len() };
+    Ok(())
+}
+
+unsafe fn mpeg2_decode_picture_impl(
+    data: *const u8,
+    len: usize,
+    presentation_index: usize,
+    out_frame: *mut MmrVideoFrame,
+) -> ApiResult<()> {
+    if out_frame.is_null() {
+        return Err(ApiError::InvalidArgument("out_frame is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output pointer.
+    let out_frame = unsafe { &mut *out_frame };
+    validate_owned_frame_output(out_frame)?;
+    *out_frame = MmrVideoFrame::empty();
+    let input = unsafe { borrowed_bytes(data, len, "data")? };
+    let pictures = mmrecode_mpeg2::decode_stream(input)?;
+    let picture_count = pictures.len();
+    let picture = pictures.into_iter().nth(presentation_index).ok_or_else(|| {
+        ApiError::InvalidArgument(format!(
+            "presentation_index {presentation_index} is outside the {picture_count}-picture stream"
+        ))
+    })?;
+    *out_frame = MmrVideoFrame::from_video_frame(picture.frame)?;
+    Ok(())
+}
+
 unsafe fn mjpeg_encode_impl(
     frame: *const MmrVideoFrameView,
     quality: u8,
@@ -559,6 +709,155 @@ unsafe fn dv_encode_impl(
     let encoded = mmrecode_dv::encode_video(&frame)?;
     *out_buffer = MmrBuffer::from_vec(encoded.data);
     Ok(())
+}
+
+unsafe fn mpeg2_encode_impl(
+    frames: *const MmrVideoFrameView,
+    frame_count: usize,
+    options: *const MmrMpeg2EncodeOptions,
+    out_buffer: *mut MmrBuffer,
+) -> ApiResult<()> {
+    if frame_count == 0 {
+        return Err(ApiError::InvalidArgument("frame_count is zero".into()));
+    }
+    if frames.is_null() {
+        return Err(ApiError::InvalidArgument("frames is null".into()));
+    }
+    if frame_count > isize::MAX as usize {
+        return Err(ApiError::InvalidArgument(
+            "frame_count exceeds the addressable object limit".into(),
+        ));
+    }
+    if options.is_null() {
+        return Err(ApiError::InvalidArgument("options is null".into()));
+    }
+    if out_buffer.is_null() {
+        return Err(ApiError::InvalidArgument("out_buffer is null".into()));
+    }
+    // SAFETY: the caller guarantees readable input structures and a writable output structure.
+    let (frames, options, out_buffer) = unsafe {
+        (
+            slice::from_raw_parts(frames, frame_count),
+            &*options,
+            &mut *out_buffer,
+        )
+    };
+    if options.struct_size != size_of::<MmrMpeg2EncodeOptions>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "options struct_size is {}, expected {}",
+            options.struct_size,
+            size_of::<MmrMpeg2EncodeOptions>()
+        )));
+    }
+    validate_buffer_output(out_buffer)?;
+    *out_buffer = MmrBuffer::empty();
+
+    let mut owned_frames = Vec::with_capacity(frame_count);
+    for frame in frames {
+        if frame.struct_size != size_of::<MmrVideoFrameView>() {
+            return Err(ApiError::InvalidArgument(format!(
+                "frame struct_size is {}, expected {}",
+                frame.struct_size,
+                size_of::<MmrVideoFrameView>()
+            )));
+        }
+        owned_frames.push(unsafe { video_frame_from_view(frame)? });
+    }
+    let encoded = mmrecode_mpeg2::encode_stream(
+        &owned_frames,
+        Mpeg2EncodeOptions {
+            frame_rate: mpeg2_frame_rate(
+                options.frame_rate_numerator,
+                options.frame_rate_denominator,
+            )?,
+            gop_size: usize::try_from(options.gop_size)
+                .map_err(|_| ApiError::InvalidArgument("gop_size does not fit size_t".into()))?,
+            b_frames: usize::try_from(options.b_frames)
+                .map_err(|_| ApiError::InvalidArgument("b_frames does not fit size_t".into()))?,
+            quantiser_scale_code: u8::try_from(options.quantiser_scale_code).map_err(|_| {
+                ApiError::InvalidArgument("quantiser_scale_code does not fit uint8_t".into())
+            })?,
+            motion_search_range: usize::try_from(options.motion_search_range).map_err(|_| {
+                ApiError::InvalidArgument("motion_search_range does not fit size_t".into())
+            })?,
+            progressive: c_boolean(options.progressive, "progressive")?,
+            top_field_first: c_boolean(options.top_field_first, "top_field_first")?,
+        },
+    )?;
+    *out_buffer = MmrBuffer::from_vec(encoded.data);
+    Ok(())
+}
+
+unsafe fn mpegts_transform_impl(
+    data: *const u8,
+    len: usize,
+    out_buffer: *mut MmrBuffer,
+    mux: bool,
+) -> ApiResult<()> {
+    if out_buffer.is_null() {
+        return Err(ApiError::InvalidArgument("out_buffer is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output structure.
+    let out_buffer = unsafe { &mut *out_buffer };
+    validate_buffer_output(out_buffer)?;
+    *out_buffer = MmrBuffer::empty();
+    let input = unsafe { borrowed_bytes(data, len, "data")? };
+    let output = if mux {
+        mmrecode_mpeg2::parse_stream(input)?;
+        mmrecode_mpegts::mux_mpeg2_video(input)?
+    } else {
+        mmrecode_mpegts::demux_transport_stream(input)?.mpeg2_video_bytes()?
+    };
+    *out_buffer = MmrBuffer::from_vec(output);
+    Ok(())
+}
+
+fn validate_owned_frame_output(out_frame: &MmrVideoFrame) -> ApiResult<()> {
+    if out_frame.struct_size != size_of::<MmrVideoFrame>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "out_frame struct_size is {}, expected {}",
+            out_frame.struct_size,
+            size_of::<MmrVideoFrame>()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_buffer_output(out_buffer: &MmrBuffer) -> ApiResult<()> {
+    if out_buffer.struct_size != size_of::<MmrBuffer>() {
+        return Err(ApiError::InvalidArgument(format!(
+            "out_buffer struct_size is {}, expected {}",
+            out_buffer.struct_size,
+            size_of::<MmrBuffer>()
+        )));
+    }
+    Ok(())
+}
+
+fn mpeg2_frame_rate(numerator: u32, denominator: u32) -> ApiResult<FrameRate> {
+    match (numerator, denominator) {
+        (24_000, 1_001) => Ok(FrameRate::Fps23_976),
+        (24, 1) => Ok(FrameRate::Fps24),
+        (25, 1) => Ok(FrameRate::Fps25),
+        (30_000, 1_001) => Ok(FrameRate::Fps29_97),
+        (30, 1) => Ok(FrameRate::Fps30),
+        (50, 1) => Ok(FrameRate::Fps50),
+        (60_000, 1_001) => Ok(FrameRate::Fps59_94),
+        (60, 1) => Ok(FrameRate::Fps60),
+        _ => Err(ApiError::InvalidArgument(format!(
+            "unsupported MPEG-2 frame rate {numerator}/{denominator}"
+        ))),
+    }
+}
+
+fn c_boolean(value: u32, name: &str) -> ApiResult<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ApiError::InvalidArgument(format!(
+            "{name} must be zero or one"
+        ))),
+    }
 }
 
 unsafe fn video_frame_from_view(view: &MmrVideoFrameView) -> ApiResult<VideoFrame> {
@@ -712,6 +1011,8 @@ mod tests {
 
     const JPEG: &[u8] = include_bytes!("../../../testdata/jpeg/valid/baseline-420.jpg");
     const DV: &[u8] = include_bytes!("../../../testdata/dv/valid/dv25-525-60-one-frame.dv");
+    const MPEG2: &[u8] =
+        include_bytes!("../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
 
     #[test]
     fn c_boundary_decodes_and_reencodes_a_frame() {
@@ -797,6 +1098,66 @@ mod tests {
     }
 
     #[test]
+    fn c_boundary_counts_decodes_and_encodes_mpeg2() {
+        let mut picture_count = 0_usize;
+        // SAFETY: all pointers refer to live Rust objects.
+        let status =
+            unsafe { mmr_mpeg2_picture_count(MPEG2.as_ptr(), MPEG2.len(), &raw mut picture_count) };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(picture_count, 12);
+
+        let mut decoded = MmrVideoFrame::empty();
+        // SAFETY: all pointers refer to live Rust objects.
+        let status =
+            unsafe { mmr_mpeg2_decode_picture(MPEG2.as_ptr(), MPEG2.len(), 0, &raw mut decoded) };
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(decoded.format, PIXEL_FORMAT_YUV420P8);
+        assert_eq!((decoded.width, decoded.height), (96, 64));
+
+        let mut views = [MmrPlaneView::empty(); MAX_PLANES];
+        for (view, plane) in views.iter_mut().zip(decoded.planes) {
+            *view = MmrPlaneView {
+                data: plane.data,
+                data_len: plane.data_len,
+                stride: plane.stride,
+                width: plane.width,
+                height: plane.height,
+            };
+        }
+        let view = MmrVideoFrameView {
+            struct_size: size_of::<MmrVideoFrameView>(),
+            format: decoded.format,
+            range: decoded.range,
+            width: decoded.width,
+            height: decoded.height,
+            plane_count: decoded.plane_count,
+            planes: views,
+        };
+        let options = MmrMpeg2EncodeOptions {
+            struct_size: size_of::<MmrMpeg2EncodeOptions>(),
+            frame_rate_numerator: 25,
+            frame_rate_denominator: 1,
+            gop_size: 12,
+            b_frames: 2,
+            quantiser_scale_code: 8,
+            motion_search_range: 4,
+            progressive: 1,
+            top_field_first: 0,
+        };
+        let mut encoded = MmrBuffer::empty();
+        // SAFETY: the input frame, options, and output all remain live for the call.
+        let status =
+            unsafe { mmr_mpeg2_encode(&raw const view, 1, &raw const options, &raw mut encoded) };
+        assert_eq!(status, STATUS_OK);
+        assert!(encoded.len > 16);
+        // SAFETY: both allocations originated from this library and are freed once.
+        unsafe {
+            mmr_buffer_free(&raw mut encoded);
+            mmr_video_frame_free(&raw mut decoded);
+        }
+    }
+
+    #[test]
     fn invalid_argument_sets_thread_local_diagnostic() {
         let mut decoded = MmrVideoFrame::empty();
         // SAFETY: output is live; the deliberately invalid null input is part
@@ -813,6 +1174,33 @@ mod tests {
                 .expect("diagnostics are UTF-8")
                 .contains("data is null")
         );
+    }
+
+    #[test]
+    fn c_boundary_muxes_and_demuxes_mpegts() {
+        let mut transport = MmrBuffer::empty();
+        // SAFETY: all pointers refer to live storage for the duration of the call.
+        let status =
+            unsafe { mmr_mpegts_mux_mpeg2(MPEG2.as_ptr(), MPEG2.len(), &raw mut transport) };
+        assert_eq!(status, STATUS_OK);
+        assert!(
+            transport
+                .len
+                .is_multiple_of(mmrecode_mpegts::TS_PACKET_SIZE)
+        );
+        let mut elementary = MmrBuffer::empty();
+        // SAFETY: the transport allocation remains owned and readable until both calls finish.
+        let status =
+            unsafe { mmr_mpegts_demux_mpeg2(transport.data, transport.len, &raw mut elementary) };
+        assert_eq!(status, STATUS_OK);
+        // SAFETY: the returned allocation contains `len` initialized bytes.
+        let extracted = unsafe { slice::from_raw_parts(elementary.data, elementary.len) };
+        assert_eq!(extracted, MPEG2);
+        // SAFETY: both allocations originated from this library and are freed once.
+        unsafe {
+            mmr_buffer_free(&raw mut elementary);
+            mmr_buffer_free(&raw mut transport);
+        }
     }
 
     #[test]

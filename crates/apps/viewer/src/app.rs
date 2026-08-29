@@ -5,7 +5,7 @@ use mmrecode_mjpeg::{HuffmanTableClass, Marker, QuantizationPrecision, SegmentDa
 
 use crate::{
     display::{self, DisplayMode},
-    document::{Document, DvInspection, JpegInspection},
+    document::{Document, DvInspection, JpegInspection, Mpeg2Inspection, TransportInspection},
 };
 
 pub(crate) struct ViewerApp {
@@ -18,7 +18,7 @@ pub(crate) struct ViewerApp {
     fit_to_window: bool,
     zoom: f32,
     block_grid: bool,
-    dv_structure: bool,
+    structure_view: StructureView,
     pixel_description: Option<String>,
     status: Status,
 }
@@ -27,6 +27,14 @@ enum Status {
     Ready,
     Info(String),
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StructureView {
+    #[default]
+    Image,
+    DifMap,
+    MacroblockMap,
 }
 
 impl ViewerApp {
@@ -47,7 +55,7 @@ impl ViewerApp {
             fit_to_window: true,
             zoom: 1.0,
             block_grid: false,
-            dv_structure: false,
+            structure_view: StructureView::Image,
             pixel_description: None,
             status: Status::Ready,
         };
@@ -66,7 +74,7 @@ impl ViewerApp {
                 self.document = Some(document);
                 self.frame_index = 0;
                 self.display_mode = DisplayMode::Composite;
-                self.dv_structure = false;
+                self.structure_view = StructureView::Image;
                 self.pixel_description = None;
                 self.status = Status::Info(format!("Loaded {frame_count} {kind} frame(s)"));
                 self.refresh_texture(context);
@@ -91,7 +99,7 @@ impl ViewerApp {
             self.texture = None;
             return;
         };
-        let frame = display_frame(record, self.dv_structure);
+        let frame = display_frame(record, self.structure_view);
         match display::color_image(frame, self.display_mode) {
             Ok(image) => {
                 self.texture_generation += 1;
@@ -124,7 +132,7 @@ impl ViewerApp {
             let path_response = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
                     .desired_width(360.0)
-                    .hint_text("Raw DV, JPEG, MJPEG, or Y4M path"),
+                    .hint_text("MPEG-TS, MPEG-2 Video, raw DV, JPEG/MJPEG, or Y4M path"),
             );
             let open_requested = ui.button("Open").clicked()
                 || (path_response.lost_focus()
@@ -157,11 +165,12 @@ impl ViewerApp {
                 .as_ref()
                 .and_then(|document| document.frames.get(self.frame_index));
             let current_frame =
-                current_record.map(|record| display_frame(record, self.dv_structure));
+                current_record.map(|record| display_frame(record, self.structure_view));
             let plane_count = current_frame.map_or(0, |frame| frame.planes.len());
             let packed_rgb = current_frame
                 .is_some_and(|frame| frame.format == mmrecode_core::PixelFormat::Rgb24);
             let has_dv = current_record.is_some_and(|record| record.dv.is_some());
+            let has_mpeg2 = current_record.is_some_and(|record| record.mpeg2.is_some());
             for mode in DisplayMode::ALL {
                 let enabled = match mode {
                     DisplayMode::Composite => plane_count >= 1,
@@ -187,11 +196,28 @@ impl ViewerApp {
                     .suffix("×"),
             );
             ui.checkbox(&mut self.block_grid, "8×8 grid");
-            let old_structure = self.dv_structure;
+            let old_structure = self.structure_view;
             ui.add_enabled_ui(has_dv, |ui| {
-                ui.checkbox(&mut self.dv_structure, "DIF map");
+                let mut enabled = self.structure_view == StructureView::DifMap;
+                if ui.checkbox(&mut enabled, "DIF map").changed() {
+                    self.structure_view = if enabled {
+                        StructureView::DifMap
+                    } else {
+                        StructureView::Image
+                    };
+                }
             });
-            if old_structure != self.dv_structure {
+            ui.add_enabled_ui(has_mpeg2, |ui| {
+                let mut enabled = self.structure_view == StructureView::MacroblockMap;
+                if ui.checkbox(&mut enabled, "Macroblock map").changed() {
+                    self.structure_view = if enabled {
+                        StructureView::MacroblockMap
+                    } else {
+                        StructureView::Image
+                    };
+                }
+            });
+            if old_structure != self.structure_view {
                 self.display_mode = DisplayMode::Composite;
                 self.refresh_texture(ui.ctx());
             }
@@ -218,7 +244,9 @@ impl ViewerApp {
                     self.refresh_texture(ui.ctx());
                 }
             } else {
-                ui.label("Drop a raw DV, JPEG, MJPEG, or Y4M file here, or enter its path above.");
+                ui.label(
+                    "Drop an MPEG-TS, MPEG-2 Video, raw DV, JPEG/MJPEG, or Y4M file here, or enter its path above.",
+                );
             }
 
             ui.separator();
@@ -273,6 +301,36 @@ impl ViewerApp {
                 ui.label("Range");
                 ui.monospace(format!("{:?}", record.frame.color.range));
                 ui.end_row();
+                ui.label("Primaries");
+                ui.monospace(
+                    record
+                        .frame
+                        .color
+                        .primaries
+                        .as_deref()
+                        .unwrap_or("unspecified"),
+                );
+                ui.end_row();
+                ui.label("Transfer");
+                ui.monospace(
+                    record
+                        .frame
+                        .color
+                        .transfer
+                        .as_deref()
+                        .unwrap_or("unspecified"),
+                );
+                ui.end_row();
+                ui.label("Matrix");
+                ui.monospace(
+                    record
+                        .frame
+                        .color
+                        .matrix
+                        .as_deref()
+                        .unwrap_or("unspecified"),
+                );
+                ui.end_row();
                 ui.label("Field order");
                 ui.monospace(format!("{:?}", record.frame.field_order));
                 ui.end_row();
@@ -293,11 +351,17 @@ impl ViewerApp {
 
         ui.separator();
         ui.small("Display conversion: BT.601 coefficients; unspecified range is treated as full. Raw plane views are unconverted.");
+        if let Some(transport) = &document.transport {
+            show_transport_inspection(ui, transport);
+        }
         if let Some(jpeg) = &record.jpeg {
             show_jpeg_inspection(ui, jpeg);
         }
         if let Some(dv) = &record.dv {
             show_dv_inspection(ui, dv);
+        }
+        if let Some(mpeg2) = &record.mpeg2 {
+            show_mpeg2_inspection(ui, mpeg2);
         }
     }
 
@@ -314,7 +378,7 @@ impl ViewerApp {
             return;
         };
         let record = &document.frames[self.frame_index];
-        let frame = display_frame(record, self.dv_structure);
+        let frame = display_frame(record, self.structure_view);
         let Some((width, height)) = display::dimensions(frame, self.display_mode) else {
             return;
         };
@@ -388,13 +452,93 @@ impl ViewerApp {
 
 fn display_frame(
     record: &crate::document::FrameRecord,
-    dv_structure: bool,
+    structure_view: StructureView,
 ) -> &mmrecode_core::VideoFrame {
-    if dv_structure && let Some(dv) = &record.dv {
-        &dv.dif_map
-    } else {
-        &record.frame
+    match (structure_view, &record.dv, &record.mpeg2) {
+        (StructureView::DifMap, Some(dv), _) => &dv.dif_map,
+        (StructureView::MacroblockMap, _, Some(mpeg2)) => &mpeg2.macroblock_map,
+        _ => &record.frame,
     }
+}
+
+fn show_transport_inspection(ui: &mut egui::Ui, transport: &TransportInspection) {
+    ui.separator();
+    ui.label(RichText::new("MPEG-2 Transport").strong());
+    ui.monospace(format!(
+        "{} TS packets, {} PAT, {} PMT, {} PES, {} PCR",
+        transport.packet_count,
+        transport.pat_count,
+        transport.pmt_count,
+        transport.pes_count,
+        transport.pcr_count
+    ));
+    for program in &transport.programs {
+        ui.monospace(format!(
+            "Program {}: PMT 0x{:04x}, PCR 0x{:04x}",
+            program.program_number, program.pmt_pid, program.pcr_pid
+        ));
+        for &(pid, stream_type) in &program.streams {
+            ui.monospace(format!(
+                "  PID 0x{pid:04x}, stream type 0x{stream_type:02x}"
+            ));
+        }
+    }
+    ui.small("Picture byte ranges below are relative to the demultiplexed elementary stream.");
+}
+
+fn show_mpeg2_inspection(ui: &mut egui::Ui, mpeg2: &Mpeg2Inspection) {
+    ui.separator();
+    ui.label(RichText::new("MPEG-2 structure").strong());
+    ui.monospace(format!(
+        "source 0x{:08x}..0x{:08x} ({} bytes)",
+        mpeg2.source_range.start,
+        mpeg2.source_range.end,
+        mpeg2.source_range.len()
+    ));
+    ui.monospace(format!(
+        "{:?} picture: temporal {}, decode {}, display {}",
+        mpeg2.picture_type, mpeg2.temporal_reference, mpeg2.decode_order, mpeg2.presentation_order
+    ));
+    ui.monospace(format!(
+        "{:?}, random access {:?}, references {:?}",
+        mpeg2.picture_structure, mpeg2.random_access, mpeg2.references
+    ));
+    ui.monospace(format!(
+        "{}×{} {:?}, {}/{} fps, profile/level 0x{:02x}",
+        mpeg2.sequence.width,
+        mpeg2.sequence.height,
+        mpeg2.sequence.chroma_format,
+        mpeg2.sequence.frame_rate.numerator(),
+        mpeg2.sequence.frame_rate.denominator(),
+        mpeg2.sequence.profile_and_level_indication
+    ));
+    ui.monospace(format!(
+        "{} slice(s), {} macroblock(s), VBV {} bits",
+        mpeg2.slice_count,
+        mpeg2.macroblocks.len(),
+        mpeg2.sequence.vbv_buffer_size_bits
+    ));
+    ui.monospace(format!(
+        "progressive {}, top first {}, repeat first {}",
+        mpeg2.progressive_frame, mpeg2.top_field_first, mpeg2.repeat_first_field
+    ));
+    let intra = mpeg2
+        .macroblocks
+        .iter()
+        .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Intra)
+        .count();
+    let predicted = mpeg2
+        .macroblocks
+        .iter()
+        .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Predicted)
+        .count();
+    let skipped = mpeg2.macroblocks.len().saturating_sub(intra + predicted);
+    ui.monospace(format!(
+        "macroblocks: {intra} intra, {predicted} predicted, {skipped} skipped"
+    ));
+    ui.small(
+        "Macroblock map: intra green, P prediction amber, B prediction violet, skipped blue/dark violet, field prediction cyan/magenta.",
+    );
 }
 
 fn show_dv_inspection(ui: &mut egui::Ui, dv: &DvInspection) {

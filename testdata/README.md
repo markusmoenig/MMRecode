@@ -12,7 +12,7 @@ container, CLI, and verification tests.
 - Keep large or third-party corpora outside Git. A future corpus manifest may
   identify those by URL, local path, license, size, and digest.
 - A file under `valid/` must be independently decodable. Files under `parser/`
-  exercise marker syntax and are not necessarily complete decodable images.
+  exercise syntax and are not necessarily complete decodable media.
 
 ## JPEG corpus
 
@@ -42,3 +42,19 @@ rustc testdata/tools/generate_jpeg_vectors.rs \
 Regeneration requires FFmpeg. Encoder output can change between FFmpeg
 versions, so review binary and manifest digest changes rather than assuming
 they are mechanical.
+
+## DV corpus
+
+`dv/valid/` contains one independently generated raw DV25 frame for each supported television
+system. See [`dv/README.md`](dv/README.md) for provenance and regeneration instructions.
+
+## MPEG-2 Video corpus
+
+`mpeg2/valid/` contains small Main Profile/Main Level elementary streams covering progressive,
+interlaced, closed-GOP, and open-GOP behavior. See [`mpeg2/README.md`](mpeg2/README.md) for the
+vector descriptions, checksums, and regeneration command.
+
+## MPEG-2 Transport Stream corpus
+
+`mpegts/valid/` contains an independently generated single-program 188-byte transport stream with
+MPEG-2 Video. See [`mpegts/README.md`](mpegts/README.md) for provenance and regeneration details.

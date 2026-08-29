@@ -31,15 +31,19 @@ fn run() -> Result<(), String> {
         }
         Some("extract-dv-audio") => extract_dv_audio_command(&mut arguments),
         Some("encode-dv") => encode_dv_command(&mut arguments),
+        Some("encode-mpeg2") => encode_mpeg2_command(&mut arguments),
+        Some("mux-mpegts") => mux_mpegts_command(&mut arguments),
+        Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
+        Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
         Some("decode") => {
             let input = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode decode <media-file> <output.y4m>".to_owned())?;
             let output = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode decode <media-file> <output.y4m>".to_owned())?;
             if arguments.next().is_some() {
-                return Err("usage: mmrecode decode <mjpg-or-dv> <output.y4m>".to_owned());
+                return Err("usage: mmrecode decode <media-file> <output.y4m>".to_owned());
             }
             decode(std::path::Path::new(&input), std::path::Path::new(&output))
         }
@@ -73,10 +77,10 @@ fn run() -> Result<(), String> {
         Some("verify") => {
             let input = arguments
                 .next()
-                .ok_or_else(|| "usage: mmrecode verify <input.mjpg> [reference.y4m]".to_owned())?;
+                .ok_or_else(|| "usage: mmrecode verify <media-file> [reference.y4m]".to_owned())?;
             let reference = arguments.next();
             if arguments.next().is_some() {
-                return Err("usage: mmrecode verify <input.mjpg> [reference.y4m]".to_owned());
+                return Err("usage: mmrecode verify <media-file> [reference.y4m]".to_owned());
             }
             verify(
                 std::path::Path::new(&input),
@@ -102,6 +106,274 @@ fn run() -> Result<(), String> {
             "command '{other}' is not implemented; run 'mmrecode help' for available commands"
         )),
     }
+}
+
+fn encode_mpeg2_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode encode-mpeg2 <input.y4m> <output.m2v> [quantiser-scale-code]";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let quantiser_scale_code = arguments
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "quantiser scale must be valid UTF-8".to_owned())?
+                .parse::<u8>()
+                .map_err(|_| "quantiser scale must be an integer from 1 through 31".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(8);
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    encode_mpeg2(
+        std::path::Path::new(&input),
+        std::path::Path::new(&output),
+        quantiser_scale_code,
+    )
+}
+
+fn mux_mpegts_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    use mmrecode_core::Muxer as _;
+
+    let usage = "usage: mmrecode mux-mpegts <input.m2v> <output.ts>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let input = std::path::Path::new(&input);
+    let output = std::path::Path::new(&output);
+    let elementary = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let stream = mmrecode_mpeg2::parse_stream(&elementary).map_err(|error| error.to_string())?;
+    let dependencies =
+        mmrecode_mpeg2::analyze_dependencies(&stream).map_err(|error| error.to_string())?;
+    let frame_rate = stream.pictures()[0].sequence.frame_rate;
+    let frame_time = mmrecode_core::Rational::new(frame_rate.denominator(), frame_rate.numerator())
+        .map_err(|error| error.to_string())?;
+    let mut muxer = mmrecode_mpegts::MpegTsMuxer::new();
+    let stream_id = muxer
+        .add_stream(mmrecode_core::StreamDescriptor {
+            id: mmrecode_core::StreamId(0),
+            codec: mmrecode_core::CodecDescriptor {
+                codec_id: mmrecode_core::CodecId::new("video/mpeg2"),
+                codec_tag: None,
+                media_type: mmrecode_core::MediaType::Video,
+                configuration: Vec::new(),
+            },
+            time_base: mmrecode_core::Rational::new(1, 90_000)
+                .map_err(|error| error.to_string())?,
+        })
+        .map_err(|error| error.to_string())?;
+    for (index, (picture, dependency)) in stream.pictures().iter().zip(&dependencies).enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            stream.pictures()[index - 1].source_range.end
+        };
+        let end = if index + 1 == stream.pictures().len() {
+            elementary.len()
+        } else {
+            picture.source_range.end
+        };
+        let mut flags = mmrecode_core::PacketFlags::empty();
+        if dependency.random_access == mmrecode_core::RandomAccessKind::Clean {
+            flags.insert(mmrecode_core::PacketFlags::KEY);
+        }
+        muxer
+            .write_packet(mmrecode_core::Packet {
+                stream_id,
+                data: elementary[start..end].to_vec(),
+                pts: Some(mmrecode_core::Timestamp {
+                    value: dependency.presentation_order,
+                    time_base: frame_time,
+                }),
+                dts: Some(mmrecode_core::Timestamp {
+                    value: dependency.decode_order,
+                    time_base: frame_time,
+                }),
+                duration: Some(mmrecode_core::Timestamp {
+                    value: 1,
+                    time_base: frame_time,
+                }),
+                flags,
+                side_data: Vec::new(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    muxer.finalize().map_err(|error| error.to_string())?;
+    let transport = muxer.into_bytes().map_err(|error| error.to_string())?;
+    std::fs::write(output, &transport)
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    println!(
+        "Muxed {} MPEG-2 Video bytes into {} transport packets at {}",
+        elementary.len(),
+        transport.len() / mmrecode_mpegts::TS_PACKET_SIZE,
+        output.display()
+    );
+    Ok(())
+}
+
+fn demux_mpegts_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode demux-mpegts <input.ts> <output.m2v>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let input = std::path::Path::new(&input);
+    let output = std::path::Path::new(&output);
+    let bytes = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let transport =
+        mmrecode_mpegts::demux_transport_stream(&bytes).map_err(|error| error.to_string())?;
+    let elementary = transport
+        .mpeg2_video_bytes()
+        .map_err(|error| error.to_string())?;
+    std::fs::write(output, &elementary)
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    println!(
+        "Demuxed {} MPEG-2 Video bytes from {} transport packets to {}",
+        elementary.len(),
+        transport.packets.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn plan_mpeg2_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode plan-mpeg2 <input.m2v> <display-start> <display-end>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let start = parse_i64_argument(arguments.next(), "display-start", usage)?;
+    let end = parse_i64_argument(arguments.next(), "display-end", usage)?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    plan_mpeg2(std::path::Path::new(&input), start..end)
+}
+
+fn parse_i64_argument(
+    argument: Option<std::ffi::OsString>,
+    name: &str,
+    usage: &str,
+) -> Result<i64, String> {
+    argument
+        .ok_or_else(|| usage.to_owned())?
+        .to_str()
+        .ok_or_else(|| format!("{name} must be valid UTF-8"))?
+        .parse()
+        .map_err(|_| format!("{name} must be an integer"))
+}
+
+fn plan_mpeg2(input: &std::path::Path, edited: std::ops::Range<i64>) -> Result<(), String> {
+    let bytes = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let stream = mmrecode_mpeg2::parse_stream(&bytes).map_err(|error| error.to_string())?;
+    let plan =
+        mmrecode_mpeg2::plan_smart_render(&stream, edited).map_err(|error| error.to_string())?;
+    println!("MPEG-2 smart-render plan: {}", input.display());
+    println!(
+        "Edited display range: {}..{}",
+        plan.edited_presentation_range.start, plan.edited_presentation_range.end
+    );
+    for picture in &plan.pictures {
+        let action = match &picture.disposition {
+            mmrecode_mpeg2::SmartRenderDisposition::Copy => "copy".to_owned(),
+            mmrecode_mpeg2::SmartRenderDisposition::EncodeEdited => "encode (edited)".to_owned(),
+            mmrecode_mpeg2::SmartRenderDisposition::BridgeEncode {
+                affected_references,
+            } => format!(
+                "bridge-encode (affected refs {})",
+                affected_references
+                    .iter()
+                    .map(|reference| reference.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
+        println!(
+            "Picture {}: decode {}, display {}, bytes 0x{:08x}..0x{:08x}: {action}",
+            picture.picture_id.0,
+            picture.decode_order,
+            picture.presentation_order,
+            picture.source_range.start,
+            picture.source_range.end
+        );
+    }
+    let encoded_count = plan
+        .pictures
+        .iter()
+        .filter(|picture| picture.disposition != mmrecode_mpeg2::SmartRenderDisposition::Copy)
+        .count();
+    let ranges = plan
+        .encode_presentation_ranges
+        .iter()
+        .map(|range| format!("{}..{}", range.start, range.end))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Encode display range(s): {ranges}");
+    println!(
+        "Pictures copied: {}; encoded/bridged: {}",
+        plan.pictures.len() - encoded_count,
+        encoded_count
+    );
+    Ok(())
+}
+
+fn encode_mpeg2(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    quantiser_scale_code: u8,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let file = std::fs::File::open(input)
+        .map_err(|error| format!("cannot open '{}': {error}", input.display()))?;
+    let mut reader = mmrecode_y4m::Y4mReader::new(std::io::BufReader::new(file));
+    let mut frames = Vec::new();
+    while let Some(frame) = reader.read_frame().map_err(|error| error.to_string())? {
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        return Err("Y4M input contains no frames".to_owned());
+    }
+    let encoded = mmrecode_mpeg2::encode_stream(
+        &frames,
+        mmrecode_mpeg2::Mpeg2EncodeOptions {
+            quantiser_scale_code,
+            ..mmrecode_mpeg2::Mpeg2EncodeOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut aggregate_mse = 0.0;
+    for (index, (source, reconstruction)) in frames.iter().zip(&encoded.reconstructed).enumerate() {
+        let report = mmrecode_quality::compare_video_frames(source, reconstruction)
+            .map_err(|error| error.to_string())?;
+        aggregate_mse += report.mean_squared_error;
+        println!("Frame {}: {}", index + 1, quality_summary(&report));
+    }
+    std::fs::File::create(output)
+        .and_then(|mut file| file.write_all(&encoded.data))
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    let frame_count_f64 =
+        f64::from(u32::try_from(frames.len()).map_err(|_| "too many frames for quality summary")?);
+    println!(
+        "Encoded {} frame(s) as MPEG-2 Video to {} ({} bytes, mean frame MSE {:.4})",
+        frames.len(),
+        output.display(),
+        encoded.data.len(),
+        aggregate_mse / frame_count_f64
+    );
+    Ok(())
 }
 
 fn encode_dv_command(
@@ -209,7 +481,18 @@ fn decode(input: &std::path::Path, output: &std::path::Path) -> Result<(), Strin
     let bytes = std::fs::read(input)
         .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
     if bytes.is_empty() {
-        return Err("input contains no JPEG frames".to_owned());
+        return Err("input contains no media frames".to_owned());
+    }
+    if is_mpegts(&bytes) {
+        let transport =
+            mmrecode_mpegts::demux_transport_stream(&bytes).map_err(|error| error.to_string())?;
+        let elementary = transport
+            .mpeg2_video_bytes()
+            .map_err(|error| error.to_string())?;
+        return decode_mpeg2(output, &elementary);
+    }
+    if is_mpeg2_video(&bytes) {
+        return decode_mpeg2(output, &bytes);
     }
     if mmrecode_dv::detect_profile_prefix(&bytes).is_ok() {
         return decode_dv(input, output, &bytes);
@@ -237,6 +520,28 @@ fn decode(input: &std::path::Path, output: &std::path::Path) -> Result<(), Strin
         .map_err(|error| format!("cannot finish '{}': {error}", output.display()))?;
     println!(
         "Decoded {frame_count} JPEG frame(s) to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn decode_mpeg2(output: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let decoded = mmrecode_mpeg2::decode_stream(bytes).map_err(|error| error.to_string())?;
+    let file = std::fs::File::create(output)
+        .map_err(|error| format!("cannot create '{}': {error}", output.display()))?;
+    let mut y4m = mmrecode_y4m::Y4mWriter::new(std::io::BufWriter::new(file));
+    for picture in &decoded {
+        y4m.write_frame(&picture.frame)
+            .map_err(|error| error.to_string())?;
+    }
+    y4m.into_inner()
+        .flush()
+        .map_err(|error| format!("cannot finish '{}': {error}", output.display()))?;
+    println!(
+        "Decoded {} MPEG-2 picture(s) in presentation order to {}",
+        decoded.len(),
         output.display()
     );
     Ok(())
@@ -319,6 +624,17 @@ fn encode_y4m(
 fn verify(input: &std::path::Path, reference: Option<&std::path::Path>) -> Result<(), String> {
     let bytes = std::fs::read(input)
         .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    if is_mpegts(&bytes) {
+        let transport =
+            mmrecode_mpegts::demux_transport_stream(&bytes).map_err(|error| error.to_string())?;
+        let elementary = transport
+            .mpeg2_video_bytes()
+            .map_err(|error| error.to_string())?;
+        return verify_mpeg2(&elementary, reference);
+    }
+    if is_mpeg2_video(&bytes) {
+        return verify_mpeg2(&bytes, reference);
+    }
     let mut reference_reader = reference
         .map(|path| {
             let file = std::fs::File::open(path)
@@ -368,6 +684,56 @@ fn verify(input: &std::path::Path, reference: Option<&std::path::Path>) -> Resul
         return Err("reference Y4M has more frames than the JPEG input".to_owned());
     }
     println!("Verification passed for {frame_count} frame(s)");
+    Ok(())
+}
+
+fn verify_mpeg2(bytes: &[u8], reference: Option<&std::path::Path>) -> Result<(), String> {
+    let stream = mmrecode_mpeg2::parse_stream(bytes).map_err(|error| error.to_string())?;
+    let dependencies =
+        mmrecode_mpeg2::analyze_dependencies(&stream).map_err(|error| error.to_string())?;
+    let decoded = mmrecode_mpeg2::decode_stream(bytes).map_err(|error| error.to_string())?;
+    let mut reference_reader = reference
+        .map(|path| {
+            let file = std::fs::File::open(path)
+                .map_err(|error| format!("cannot open '{}': {error}", path.display()))?;
+            Ok::<_, String>(mmrecode_y4m::Y4mReader::new(std::io::BufReader::new(file)))
+        })
+        .transpose()?;
+    for (index, picture) in decoded.iter().enumerate() {
+        println!(
+            "Picture {}: {:?}, decode {}, display {}, {}x{} {:?}",
+            index + 1,
+            picture.picture_type,
+            picture.decode_order,
+            picture.presentation_order,
+            picture.frame.width,
+            picture.frame.height,
+            picture.frame.format
+        );
+        if let Some(reader) = &mut reference_reader {
+            let expected = reader
+                .read_frame()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("reference Y4M has fewer than {} frames", index + 1))?;
+            let report = mmrecode_quality::compare_video_frames(&expected, &picture.frame)
+                .map_err(|error| error.to_string())?;
+            print_quality_report(index + 1, &report);
+        }
+    }
+    if let Some(reader) = &mut reference_reader
+        && reader
+            .read_frame()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("reference Y4M has more frames than the MPEG-2 input".to_owned());
+    }
+    println!(
+        "Verification passed for {} MPEG-2 picture(s), {} dependency record(s), {} start code(s)",
+        decoded.len(),
+        dependencies.len(),
+        stream.units().len()
+    );
     Ok(())
 }
 
@@ -444,6 +810,12 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("input is empty".to_owned());
     }
+    if is_mpegts(&bytes) {
+        return inspect_mpegts(path, &bytes);
+    }
+    if is_mpeg2_video(&bytes) {
+        return inspect_mpeg2(path, &bytes);
+    }
     if mmrecode_dv::detect_profile_prefix(&bytes).is_ok() {
         return inspect_dv(path, &bytes);
     }
@@ -472,6 +844,164 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     if multiple_frames {
         println!("Motion JPEG frames: {frame_count}");
     }
+    Ok(())
+}
+
+fn is_mpeg2_video(bytes: &[u8]) -> bool {
+    bytes
+        .windows(4)
+        .take(256)
+        .any(|window| window == [0, 0, 1, 0xb3])
+}
+
+fn is_mpegts(bytes: &[u8]) -> bool {
+    bytes.len() >= mmrecode_mpegts::TS_PACKET_SIZE
+        && bytes
+            .chunks(mmrecode_mpegts::TS_PACKET_SIZE)
+            .take(3)
+            .all(|packet| packet.first() == Some(&0x47))
+}
+
+fn inspect_mpegts(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let transport =
+        mmrecode_mpegts::demux_transport_stream(bytes).map_err(|error| error.to_string())?;
+    println!("MPEG-2 Transport Stream: {}", path.display());
+    println!(
+        "File size: {} bytes, {} packet(s) of 188 bytes",
+        bytes.len(),
+        transport.packets.len()
+    );
+    println!(
+        "PAT section(s): {}, PMT section(s): {}, PES packet(s): {}, issue(s): {}",
+        transport.program_association_tables.len(),
+        transport.program_map_tables.len(),
+        transport.elementary_packets.len(),
+        transport.issues.len()
+    );
+    for table in &transport.program_map_tables {
+        println!(
+            "Program {}: PMT PID 0x{:04x}, PCR PID 0x{:04x}, version {}",
+            table.program_number, table.pid, table.pcr_pid, table.version
+        );
+        for stream in &table.streams {
+            let descriptor = transport
+                .streams
+                .iter()
+                .find(|descriptor| descriptor.id.0 == u32::from(stream.elementary_pid));
+            println!(
+                "  PID 0x{:04x}: stream type 0x{:02x}, {}",
+                stream.elementary_pid,
+                stream.stream_type,
+                descriptor.map_or("unknown", |value| value.codec.codec_id.as_str())
+            );
+        }
+    }
+    let pcr_count = transport
+        .packets
+        .iter()
+        .filter(|packet| packet.pcr.is_some())
+        .count();
+    println!("PCR samples: {pcr_count}");
+    if let Ok(elementary) = transport.mpeg2_video_bytes() {
+        let video = mmrecode_mpeg2::parse_stream(&elementary).map_err(|error| error.to_string())?;
+        let sequence = &video.pictures()[0].sequence;
+        println!(
+            "MPEG-2 Video: {}x{}, {}/{} fps, {} picture(s), {} elementary byte(s)",
+            sequence.width,
+            sequence.height,
+            sequence.frame_rate.numerator(),
+            sequence.frame_rate.denominator(),
+            video.pictures().len(),
+            elementary.len()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_mpeg2(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::fmt::Write as _;
+
+    let stream = mmrecode_mpeg2::parse_stream(bytes).map_err(|error| error.to_string())?;
+    let dependencies =
+        mmrecode_mpeg2::analyze_dependencies(&stream).map_err(|error| error.to_string())?;
+    let sequence = &stream.pictures()[0].sequence;
+    let mut report = String::new();
+    let _ = writeln!(report, "MPEG-2 Video: {}", path.display());
+    let _ = writeln!(report, "File size: {} bytes", bytes.len());
+    let _ = writeln!(
+        report,
+        "Sequence: {}x{}, {:?}, {}/{} fps, profile/level 0x{:02x}",
+        sequence.width,
+        sequence.height,
+        sequence.chroma_format,
+        sequence.frame_rate.numerator(),
+        sequence.frame_rate.denominator(),
+        sequence.profile_and_level_indication
+    );
+    let _ = writeln!(
+        report,
+        "Progressive sequence: {}, bit rate: {}, VBV: {} bits",
+        sequence.progressive_sequence,
+        sequence
+            .bit_rate
+            .map_or_else(|| "variable".to_owned(), |rate| format!("{rate} bit/s")),
+        sequence.vbv_buffer_size_bits
+    );
+    if let Some(display) = sequence.display {
+        let _ = writeln!(
+            report,
+            "Display: {}x{}, video format {}, colour {:?}",
+            display.display_horizontal_size,
+            display.display_vertical_size,
+            display.video_format,
+            display.colour_description
+        );
+    }
+    let _ = writeln!(
+        report,
+        "Start codes: {}, GOPs: {}, pictures: {} (decode order below)",
+        stream.units().len(),
+        stream.groups().len(),
+        stream.pictures().len()
+    );
+    for (index, (picture, dependency)) in stream.pictures().iter().zip(&dependencies).enumerate() {
+        let references = dependency
+            .references
+            .iter()
+            .map(|reference| reference.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(
+            report,
+            "Picture {index}: {:?}, temporal {}, decode {}, display {}, {:?}, refs [{}], {} slice(s), bytes 0x{:08x}..0x{:08x}",
+            picture.header.picture_coding_type,
+            picture.header.temporal_reference,
+            dependency.decode_order,
+            dependency.presentation_order,
+            dependency.random_access,
+            references,
+            picture.slices.len(),
+            picture.source_range.start,
+            picture.source_range.end
+        );
+        let extension = picture.coding_extension;
+        let _ = writeln!(
+            report,
+            "  {:?}, progressive {}, top-first {}, frame-pred {}, qscale {}, intra-VLC {}, alternate-scan {}",
+            extension.picture_structure,
+            extension.progressive_frame,
+            extension.top_field_first,
+            extension.frame_pred_frame_dct,
+            if extension.q_scale_type {
+                "non-linear"
+            } else {
+                "linear"
+            },
+            extension.intra_vlc_format,
+            extension.alternate_scan
+        );
+    }
+    print!("{report}");
     Ok(())
 }
 
@@ -713,12 +1243,16 @@ fn print_help() {
     println!(
         "MMRecode media-codec tools\n\n\
          Usage: mmrecode <command> [arguments]\n\n\
-         Available commands:\n  inspect <media-file>  Inspect JPEG/MJPEG or raw DV syntax\n  \
+         Available commands:\n  inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
-         decode <mjpg-or-dv> <y4m>  Decode JPEG or raw DV frame(s) to YUV4MPEG2\n  \
+         decode <media-file> <y4m>  Decode JPEG, raw DV, MPEG-2 Video, or MPEG-TS to YUV4MPEG2\n  \
          encode-dv <y4m> <dv>  Encode native-layout Y4M frame(s) as raw DV25\n  \
+         encode-mpeg2 <y4m> <m2v> [qscale]  Encode Y4M as MPEG-2 Main Profile Video\n  \
+         mux-mpegts <m2v> <ts>  Mux MPEG-2 Video into a single-program transport stream\n  \
+         demux-mpegts <ts> <m2v>  Extract the first MPEG-2 Video elementary stream\n  \
+         plan-mpeg2 <m2v> <start> <end>  Explain copy and bridge-encode picture ranges\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
-         verify <mjpg> [reference.y4m]  Verify syntax, reconstruction, and optional quality\n  \
+         verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \
          help                 Show this help\n  version              Show the version\n\n\
          Planned commands:\n  edit\n  benchmark"
