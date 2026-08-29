@@ -1,0 +1,13 @@
+[package]
+name = "mmrecode-core"
+description = "Shared media types and interfaces for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+

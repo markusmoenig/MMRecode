@@ -1,0 +1,20 @@
+[package]
+name = "mmrecode-mjpeg"
+description = "Motion JPEG codec implementation for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mmrecode-bitstream.workspace = true
+mmrecode-core.workspace = true
+
+[dev-dependencies]
+mmrecode-testkit.workspace = true
+
+[lints]
+workspace = true
+

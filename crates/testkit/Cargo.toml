@@ -1,0 +1,16 @@
+[package]
+name = "mmrecode-testkit"
+description = "Verification support shared by MMRecode codec tests"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mmrecode-core.workspace = true
+
+[lints]
+workspace = true
+

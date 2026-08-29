@@ -1,0 +1,16 @@
+[package]
+name = "mmrecode-bitstream"
+description = "Bit-level reading and writing utilities for MMRecode codecs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mmrecode-core.workspace = true
+
+[lints]
+workspace = true
+

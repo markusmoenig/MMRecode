@@ -1,0 +1,16 @@
+[package]
+name = "mmrecode-y4m"
+description = "YUV4MPEG2 test input and output for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mmrecode-core.workspace = true
+
+[lints]
+workspace = true
+

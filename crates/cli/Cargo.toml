@@ -1,0 +1,23 @@
+[package]
+name = "mmrecode-cli"
+description = "Command-line tools for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mmrecode"
+path = "src/main.rs"
+
+[dependencies]
+mmrecode-core.workspace = true
+mmrecode-mjpeg.workspace = true
+mmrecode-quality.workspace = true
+mmrecode-y4m.workspace = true
+
+[lints]
+workspace = true
+

@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.y4m
+*.avi
+*.mov
+*.mp4
+*.mxf
+*.ts
+
