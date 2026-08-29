@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "crates/apps/viewer",
     "crates/bitstream",
+    "crates/capi",
     "crates/cli",
     "crates/codecs/mjpeg",
     "crates/containers/y4m",
@@ -14,12 +16,14 @@ resolver = "3"
 version = "0.0.1"
 authors = ["Markus Moenig"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }
 mmrecode-bitstream = { path = "crates/bitstream" }
+mmrecode-capi = { path = "crates/capi" }
 mmrecode-core = { path = "crates/core" }
 mmrecode-mjpeg = { path = "crates/codecs/mjpeg" }
 mmrecode-quality = { path = "crates/quality" }
@@ -33,4 +37,3 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-

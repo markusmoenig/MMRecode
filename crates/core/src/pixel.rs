@@ -4,6 +4,8 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum PixelFormat {
+    /// Planar eight-bit grayscale.
+    Gray8,
     /// Planar 8-bit 4:2:0 YCbCr.
     Yuv420p8,
     /// Planar 8-bit 4:2:2 YCbCr.

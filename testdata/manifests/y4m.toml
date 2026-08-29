@@ -1,0 +1,11 @@
+format_version = 1
+corpus = "MMRecode Y4M regression vectors"
+
+[[vector]]
+path = "y4m/valid/two-frame-420.y4m"
+class = "valid"
+description = "Two 16x16 full-range 4:2:0 test-pattern frames"
+provenance = "Generated from FFmpeg 9.0.1 testsrc2 by testdata/tools/generate_jpeg_vectors.rs"
+license = "Apache-2.0"
+size = 852
+sha256 = "e55e6945f74fec9a3f555479d7965375e8ea6771647d36614b182fc3f36bfa0c"

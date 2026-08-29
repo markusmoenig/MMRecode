@@ -55,6 +55,8 @@ Dependencies flow downward only:
 
 The diagram shows conceptual layers; `mmrecode-bitstream` depends on `mmrecode-core` for common
 errors, while codec crates depend on both. `mmrecode-core` itself has no MMRecode dependencies.
+`mmrecode-viewer`, like the CLI, is an application at the top of the graph and may consume codecs,
+containers, and quality tools without becoming a dependency of any library crate.
 
 Forbidden dependencies include:
 
@@ -70,6 +72,8 @@ The initial workspace contains only crates needed for the first vertical slice:
 
 ```text
 crates/
+├── apps/
+│   └── viewer/               mmrecode-viewer; native inspection application
 ├── core/                    mmrecode-core
 ├── bitstream/               mmrecode-bitstream
 ├── codecs/
@@ -78,6 +82,7 @@ crates/
 │   └── y4m/                 mmrecode-y4m
 ├── quality/                 mmrecode-quality
 ├── testkit/                 mmrecode-testkit
+├── capi/                    mmrecode-capi; experimental C boundary
 └── cli/                     mmrecode-cli; binary: mmrecode
 ```
 
@@ -99,7 +104,6 @@ crates/
 │   └── mxf/                 mmrecode-mxf
 ├── render/                  mmrecode-render
 ├── edit/                    mmrecode-edit
-├── capi/                    mmrecode-capi
 └── facade/                  package: mmrecode
 ```
 
@@ -381,6 +385,22 @@ Direct dependencies remain supported so users can select only one codec or conta
 
 No feature should enable every codec and container by default.
 
+## Visual inspection application
+
+`mmrecode-viewer` is a development and codec-analysis application, not a media-library layer or the
+future editing UI. It directly consumes codec/container crates and never becomes their dependency.
+
+Its first implementation uses `eframe`/`egui` with the `wgpu` renderer. Frames are converted to an
+RGBA inspection texture on the CPU, while raw component planes remain separately viewable. This
+keeps the initial implementation easy to validate. A later GPU presentation module may upload
+planar textures and apply matrix, range, transfer, chroma-siting, and HDR transforms in shaders.
+That display transform remains non-normative and separate from decoder reconstruction.
+
+Codec-specific overlays—JPEG blocks today, later MPEG-2 macroblocks, motion vectors, quantizers,
+slice boundaries, and dependency information—read public inspection structures rather than placing
+GUI concerns inside codec implementations. Reusable presentation machinery should be extracted to
+a library crate only when the editor or another application actually needs it.
+
 ## Registration
 
 Static Rust dependencies are sufficient initially. Applications instantiate the implementations
@@ -391,23 +411,33 @@ should be considered only after a stable C ABI exists; Rust trait-object ABI is 
 
 ## C ABI and bindings
 
-`mmrecode-capi` is deferred until Rust APIs and ownership models have survived real codecs.
+`mmrecode-capi` begins experimentally after the first end-to-end MJPEG slice. This gives non-Rust
+integration code something real to exercise without declaring the ABI stable. The first surface is
+deliberately narrow: one-shot baseline JPEG decode and encode, planar frame views, owned output
+buffers, version queries, and thread-local diagnostics. Streaming codec handles follow only after
+another codec has tested their lifecycle requirements.
 
 The C layer should:
 
-- Use opaque handles
+- Use opaque handles for stateful streaming objects
 - Use explicit structure sizes and ABI versions
 - Avoid exposing Rust enum layouts
 - Return structured error codes and retrievable diagnostic text
 - Permit caller-provided allocation strategies where required
 - Remain separate from internal Rust traits
 
+All allocations crossing the initial ABI have one clearly named library free function. Every
+exported operation catches Rust panics before they can unwind into C. Raw-pointer access and other
+necessary unsafe code are isolated in `mmrecode-capi`; the remaining workspace continues to forbid
+unsafe Rust.
+
 Swift, Kotlin, Python, and other bindings should build on the stable C ABI unless a language has a
 strong reason to use a native Rust binding.
 
 ## Safety and acceleration
 
-Workspace lints currently forbid unsafe Rust. This establishes a safe portable reference path.
+Workspace lints forbid unsafe Rust outside the narrowly scoped C boundary crate. This establishes a
+safe portable reference path while permitting the unavoidable pointer operations at the ABI edge.
 
 When acceleration is introduced:
 
@@ -419,8 +449,8 @@ When acceleration is introduced:
 
 ## Compatibility and versioning
 
-The workspace begins at version `0.0.1` and is not publishable. APIs may change freely while the
-first vertical slice is built.
+The workspace begins at version `0.0.1`, uses Rust 1.92, and is not publishable. APIs may change
+freely while the first vertical slice is built.
 
 Before publishing crates:
 
@@ -453,4 +483,3 @@ Before adding a module or crate, ask:
 
 If the answers are unclear, keep the implementation local until evidence establishes the correct
 boundary.
-

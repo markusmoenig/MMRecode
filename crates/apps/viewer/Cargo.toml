@@ -1,6 +1,6 @@
 [package]
-name = "mmrecode-mjpeg"
-description = "Motion JPEG codec implementation for MMRecode"
+name = "mmrecode-viewer"
+description = "Visual codec and frame inspection tool for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,12 +9,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-mmrecode-bitstream.workspace = true
+eframe.workspace = true
 mmrecode-core.workspace = true
-
-[dev-dependencies]
-mmrecode-testkit.workspace = true
+mmrecode-mjpeg.workspace = true
 mmrecode-y4m.workspace = true
 
 [lints]
 workspace = true
+

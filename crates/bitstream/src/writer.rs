@@ -41,7 +41,7 @@ impl BitWriter {
         }
 
         for bit_index in (0..count).rev() {
-            if self.bit_position % 8 == 0 {
+            if self.bit_position.is_multiple_of(8) {
                 self.data.push(0);
             }
             let bit = ((value >> bit_index) & 1) as u8;
@@ -55,7 +55,7 @@ impl BitWriter {
 
     /// Pads with zero bits to the next byte boundary.
     pub fn align_to_byte(&mut self) {
-        if self.bit_position % 8 != 0 {
+        if !self.bit_position.is_multiple_of(8) {
             self.bit_position = self.bit_position.div_ceil(8) * 8;
         }
     }

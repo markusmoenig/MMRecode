@@ -255,8 +255,21 @@ Implement only enough infrastructure to demonstrate a trustworthy end-to-end pat
 8. Frame-level quality and regression reports
 9. Basic `encode`, `decode`, `inspect`, and `verify` commands
 
-Do not initially build a GUI, C ABI, dynamic plugin system, broad container suite, GPU path, or
-elaborate rate-control system.
+Do not initially build a production editing GUI, dynamic plugin system, broad container suite,
+GPU codec path, or elaborate rate-control system. A narrow visual inspection application is useful
+development infrastructure rather than an attempt to build the editor. Keep the experimental C
+surface narrow until multiple codecs have exercised its ownership and streaming model.
+
+The first constrained implementation now exercises all nine items with eight-bit baseline
+sequential JPEG, planar grayscale and YCbCr sampling, multi-frame raw Motion JPEG streams, and Y4M
+test input/output. Its deliberately narrow limits are documented in the repository README; wider
+JPEG conformance and performance optimization remain follow-on work rather than hidden assumptions.
+An experimental one-shot C boundary now exposes that slice for early integration testing without
+promising long-term ABI stability.
+
+The native `mmrecode-viewer` application provides direct visual inspection of decoded frames, raw
+component planes, pixel samples, block boundaries, and JPEG structure. It remains above the codec
+and container libraries in the dependency graph so UI choices cannot shape normative media APIs.
 
 ### Continuation criteria
 
@@ -304,4 +317,3 @@ Patent licensing for JPEG-family formats, DV, MPEG-2, AVC, HEVC, VVC, audio code
 technologies must be evaluated separately for each use, territory, and distribution model.
 
 The project name and related trademarks are also separate from the source-code license.
-

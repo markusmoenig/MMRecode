@@ -1,0 +1,83 @@
+format_version = 1
+corpus = "MMRecode JPEG regression vectors"
+
+[[vector]]
+path = "jpeg/encoded/mmrecode-q85-420.mjpg"
+class = "encoded-regression"
+description = "Two 16x16 4:2:0 frames emitted by the MMRecode encoder at quality 85"
+provenance = "Encoded from y4m/valid/two-frame-420.y4m by MMRecode"
+license = "Apache-2.0"
+size = 1479
+sha256 = "ea67b37fc6e56b7e9065de419061a1c314cf77191efd6ea9442a85d4b66279e3"
+
+[[vector]]
+path = "jpeg/valid/baseline-420.jpg"
+class = "valid"
+description = "16x16 baseline JPEG with 4:2:0 component sampling"
+provenance = "Generated from FFmpeg 9.0.1 testsrc2 by testdata/tools/generate_jpeg_vectors.rs"
+license = "Apache-2.0"
+size = 479
+sha256 = "e96f63e030b455569408ab111bb19eb9ca5ccceb8efd528d2951c8a18965078b"
+
+[[vector]]
+path = "jpeg/valid/minimal-gray.jpg"
+class = "valid"
+description = "8x8 baseline JPEG with 4:4:4 component sampling"
+provenance = "Generated from FFmpeg 9.0.1 color source by testdata/tools/generate_jpeg_vectors.rs"
+license = "Apache-2.0"
+size = 219
+sha256 = "a917efb97c316c964d16c8d473ccfc600df1489316f64dd123a2ba8dc306ce3b"
+
+[[vector]]
+path = "jpeg/valid/unknown-app-marker.jpg"
+class = "valid"
+description = "Baseline 4:2:0 JPEG carrying an opaque APP2 payload"
+provenance = "Derived from baseline-420.jpg by the MMRecode vector generator"
+license = "Apache-2.0"
+size = 487
+sha256 = "b17a0f01c97f2b75069c0942a967c8f07455cb0e72846e1ee85b17662e284eb4"
+
+[[vector]]
+path = "jpeg/valid/restart-interval.jpg"
+class = "valid"
+description = "16x8 grayscale baseline JPEG with a one-MCU restart interval"
+provenance = "Constructed by the MMRecode vector generator and independently decoded by FFmpeg"
+license = "Apache-2.0"
+size = 146
+sha256 = "3a5555a4590ec812a2da2ed709162992887096e798aa15b052b0de7a2050c1a1"
+
+[[vector]]
+path = "jpeg/parser/stuffed-restarts.jpg"
+class = "parser-only"
+description = "Synthetic scan containing a stuffed 0xff byte and RST0/RST7 markers"
+provenance = "Constructed by the MMRecode vector generator"
+license = "Apache-2.0"
+size = 46
+sha256 = "24fde04452db661cd664737dcdb8b6f89c56cb000124193650b6acb42e311686"
+
+[[vector]]
+path = "jpeg/invalid/invalid-length.jpg"
+class = "invalid"
+description = "APP0 marker whose length is smaller than the two-byte length field"
+provenance = "Constructed by the MMRecode vector generator"
+license = "Apache-2.0"
+size = 6
+sha256 = "780806275d97563cce1485a1bd48f4398ca42c7d0cf279b63d00a4a67ab7cd43"
+
+[[vector]]
+path = "jpeg/invalid/missing-eoi.jpg"
+class = "invalid"
+description = "Valid baseline-420 vector with its EOI marker removed"
+provenance = "Derived from baseline-420.jpg by the MMRecode vector generator"
+license = "Apache-2.0"
+size = 477
+sha256 = "f1e7542a0ffaa4cda54a6f48643aabc955b2d1c276d7bc049c845c3e3723da3b"
+
+[[vector]]
+path = "jpeg/invalid/truncated-marker.jpg"
+class = "invalid"
+description = "SOI followed by a truncated marker prefix"
+provenance = "Constructed by the MMRecode vector generator"
+license = "Apache-2.0"
+size = 3
+sha256 = "6e568e1f67fba258184c78181539e5e8fdee447e49bb706fc0ea34fbf12336a5"

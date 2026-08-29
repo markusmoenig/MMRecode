@@ -1,0 +1,27 @@
+[package]
+name = "mmrecode-capi"
+description = "Experimental C API for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+mmrecode-core.workspace = true
+mmrecode-mjpeg.workspace = true
+
+# The C boundary necessarily dereferences raw pointers. Unsafe code remains
+# allowed only in this crate rather than weakening the workspace-wide rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
