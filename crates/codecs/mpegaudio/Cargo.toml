@@ -1,6 +1,6 @@
 [package]
-name = "mmrecode-mpegts"
-description = "MPEG-2 Transport Stream demuxing and muxing for MMRecode"
+name = "mmrecode-mpegaudio"
+description = "MPEG audio elementary-stream framing for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,10 +10,6 @@ publish.workspace = true
 
 [dependencies]
 mmrecode-core.workspace = true
-
-[dev-dependencies]
-mmrecode-mpeg2.workspace = true
-mmrecode-mpegaudio.workspace = true
 
 [lints]
 workspace = true

@@ -182,8 +182,22 @@ MMR_API mmr_status mmr_mpegts_mux_mpeg2(
     size_t len,
     mmr_buffer *out_buffer);
 
+/* Muxes complete MPEG-2 Video and MPEG-1 Layer II elementary streams with A/V timing. */
+MMR_API mmr_status mmr_mpegts_mux_mpeg2_mp2(
+    const uint8_t *video_data,
+    size_t video_len,
+    const uint8_t *audio_data,
+    size_t audio_len,
+    mmr_buffer *out_buffer);
+
 /* Extracts the first MPEG-2 Video elementary stream from a complete MPEG-TS. */
 MMR_API mmr_status mmr_mpegts_demux_mpeg2(
+    const uint8_t *data,
+    size_t len,
+    mmr_buffer *out_buffer);
+
+/* Extracts the first MPEG-1 Audio Layer II elementary stream from a complete MPEG-TS. */
+MMR_API mmr_status mmr_mpegts_demux_mp2(
     const uint8_t *data,
     size_t len,
     mmr_buffer *out_buffer);

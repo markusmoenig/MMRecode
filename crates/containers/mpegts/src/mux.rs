@@ -18,6 +18,8 @@ pub struct MpegTsMuxConfig {
     pub pmt_pid: u16,
     /// PID carrying MPEG-2 Video PES and PCR.
     pub video_pid: u16,
+    /// PID carrying MPEG-1 Audio Layer II PES.
+    pub audio_pid: u16,
     /// Maximum number of emitted TS packets between repeated PAT/PMT pairs.
     pub psi_interval_packets: usize,
 }
@@ -29,6 +31,7 @@ impl Default for MpegTsMuxConfig {
             program_number: 1,
             pmt_pid: 0x1000,
             video_pid: 0x0100,
+            audio_pid: 0x0101,
             psi_interval_packets: 40,
         }
     }
@@ -40,7 +43,7 @@ pub struct MpegTsMuxer {
     config: MpegTsMuxConfig,
     output: Vec<u8>,
     continuity: HashMap<u16, u8>,
-    stream: Option<StreamDescriptor>,
+    streams: Vec<StreamDescriptor>,
     finalized: bool,
     wrote_payload: bool,
     packets_since_psi: usize,
@@ -61,7 +64,7 @@ impl MpegTsMuxer {
             config,
             output: Vec::new(),
             continuity: HashMap::new(),
-            stream: None,
+            streams: Vec::new(),
             finalized: false,
             wrote_payload: false,
             packets_since_psi: 0,
@@ -96,15 +99,24 @@ impl MpegTsMuxer {
                 "MPEG-TS program number must be non-zero".into(),
             ));
         }
-        for (name, pid) in [("PMT", config.pmt_pid), ("video", config.video_pid)] {
+        for (name, pid) in [
+            ("PMT", config.pmt_pid),
+            ("video", config.video_pid),
+            ("audio", config.audio_pid),
+        ] {
             if !(0x0010..0x1fff).contains(&pid) {
                 return Err(Error::InvalidData(format!(
                     "{name} PID 0x{pid:04x} is reserved"
                 )));
             }
         }
-        if config.pmt_pid == config.video_pid {
-            return Err(Error::InvalidData("PMT and video PID must differ".into()));
+        if config.pmt_pid == config.video_pid
+            || config.pmt_pid == config.audio_pid
+            || config.video_pid == config.audio_pid
+        {
+            return Err(Error::InvalidData(
+                "PMT, video, and audio PIDs must differ".into(),
+            ));
         }
         if config.psi_interval_packets == 0 {
             return Err(Error::InvalidData(
@@ -116,7 +128,7 @@ impl MpegTsMuxer {
 
     fn emit_psi(&mut self) -> Result<()> {
         let pat = make_pat(self.config);
-        let pmt = make_pmt(self.config);
+        let pmt = make_pmt(self.config, &self.streams)?;
         self.emit_section(0, &pat)?;
         self.emit_section(self.config.pmt_pid, &pmt)?;
         self.packets_since_psi = 0;
@@ -135,10 +147,16 @@ impl MpegTsMuxer {
         self.emit_transport_packet(pid, true, &payload, None, false)
     }
 
-    fn emit_pes(&mut self, packet: &Packet) -> Result<()> {
+    fn emit_pes(
+        &mut self,
+        packet: &Packet,
+        pid: u16,
+        pes_stream_id: u8,
+        video: bool,
+    ) -> Result<()> {
         if packet.data.is_empty() {
             return Err(Error::InvalidData(
-                "cannot mux an empty MPEG-2 Video packet".into(),
+                "cannot mux an empty elementary-stream packet".into(),
             ));
         }
         if packet.dts.is_some() && packet.pts.is_none() {
@@ -147,7 +165,7 @@ impl MpegTsMuxer {
         let pts = packet.pts.map(timestamp_to_90k).transpose()?;
         let dts = packet.dts.map(timestamp_to_90k).transpose()?;
         let mut pes = Vec::with_capacity(packet.data.len() + 19);
-        pes.extend_from_slice(&[0, 0, 1, 0xe0, 0, 0]);
+        pes.extend_from_slice(&[0, 0, 1, pes_stream_id, 0, 0]);
         pes.push(0x80);
         match (pts, dts) {
             (Some(pts), Some(dts)) => {
@@ -168,26 +186,71 @@ impl MpegTsMuxer {
         }
         pes.extend_from_slice(&packet.data);
 
-        let requested_pcr = dts.or(pts).unwrap_or(self.last_pcr);
-        let pcr = requested_pcr.max(self.last_pcr) & ((1_u64 << 33) - 1);
-        self.last_pcr = pcr;
+        if !video {
+            let packet_length = pes.len().checked_sub(6).ok_or_else(|| {
+                Error::InvalidState("internal PES length is shorter than its prefix".into())
+            })?;
+            let packet_length = u16::try_from(packet_length).map_err(|_| {
+                Error::Unsupported(
+                    "MPEG audio packet exceeds the 65,535-byte PES length; split it into frames"
+                        .into(),
+                )
+            })?;
+            pes[4..6].copy_from_slice(&packet_length.to_be_bytes());
+        }
+
+        let pcr_pid = self.pcr_pid()?;
+        let pcr = if pid == pcr_pid {
+            let requested = dts.or(pts).unwrap_or(self.last_pcr);
+            let value = requested.max(self.last_pcr) & ((1_u64 << 33) - 1);
+            self.last_pcr = value;
+            Some(value)
+        } else {
+            None
+        };
         let random_access = packet.flags.contains(PacketFlags::KEY);
         let mut remaining = pes.as_slice();
         let mut first = true;
         while !remaining.is_empty() {
-            let capacity = if first { 176 } else { 184 };
+            let capacity = if first && pcr.is_some() {
+                176
+            } else if first && random_access {
+                182
+            } else {
+                184
+            };
             let take = remaining.len().min(capacity);
             self.emit_transport_packet(
-                self.config.video_pid,
+                pid,
                 first,
                 &remaining[..take],
-                first.then_some(pcr),
+                if first { pcr } else { None },
                 first && random_access,
             )?;
             remaining = &remaining[take..];
             first = false;
         }
         Ok(())
+    }
+
+    fn pcr_pid(&self) -> Result<u16> {
+        if self
+            .streams
+            .iter()
+            .any(|stream| stream.codec.codec_id.as_str() == "video/mpeg2")
+        {
+            Ok(self.config.video_pid)
+        } else if self
+            .streams
+            .iter()
+            .any(|stream| stream.codec.codec_id.as_str() == "audio/mpeg1")
+        {
+            Ok(self.config.audio_pid)
+        } else {
+            Err(Error::InvalidState(
+                "transport muxer has no PCR stream".into(),
+            ))
+        }
     }
 
     fn emit_transport_packet(
@@ -204,7 +267,11 @@ impl MpegTsMuxer {
                 payload.len()
             )));
         }
-        let minimum_adaptation_length = usize::from(pcr.is_some()) * 6 + 1;
+        let minimum_adaptation_length = if pcr.is_some() {
+            7
+        } else {
+            usize::from(random_access)
+        };
         let needs_adaptation = pcr.is_some() || random_access || payload.len() < 184;
         let adaptation_length = needs_adaptation.then(|| 183 - payload.len());
         if adaptation_length.is_some_and(|length| length < minimum_adaptation_length) {
@@ -234,13 +301,15 @@ impl MpegTsMuxer {
                     write_pcr(&mut data[cursor..cursor + 6], base);
                     cursor += 6;
                 }
-                cursor += length - minimum_adaptation_length;
+                let used = 1 + usize::from(pcr.is_some()) * 6;
+                cursor += length - used;
             }
         }
         if cursor + payload.len() != TS_PACKET_SIZE {
-            return Err(Error::InvalidState(
-                "internal TS packet payload placement mismatch".into(),
-            ));
+            return Err(Error::InvalidState(format!(
+                "internal TS packet payload placement mismatch for PID 0x{pid:04x}: cursor {cursor}, payload {}",
+                payload.len()
+            )));
         }
         data[cursor..].copy_from_slice(payload);
         self.output.extend_from_slice(&data);
@@ -263,21 +332,35 @@ impl Muxer for MpegTsMuxer {
             ));
         }
         self.validate_config()?;
-        if self.stream.is_some() {
-            return Err(Error::Unsupported(
-                "initial MPEG-TS muxer supports one MPEG-2 Video stream".into(),
-            ));
+        let (pid, expected_media) = match descriptor.codec.codec_id.as_str() {
+            "video/mpeg2" => (self.config.video_pid, MediaType::Video),
+            "audio/mpeg1" => (self.config.audio_pid, MediaType::Audio),
+            codec => {
+                return Err(Error::Unsupported(format!(
+                    "initial MPEG-TS muxer does not support codec {codec}"
+                )));
+            }
+        };
+        if descriptor.codec.media_type != expected_media {
+            return Err(Error::InvalidData(format!(
+                "codec {} has incompatible media type {:?}",
+                descriptor.codec.codec_id.as_str(),
+                descriptor.codec.media_type
+            )));
         }
-        if descriptor.codec.codec_id.as_str() != "video/mpeg2"
-            || descriptor.codec.media_type != MediaType::Video
+        if self
+            .streams
+            .iter()
+            .any(|stream| stream.codec.codec_id == descriptor.codec.codec_id)
         {
-            return Err(Error::Unsupported(
-                "initial MPEG-TS muxer accepts only video/mpeg2".into(),
-            ));
+            return Err(Error::Unsupported(format!(
+                "only one {} stream is supported",
+                descriptor.codec.codec_id.as_str()
+            )));
         }
-        let id = StreamId(u32::from(self.config.video_pid));
+        let id = StreamId(u32::from(pid));
         descriptor.id = id;
-        self.stream = Some(descriptor);
+        self.streams.push(descriptor);
         Ok(id)
     }
 
@@ -285,20 +368,25 @@ impl Muxer for MpegTsMuxer {
         if self.finalized {
             return Err(Error::InvalidState("transport muxer is finalized".into()));
         }
-        let stream = self
-            .stream
-            .as_ref()
-            .ok_or_else(|| Error::InvalidState("add a stream before writing packets".into()))?;
-        if packet.stream_id != stream.id {
-            return Err(Error::InvalidData(format!(
-                "packet stream {:?} does not match registered stream {:?}",
-                packet.stream_id, stream.id
-            )));
-        }
+        let (pid, pes_stream_id, video) = self
+            .streams
+            .iter()
+            .find(|stream| stream.id == packet.stream_id)
+            .map(|stream| match stream.codec.codec_id.as_str() {
+                "video/mpeg2" => (self.config.video_pid, 0xe0, true),
+                "audio/mpeg1" => (self.config.audio_pid, 0xc0, false),
+                _ => unreachable!("unsupported codecs are rejected during registration"),
+            })
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "packet stream {:?} is not registered",
+                    packet.stream_id
+                ))
+            })?;
         if !self.wrote_payload || self.packets_since_psi >= self.config.psi_interval_packets {
             self.emit_psi()?;
         }
-        self.emit_pes(&packet)?;
+        self.emit_pes(&packet, pid, pes_stream_id, video)?;
         self.wrote_payload = true;
         Ok(())
     }
@@ -309,7 +397,7 @@ impl Muxer for MpegTsMuxer {
                 "transport muxer is already finalized".into(),
             ));
         }
-        if self.stream.is_none() || !self.wrote_payload {
+        if self.streams.is_empty() || !self.wrote_payload {
             return Err(Error::InvalidState(
                 "transport muxer has no registered stream or payload".into(),
             ));
@@ -374,28 +462,56 @@ fn make_pat(config: MpegTsMuxConfig) -> Vec<u8> {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn make_pmt(config: MpegTsMuxConfig) -> Vec<u8> {
+fn make_pmt(config: MpegTsMuxConfig, streams: &[StreamDescriptor]) -> Result<Vec<u8>> {
+    let pcr_pid = if streams
+        .iter()
+        .any(|stream| stream.codec.codec_id.as_str() == "video/mpeg2")
+    {
+        config.video_pid
+    } else if streams
+        .iter()
+        .any(|stream| stream.codec.codec_id.as_str() == "audio/mpeg1")
+    {
+        config.audio_pid
+    } else {
+        return Err(Error::InvalidState("PMT has no supported streams".into()));
+    };
+    let section_length = 13_usize
+        .checked_add(streams.len() * 5)
+        .ok_or_else(|| Error::InvalidData("PMT section length overflows".into()))?;
+    if section_length > 1021 {
+        return Err(Error::Unsupported("PMT section exceeds 1021 bytes".into()));
+    }
     let mut section = vec![
         0x02,
-        0xb0,
-        18,
+        0xb0 | ((section_length >> 8) as u8 & 0x0f),
+        section_length as u8,
         (config.program_number >> 8) as u8,
         config.program_number as u8,
         0xc1,
         0,
         0,
-        0xe0 | ((config.video_pid >> 8) as u8 & 0x1f),
-        config.video_pid as u8,
-        0xf0,
-        0,
-        0x02,
-        0xe0 | ((config.video_pid >> 8) as u8 & 0x1f),
-        config.video_pid as u8,
+        0xe0 | ((pcr_pid >> 8) as u8 & 0x1f),
+        pcr_pid as u8,
         0xf0,
         0,
     ];
+    for stream in streams {
+        let (stream_type, pid) = match stream.codec.codec_id.as_str() {
+            "video/mpeg2" => (0x02, config.video_pid),
+            "audio/mpeg1" => (0x03, config.audio_pid),
+            _ => unreachable!("unsupported codecs are rejected during registration"),
+        };
+        section.extend_from_slice(&[
+            stream_type,
+            0xe0 | ((pid >> 8) as u8 & 0x1f),
+            pid as u8,
+            0xf0,
+            0,
+        ]);
+    }
     append_crc(&mut section);
-    section
+    Ok(section)
 }
 
 fn append_crc(section: &mut Vec<u8>) {
@@ -445,6 +561,8 @@ mod tests {
 
     const MPEG2: &[u8] =
         include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
+    const MP2: &[u8] =
+        include_bytes!("../../../../testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2");
 
     #[test]
     fn deterministic_mux_round_trips_elementary_bytes() {
@@ -470,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn muxer_rejects_non_mpeg2_streams() {
+    fn muxer_rejects_unsupported_streams() {
         let mut muxer = MpegTsMuxer::new();
         let error = muxer
             .add_stream(StreamDescriptor {
@@ -484,6 +602,61 @@ mod tests {
                 time_base: Rational::new(1, 25).unwrap(),
             })
             .unwrap_err();
-        assert!(error.to_string().contains("video/mpeg2"));
+        assert!(error.to_string().contains("video/h264"));
+    }
+
+    #[test]
+    fn muxes_video_and_mpeg_audio_in_one_program() {
+        let mut muxer = MpegTsMuxer::new();
+        let clock = Rational::new(1, SYSTEM_CLOCK_FREQUENCY).unwrap();
+        let video_id = muxer
+            .add_stream(StreamDescriptor {
+                id: StreamId(0),
+                codec: CodecDescriptor {
+                    codec_id: CodecId::new("video/mpeg2"),
+                    codec_tag: None,
+                    media_type: MediaType::Video,
+                    configuration: Vec::new(),
+                },
+                time_base: clock,
+            })
+            .unwrap();
+        let audio_id = muxer
+            .add_stream(StreamDescriptor {
+                id: StreamId(0),
+                codec: CodecDescriptor {
+                    codec_id: CodecId::new("audio/mpeg1"),
+                    codec_tag: None,
+                    media_type: MediaType::Audio,
+                    configuration: Vec::new(),
+                },
+                time_base: clock,
+            })
+            .unwrap();
+        for (stream_id, data, flags) in [
+            (video_id, MPEG2, PacketFlags::KEY),
+            (audio_id, MP2, PacketFlags::empty()),
+        ] {
+            muxer
+                .write_packet(Packet {
+                    stream_id,
+                    data: data.to_vec(),
+                    pts: Some(Timestamp {
+                        value: 0,
+                        time_base: clock,
+                    }),
+                    dts: None,
+                    duration: None,
+                    flags,
+                    side_data: Vec::new(),
+                })
+                .unwrap();
+        }
+        muxer.finalize().unwrap();
+        let parsed = demux_transport_stream(&muxer.into_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.mpeg2_video_bytes().unwrap(), MPEG2);
+        assert_eq!(parsed.mpeg1_audio_bytes().unwrap(), MP2);
+        assert_eq!(parsed.program_map_tables[0].streams.len(), 2);
+        assert_eq!(parsed.program_map_tables[0].streams[1].stream_type, 3);
     }
 }

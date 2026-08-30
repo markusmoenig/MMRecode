@@ -6,10 +6,14 @@ use std::{
 };
 
 use mmrecode_mpeg2::{decode_stream, parse_stream};
+use mmrecode_mpegaudio::parse_layer2_stream;
 use mmrecode_mpegts::{TS_PACKET_SIZE, demux_transport_stream, mux_mpeg2_video};
 
 const FFMPEG_TS: &[u8] =
     include_bytes!("../../../../testdata/mpegts/valid/single-program-mpeg2.ts");
+const FFMPEG_AV_TS: &[u8] =
+    include_bytes!("../../../../testdata/mpegts/valid/single-program-mpeg2-mp2.ts");
+const MP2: &[u8] = include_bytes!("../../../../testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2");
 const MPEG2: &[u8] = include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
 
 #[test]
@@ -31,6 +35,25 @@ fn parses_independent_single_program_vector() {
     let elementary = transport.mpeg2_video_bytes().expect("extract video");
     assert_eq!(parse_stream(&elementary).unwrap().pictures().len(), 12);
     assert_eq!(decode_stream(&elementary).unwrap().len(), 12);
+}
+
+#[test]
+fn parses_independent_video_and_layer2_audio_vector() {
+    let transport = demux_transport_stream(FFMPEG_AV_TS).expect("demux FFmpeg A/V transport");
+    assert_eq!(transport.streams.len(), 2);
+    assert_eq!(transport.program_map_tables[0].streams.len(), 2);
+    assert_eq!(transport.program_map_tables[0].streams[1].stream_type, 3);
+    let audio = transport.mpeg1_audio_bytes().expect("extract MPEG audio");
+    assert_eq!(audio, MP2);
+    let frames = parse_layer2_stream(&audio).expect("parse extracted Layer II audio");
+    assert_eq!(frames.len(), 20);
+    let audio_packets: Vec<_> = transport
+        .elementary_packets
+        .iter()
+        .filter(|packet| packet.stream_id.0 == 0x0101)
+        .collect();
+    assert!(!audio_packets.is_empty());
+    assert!(audio_packets.iter().all(|packet| packet.pts.is_some()));
 }
 
 #[test]

@@ -270,6 +270,9 @@ promising long-term ABI stability.
 The native `mmrecode-viewer` application provides direct visual inspection of decoded frames, raw
 component planes, pixel samples, block boundaries, and JPEG structure. It remains above the codec
 and container libraries in the dependency graph so UI choices cannot shape normative media APIs.
+It now also provides fixed-rate animation and synchronized audio playback. A reusable playback
+crate maps exact rational frame rates to media time and accepts the rendered audio position as the
+master clock; device handling and temporary third-party MP2 sample decoding remain viewer-local.
 
 ### Subsequent vertical slices
 
@@ -287,9 +290,10 @@ field pictures, dual-prime prediction, or production VBV control are already sol
 
 The first container slice now covers 188-byte MPEG-2 Transport Stream structure, PAT/PMT program
 discovery, PES and 90 kHz timestamp reconstruction, and deterministic single-program MPEG-2 Video
-muxing. It proves the intended `Packet` boundary in both directions without coupling H.222.0
-systems syntax to the MPEG-2 codec. Audio interleaving, broadcast service tables, live CBR output,
-M2TS, seeking, and other container families remain explicit later work.
+plus optional MPEG-1 Audio Layer II muxing. Audio frames and video pictures are interleaved by exact
+timestamps. This proves the intended `Packet` boundary in both directions without coupling H.222.0
+systems syntax to either codec. Native MPEG audio sample decoding/encoding, broadcast service tables, live CBR
+output, M2TS, seeking, and other container families remain explicit later work.
 
 ### Continuation criteria
 

@@ -6,8 +6,8 @@
 use std::io::{BufRead, Write};
 
 use mmrecode_core::{
-    ColorDescription, ColorRange, Error, FieldOrder, FrameTiming, PixelFormat, Plane, Result,
-    VideoFrame,
+    ColorDescription, ColorRange, Error, FieldOrder, FrameTiming, PixelFormat, Plane, Rational,
+    Result, VideoFrame,
 };
 
 /// A parsed Y4M stream header.
@@ -21,6 +21,8 @@ pub struct Y4mHeader {
     pub format: PixelFormat,
     /// Progressive or interlaced field order.
     pub field_order: FieldOrder,
+    /// Declared frame rate, when present.
+    pub frame_rate: Option<Rational>,
     /// Sample value range, when declared by an extension.
     pub color_range: ColorRange,
 }
@@ -46,6 +48,12 @@ impl<R: BufRead> Y4mReader<R> {
     #[must_use]
     pub fn into_inner(self) -> R {
         self.input
+    }
+
+    /// Returns the parsed stream header after the first frame-read attempt.
+    #[must_use]
+    pub const fn header(&self) -> Option<&Y4mHeader> {
+        self.header.as_ref()
     }
 
     /// Reads the next frame.
@@ -117,6 +125,7 @@ fn read_stream_header(input: &mut impl BufRead) -> Result<Y4mHeader> {
     let mut height = None;
     let mut format = PixelFormat::Yuv420p8;
     let mut field_order = FieldOrder::Unspecified;
+    let mut frame_rate = None;
     let mut color_range = ColorRange::Unspecified;
     for token in tokens {
         if let Some(value) = token.strip_prefix('W') {
@@ -125,6 +134,8 @@ fn read_stream_header(input: &mut impl BufRead) -> Result<Y4mHeader> {
             height = Some(parse_dimension(value, "height")?);
         } else if let Some(value) = token.strip_prefix('I') {
             field_order = parse_interlace(value)?;
+        } else if let Some(value) = token.strip_prefix('F') {
+            frame_rate = Some(parse_ratio(value, "frame rate")?);
         } else if let Some(value) = token.strip_prefix('C') {
             format = parse_chroma(value)?;
         } else if let Some(value) = token.strip_prefix("XCOLORRANGE=") {
@@ -136,8 +147,27 @@ fn read_stream_header(input: &mut impl BufRead) -> Result<Y4mHeader> {
         height: height.ok_or_else(|| Error::InvalidData("Y4M header has no height".into()))?,
         format,
         field_order,
+        frame_rate,
         color_range,
     })
+}
+
+fn parse_ratio(value: &str, name: &str) -> Result<Rational> {
+    let (numerator, denominator) = value
+        .split_once(':')
+        .ok_or_else(|| Error::InvalidData(format!("invalid Y4M {name} {value:?}")))?;
+    let numerator = numerator
+        .parse::<i64>()
+        .map_err(|_| Error::InvalidData(format!("invalid Y4M {name} {value:?}")))?;
+    let denominator = denominator
+        .parse::<i64>()
+        .map_err(|_| Error::InvalidData(format!("invalid Y4M {name} {value:?}")))?;
+    if numerator <= 0 || denominator <= 0 {
+        return Err(Error::InvalidData(format!(
+            "Y4M {name} must be a positive ratio"
+        )));
+    }
+    Rational::new(numerator, denominator)
 }
 
 fn parse_dimension(value: &str, name: &str) -> Result<usize> {
@@ -391,7 +421,7 @@ mod tests {
 
     #[test]
     fn reads_multiple_frames() {
-        let bytes = b"YUV4MPEG2 W2 H1 Ip C444 XCOLORRANGE=LIMITED\n\
+        let bytes = b"YUV4MPEG2 W2 H1 F30000:1001 Ip C444 XCOLORRANGE=LIMITED\n\
                       FRAME\n\x01\x02\x03\x04\x05\x06\
                       FRAME\n\x07\x08\x09\x0a\x0b\x0c";
         let mut reader = Y4mReader::new(std::io::Cursor::new(bytes));
@@ -400,6 +430,19 @@ mod tests {
         assert_eq!(first.planes[0].data, [1, 2]);
         assert_eq!(second.planes[2].data, [11, 12]);
         assert_eq!(second.color.range, ColorRange::Limited);
+        assert_eq!(
+            reader.header().unwrap().frame_rate,
+            Some(mmrecode_core::Rational::new(30_000, 1_001).unwrap())
+        );
         assert!(reader.read_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_frame_rates() {
+        for rate in ["0:1", "25:0", "25", "abc:1"] {
+            let stream = format!("YUV4MPEG2 W2 H1 F{rate} Ip Cmono\nFRAME\n\0\0");
+            let mut reader = Y4mReader::new(std::io::Cursor::new(stream.into_bytes()));
+            assert!(reader.read_frame().is_err(), "accepted {rate}");
+        }
     }
 }

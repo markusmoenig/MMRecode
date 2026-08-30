@@ -6,21 +6,24 @@ container support, verification, and minimal-recompression editing.
 
 The project is growing through bounded, complete vertical slices. Its purpose and intended scope are described in
 [`concept.md`](concept.md); crate boundaries and dependency rules are described in
-[`design.md`](design.md).
+[`design.md`](design.md); and remaining work across codecs, containers, editing, playback, APIs,
+and release engineering is tracked in [`todo.md`](todo.md).
 
 ## Initial workspace
 
 - `mmrecode-core`: shared media types and codec/container interfaces
 - `mmrecode-bitstream`: bit-level readers, writers, VLC support, and start-code utilities
 - `mmrecode-mjpeg`: the first codec implementation
+- `mmrecode-mpegaudio`: MPEG-1 Audio Layer II framing and timing for pass-through
 - `mmrecode-dv`: raw DV25 DIF parsing, validation, metadata, and embedded audio
 - `mmrecode-mpeg2`: MPEG-2 Video parsing, I/P/B reconstruction/encoding, and dependency planning
 - `mmrecode-mpegts`: 188-byte MPEG-2 Transport Stream demuxing and deterministic muxing
 - `mmrecode-y4m`: simple uncompressed test input and output
+- `mmrecode-playback`: exact fixed-rate timelines and audio-clock synchronization
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
 - `mmrecode-capi`: experimental C ABI with an owned-buffer boundary
-- `mmrecode-viewer`: native visual frame and JPEG-structure inspection tool
+- `mmrecode-viewer`: native visual inspection and synchronized playback tool
 - `mmrecode-cli`: the `mmrecode` command-line application
 
 ## Status
@@ -50,9 +53,9 @@ dual-prime prediction, chroma profiles, and production VBV rate control—are ex
 
 The first container slice is implemented in `mmrecode-mpegts`. It validates 188-byte transport
 packets, continuity, PAT/PMT PSI and CRCs; discovers programs and streams; reassembles MPEG-2 PES
-with PTS/DTS and PCR timing; and deterministically muxes a timed single-program MPEG-2 Video stream.
-Native output is accepted by FFmpeg, while an independent FFmpeg vector exercises demuxing. The
-current audio, M2TS, service-table, scrambling, CBR, and seeking boundaries are documented in
+with PTS/DTS and PCR timing; and deterministically muxes timed MPEG-2 Video with optional MPEG-1
+Audio Layer II. Native A/V output is accepted by FFmpeg, while independent FFmpeg vectors exercise
+demuxing. The current audio-codec, M2TS, service-table, scrambling, CBR, and seeking boundaries are documented in
 [`crates/containers/mpegts/README.md`](crates/containers/mpegts/README.md).
 
 The current codec subset is eight-bit baseline sequential JPEG with a single interleaved scan.
@@ -76,9 +79,11 @@ cargo run -p mmrecode-cli -- \
 cargo run -p mmrecode-cli -- \
   encode-mpeg2 /tmp/mmrecode-mpeg2.y4m /tmp/mmrecode-roundtrip.m2v 8
 cargo run -p mmrecode-cli -- \
-  mux-mpegts testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode.ts
+  mux-mpegts testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode.ts \
+  testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2
 cargo run -p mmrecode-cli -- inspect /tmp/mmrecode.ts
 cargo run -p mmrecode-cli -- demux-mpegts /tmp/mmrecode.ts /tmp/mmrecode-extracted.m2v
+cargo run -p mmrecode-cli -- extract-mpegts-audio /tmp/mmrecode.ts /tmp/mmrecode-audio.mp2
 cargo run -p mmrecode-cli -- extract-dv-audio \
   testdata/dv/valid/dv25-525-60-one-frame.dv /tmp/mmrecode-dv.s16le
 cargo run -p mmrecode-cli -- \
@@ -93,7 +98,7 @@ cargo run -p mmrecode-cli -- \
 ```
 
 The experimental C API currently exposes one-shot baseline MJPEG, raw DV25, complete MPEG-2
-elementary-stream decode/encode, and MPEG-TS mux/demux. Its checked-in
+elementary-stream decode/encode, and MPEG-TS video/audio mux/demux. Its checked-in
 header is [`crates/capi/include/mmrecode.h`](crates/capi/include/mmrecode.h). Run its compiled C
 smoke test with:
 
@@ -114,11 +119,17 @@ cargo run -p mmrecode-viewer -- testdata/jpeg/valid/baseline-420.jpg
 cargo run -p mmrecode-viewer -- testdata/dv/valid/dv25-625-50-one-frame.dv
 cargo run -p mmrecode-viewer -- \
   testdata/mpeg2/valid/main-ml-progressive-open-gop.m2v
-cargo run -p mmrecode-viewer -- testdata/mpegts/valid/single-program-mpeg2.ts
+cargo run -p mmrecode-viewer -- testdata/mpegts/valid/single-program-mpeg2-mp2.ts
 ```
 
-Files can also be dropped onto the window or opened by entering a path. The viewer provides frame
-navigation, fit/manual zoom, nearest-neighbor display, individual Y/Cb/Cr planes, pixel values,
+Files can also be dropped onto the window or opened by entering a path. Space or the toolbar starts
+and pauses playback; the player also supports stop, seeking, frame stepping, looping, and volume.
+MPEG-TS MPEG Layer II and complete raw-DV audio are decoded to PCM before playback, and the rendered
+audio position is the master clock for video. MPEG-2 Video, Y4M, and raw Motion JPEG animate without
+audio; Y4M's declared frame rate is honored, while raw Motion JPEG defaults to an explicitly marked
+25 fps because it has no container timeline.
+
+The viewer also provides fit/manual zoom, nearest-neighbor display, individual Y/Cb/Cr planes, pixel values,
 8×8 block overlays, frame and plane metadata, and a collapsible JPEG marker/scan inspector. The
 initial CPU display conversion uses BT.601 coefficients; raw plane views remain unconverted so they
 can reveal decoder and sampling problems.
@@ -133,10 +144,14 @@ VBV, field flags, and colour metadata. A macroblock-map view distinguishes intra
 skipped, B-picture, and field-predicted regions.
 
 For MPEG-TS, the same decoded picture and macroblock views are augmented with transport-packet,
-PAT/PMT, program, PID, stream-type, PES, and PCR summaries.
+PAT/PMT, program, PID, stream-type, PES, PCR, and MPEG Layer II audio summaries. First video and
+audio PTS values establish the playback alignment. The viewer currently predecodes complete media,
+which is appropriate for codec vectors; bounded streaming queues are future work for long programs.
 
 The workspace minimum supported Rust version is 1.92. `mmrecode-viewer` pins `eframe` 0.35 because
-the following release raised its MSRV beyond 1.92.
+the following release raised its MSRV beyond 1.92. Viewer audio output uses Rodio, and temporary
+pure-Rust MP2 sample decoding uses Symphonia behind Rodio's `symphonia-mp2` feature. No FFmpeg
+library or executable is used during playback.
 
 ## License
 

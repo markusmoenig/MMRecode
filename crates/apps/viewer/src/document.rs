@@ -6,13 +6,15 @@ use std::{
 
 use mmrecode_core::{
     ColorDescription, ColorRange, FieldOrder, FrameTiming, PixelFormat, Plane, RandomAccessKind,
-    VideoFrame,
+    Rational, Timestamp, VideoFrame,
 };
 use mmrecode_dv::{DifSection, DvIssue, DvPackData, DvProfile, Timecode};
 use mmrecode_mjpeg::JpegImage;
 use mmrecode_mpeg2::{
     MacroblockCoding, MacroblockInfo, MotionType, PictureStructure, PictureType, SequenceParameters,
 };
+
+use crate::audio::{AudioTrack, decode_mpeg_layer2};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaKind {
@@ -54,6 +56,14 @@ pub(crate) struct TransportInspection {
     pub(crate) pes_count: usize,
     pub(crate) pcr_count: usize,
     pub(crate) programs: Vec<TransportProgramInspection>,
+    pub(crate) mpeg_audio: Option<MpegAudioInspection>,
+}
+
+pub(crate) struct MpegAudioInspection {
+    pub(crate) frame_count: usize,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u8,
+    pub(crate) bit_rate: u32,
 }
 
 pub(crate) struct TransportProgramInspection {
@@ -98,6 +108,9 @@ pub(crate) struct Document {
     pub(crate) kind: MediaKind,
     pub(crate) frames: Vec<FrameRecord>,
     pub(crate) transport: Option<TransportInspection>,
+    pub(crate) frame_rate: Rational,
+    pub(crate) frame_rate_assumed: bool,
+    pub(crate) audio: Option<AudioTrack>,
 }
 
 impl Document {
@@ -161,6 +174,9 @@ impl Document {
             kind: MediaKind::MotionJpeg,
             frames,
             transport: None,
+            frame_rate: Rational::new(25, 1).expect("constant frame rate is valid"),
+            frame_rate_assumed: true,
+            audio: None,
         })
     }
 
@@ -174,6 +190,8 @@ impl Document {
             ));
         }
         let mut frames = Vec::new();
+        let mut audio_chunks = Vec::new();
+        let mut complete_audio = true;
         for (index, data) in bytes.chunks_exact(profile.frame_size).enumerate() {
             let parsed = mmrecode_dv::parse_frame(data)
                 .map_err(|error| format!("frame {}: {error}", index + 1))?;
@@ -181,11 +199,17 @@ impl Document {
                 DvPackData::Timecode(value) => Some(value),
                 _ => None,
             });
-            let audio = mmrecode_dv::extract_audio(&parsed).ok().and_then(|frames| {
+            let extracted_audio = mmrecode_dv::extract_audio(&parsed).ok();
+            let audio = extracted_audio.as_ref().and_then(|frames| {
                 frames
                     .first()
                     .map(|first| (frames.len(), first.sample_rate, first.samples_per_channel))
             });
+            if let Some(audio) = extracted_audio {
+                audio_chunks.push(audio);
+            } else {
+                complete_audio = false;
+            }
             let decoded = mmrecode_dv::decode_video_with_options(
                 &parsed,
                 mmrecode_dv::DvVideoDecodeOptions {
@@ -209,12 +233,20 @@ impl Document {
                 mpeg2: None,
             });
         }
+        let audio = if complete_audio {
+            combine_dv_audio(&audio_chunks).ok()
+        } else {
+            None
+        };
         Ok(Self {
             path: path.to_owned(),
             byte_length: bytes.len(),
             kind: MediaKind::RawDv,
             frames,
             transport: None,
+            frame_rate: profile.frame_rate(),
+            frame_rate_assumed: false,
+            audio,
         })
     }
 
@@ -236,12 +268,17 @@ impl Document {
         if frames.is_empty() {
             return Err("Y4M input contains no frames".into());
         }
+        let declared_frame_rate = reader.header().and_then(|header| header.frame_rate);
         Ok(Self {
             path: path.to_owned(),
             byte_length,
             kind: MediaKind::Y4m,
             frames,
             transport: None,
+            frame_rate: declared_frame_rate
+                .unwrap_or_else(|| Rational::new(25, 1).expect("constant frame rate is valid")),
+            frame_rate_assumed: declared_frame_rate.is_none(),
+            audio: None,
         })
     }
 
@@ -300,12 +337,20 @@ impl Document {
                 .as_ref()
                 .map_or(i64::MAX, |mpeg2| mpeg2.presentation_order)
         });
+        let frame_rate = frames
+            .first()
+            .and_then(|record| record.mpeg2.as_ref())
+            .map(|mpeg2| mpeg2.sequence.frame_rate)
+            .ok_or_else(|| "MPEG-2 stream contains no displayable pictures".to_owned())?;
         Ok(Self {
             path: path.to_owned(),
             byte_length: bytes.len(),
             kind: MediaKind::Mpeg2Elementary,
             frames,
             transport: None,
+            frame_rate,
+            frame_rate_assumed: false,
+            audio: None,
         })
     }
 
@@ -329,6 +374,10 @@ impl Document {
                     .collect(),
             })
             .collect();
+        let audio_data = transport.mpeg1_audio_bytes().ok();
+        let audio_frames = audio_data
+            .as_deref()
+            .and_then(|audio| mmrecode_mpegaudio::parse_layer2_stream(audio).ok());
         let inspection = TransportInspection {
             packet_count: transport.packets.len(),
             pat_count: transport.program_association_tables.len(),
@@ -340,13 +389,81 @@ impl Document {
                 .filter(|packet| packet.pcr.is_some())
                 .count(),
             programs,
+            mpeg_audio: audio_frames.as_ref().and_then(|frames| {
+                frames.first().map(|frame| MpegAudioInspection {
+                    frame_count: frames.len(),
+                    sample_rate: frame.header.sample_rate,
+                    channels: frame.header.channels,
+                    bit_rate: frame.header.bit_rate,
+                })
+            }),
         };
+        let video_pts = first_pts(&transport, "video/mpeg2");
+        let audio_pts = first_pts(&transport, "audio/mpeg1");
+        let mut playback_audio = audio_data
+            .as_deref()
+            .and_then(|audio| decode_mpeg_layer2(audio).ok());
+        if let (Some(audio), Some(audio_pts), Some(video_pts)) =
+            (&mut playback_audio, audio_pts, video_pts)
+        {
+            audio.align_to_video(timestamp_seconds(audio_pts) - timestamp_seconds(video_pts));
+        }
         let mut document = Self::load_mpeg2(path, &elementary)?;
         document.byte_length = bytes.len();
         document.kind = MediaKind::Mpeg2Transport;
         document.transport = Some(inspection);
+        document.audio = playback_audio;
         Ok(document)
     }
+}
+
+fn combine_dv_audio(chunks: &[Vec<mmrecode_core::AudioFrame>]) -> Result<AudioTrack, String> {
+    let first = chunks
+        .first()
+        .and_then(|chunk| chunk.first())
+        .ok_or_else(|| "DV stream contains no playable audio".to_owned())?;
+    let pair_count = chunks[0].len();
+    let channels = u16::try_from(pair_count.saturating_mul(2))
+        .map_err(|_| "DV audio channel count does not fit u16".to_owned())?;
+    let sample_rate = first.sample_rate;
+    let mut samples = Vec::new();
+    for chunk in chunks {
+        if chunk.len() != pair_count
+            || chunk.iter().any(|frame| {
+                frame.sample_rate != sample_rate
+                    || frame.channels != 2
+                    || frame.samples_per_channel != chunk[0].samples_per_channel
+            })
+        {
+            return Err("DV audio layout changes between frames".into());
+        }
+        for sample_index in 0..chunk[0].samples_per_channel {
+            for pair in chunk {
+                let start = sample_index * 2;
+                samples.extend_from_slice(&pair.samples[start..start + 2]);
+            }
+        }
+    }
+    AudioTrack::from_i16(sample_rate, channels, samples)
+}
+
+fn first_pts(transport: &mmrecode_mpegts::TransportStream, codec_id: &str) -> Option<Timestamp> {
+    let stream_id = transport
+        .streams
+        .iter()
+        .find(|stream| stream.codec.codec_id.as_str() == codec_id)?
+        .id;
+    transport
+        .elementary_packets
+        .iter()
+        .find(|packet| packet.stream_id == stream_id)
+        .and_then(|packet| packet.pts)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn timestamp_seconds(timestamp: Timestamp) -> f64 {
+    timestamp.value as f64 * timestamp.time_base.numerator() as f64
+        / timestamp.time_base.denominator() as f64
 }
 
 fn macroblock_map(
@@ -459,6 +576,8 @@ mod tests {
                 .start,
             frame.len()
         );
+        assert!(document.frame_rate_assumed);
+        assert_eq!(document.frame_rate, Rational::new(25, 1).unwrap());
     }
 
     #[test]
@@ -478,6 +597,8 @@ mod tests {
         let document = Document::load_y4m(Path::new("two.y4m"), bytes).expect("valid Y4M stream");
         assert_eq!(document.frames.len(), 2);
         assert_eq!(document.kind, MediaKind::Y4m);
+        assert_eq!(document.frame_rate, Rational::new(1, 1).unwrap());
+        assert!(!document.frame_rate_assumed);
     }
 
     #[test]
@@ -502,7 +623,7 @@ mod tests {
 
     #[test]
     fn loads_mpegts_with_container_and_video_inspection() {
-        let bytes = include_bytes!("../../../../testdata/mpegts/valid/single-program-mpeg2.ts");
+        let bytes = include_bytes!("../../../../testdata/mpegts/valid/single-program-mpeg2-mp2.ts");
         let document =
             Document::load_mpegts(Path::new("program.ts"), bytes).expect("valid MPEG-TS");
         assert_eq!(document.kind, MediaKind::Mpeg2Transport);
@@ -510,6 +631,19 @@ mod tests {
         let transport = document.transport.as_ref().expect("transport inspection");
         assert!(transport.packet_count > 10);
         assert_eq!(transport.programs[0].pmt_pid, 0x1000);
-        assert_eq!(transport.programs[0].streams, vec![(0x0100, 0x02)]);
+        assert_eq!(
+            transport.programs[0].streams,
+            vec![(0x0100, 0x02), (0x0101, 0x03)]
+        );
+        let audio = transport.mpeg_audio.as_ref().expect("audio inspection");
+        assert_eq!(audio.frame_count, 20);
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.channels, 2);
+        let playback_audio = document.audio.as_ref().expect("decoded playback audio");
+        assert_eq!(playback_audio.sample_rate, 48_000);
+        assert_eq!(playback_audio.channels, 2);
+        // The independent vector starts audio 481 samples before video; playback trims that lead.
+        assert_eq!(playback_audio.samples.len(), 45_118);
+        assert_eq!(playback_audio.duration().as_micros(), 469_979);
     }
 }

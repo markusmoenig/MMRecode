@@ -34,6 +34,7 @@ fn run() -> Result<(), String> {
         Some("encode-mpeg2") => encode_mpeg2_command(&mut arguments),
         Some("mux-mpegts") => mux_mpegts_command(&mut arguments),
         Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
+        Some("extract-mpegts-audio") => extract_mpegts_audio_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
         Some("decode") => {
             let input = arguments
@@ -135,14 +136,16 @@ fn encode_mpeg2_command(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn mux_mpegts_command(
     arguments: &mut impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<(), String> {
     use mmrecode_core::Muxer as _;
 
-    let usage = "usage: mmrecode mux-mpegts <input.m2v> <output.ts>";
+    let usage = "usage: mmrecode mux-mpegts <input.m2v> <output.ts> [input.mp2]";
     let input = arguments.next().ok_or_else(|| usage.to_owned())?;
     let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let audio = arguments.next();
     if arguments.next().is_some() {
         return Err(usage.to_owned());
     }
@@ -157,7 +160,7 @@ fn mux_mpegts_command(
     let frame_time = mmrecode_core::Rational::new(frame_rate.denominator(), frame_rate.numerator())
         .map_err(|error| error.to_string())?;
     let mut muxer = mmrecode_mpegts::MpegTsMuxer::new();
-    let stream_id = muxer
+    let video_stream_id = muxer
         .add_stream(mmrecode_core::StreamDescriptor {
             id: mmrecode_core::StreamId(0),
             codec: mmrecode_core::CodecDescriptor {
@@ -170,6 +173,39 @@ fn mux_mpegts_command(
                 .map_err(|error| error.to_string())?,
         })
         .map_err(|error| error.to_string())?;
+    let audio_data = audio
+        .as_deref()
+        .map(|path| {
+            let path = std::path::Path::new(path);
+            std::fs::read(path)
+                .map_err(|error| format!("cannot read '{}': {error}", path.display()))
+        })
+        .transpose()?;
+    let audio_frames = audio_data
+        .as_deref()
+        .map(mmrecode_mpegaudio::parse_layer2_stream)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let audio_stream_id = if audio_frames.is_some() {
+        Some(
+            muxer
+                .add_stream(mmrecode_core::StreamDescriptor {
+                    id: mmrecode_core::StreamId(0),
+                    codec: mmrecode_core::CodecDescriptor {
+                        codec_id: mmrecode_core::CodecId::new("audio/mpeg1"),
+                        codec_tag: None,
+                        media_type: mmrecode_core::MediaType::Audio,
+                        configuration: Vec::new(),
+                    },
+                    time_base: mmrecode_core::Rational::new(1, 90_000)
+                        .map_err(|error| error.to_string())?,
+                })
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut packets = Vec::new();
     for (index, (picture, dependency)) in stream.pictures().iter().zip(&dependencies).enumerate() {
         let start = if index == 0 {
             0
@@ -185,9 +221,10 @@ fn mux_mpegts_command(
         if dependency.random_access == mmrecode_core::RandomAccessKind::Clean {
             flags.insert(mmrecode_core::PacketFlags::KEY);
         }
-        muxer
-            .write_packet(mmrecode_core::Packet {
-                stream_id,
+        packets.push((
+            transport_clock_value(dependency.decode_order, frame_time)?,
+            mmrecode_core::Packet {
+                stream_id: video_stream_id,
                 data: elementary[start..end].to_vec(),
                 pts: Some(mmrecode_core::Timestamp {
                     value: dependency.presentation_order,
@@ -203,7 +240,46 @@ fn mux_mpegts_command(
                 }),
                 flags,
                 side_data: Vec::new(),
-            })
+            },
+        ));
+    }
+    if let (Some(audio_data), Some(audio_frames), Some(audio_stream_id)) = (
+        audio_data.as_deref(),
+        audio_frames.as_ref(),
+        audio_stream_id,
+    ) {
+        let sample_rate = i64::from(audio_frames[0].header.sample_rate);
+        let audio_time =
+            mmrecode_core::Rational::new(1, sample_rate).map_err(|error| error.to_string())?;
+        for frame in audio_frames {
+            let sample = i64::try_from(frame.index)
+                .map_err(|_| "MPEG audio frame index exceeds i64".to_owned())?
+                .checked_mul(i64::from(frame.header.samples_per_frame))
+                .ok_or_else(|| "MPEG audio timestamp overflows".to_owned())?;
+            packets.push((
+                transport_clock_value(sample, audio_time)?,
+                mmrecode_core::Packet {
+                    stream_id: audio_stream_id,
+                    data: frame.data(audio_data).to_vec(),
+                    pts: Some(mmrecode_core::Timestamp {
+                        value: sample,
+                        time_base: audio_time,
+                    }),
+                    dts: None,
+                    duration: Some(mmrecode_core::Timestamp {
+                        value: i64::from(frame.header.samples_per_frame),
+                        time_base: audio_time,
+                    }),
+                    flags: mmrecode_core::PacketFlags::empty(),
+                    side_data: Vec::new(),
+                },
+            ));
+        }
+    }
+    packets.sort_by_key(|(timestamp, _)| *timestamp);
+    for (_, packet) in packets {
+        muxer
+            .write_packet(packet)
             .map_err(|error| error.to_string())?;
     }
     muxer.finalize().map_err(|error| error.to_string())?;
@@ -211,12 +287,27 @@ fn mux_mpegts_command(
     std::fs::write(output, &transport)
         .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
     println!(
-        "Muxed {} MPEG-2 Video bytes into {} transport packets at {}",
+        "Muxed {} MPEG-2 Video bytes{} into {} transport packets at {}",
         elementary.len(),
+        audio_data
+            .as_ref()
+            .map_or_else(String::new, |audio| format!(
+                " and {} MPEG Layer II audio bytes",
+                audio.len()
+            )),
         transport.len() / mmrecode_mpegts::TS_PACKET_SIZE,
         output.display()
     );
     Ok(())
+}
+
+fn transport_clock_value(value: i64, time_base: mmrecode_core::Rational) -> Result<i64, String> {
+    let numerator = i128::from(value)
+        .checked_mul(i128::from(time_base.numerator()))
+        .and_then(|scaled| scaled.checked_mul(90_000))
+        .ok_or_else(|| "transport timestamp overflows".to_owned())?;
+    let result = numerator / i128::from(time_base.denominator());
+    i64::try_from(result).map_err(|_| "transport timestamp exceeds i64".to_owned())
 }
 
 fn demux_mpegts_command(
@@ -243,6 +334,39 @@ fn demux_mpegts_command(
         "Demuxed {} MPEG-2 Video bytes from {} transport packets to {}",
         elementary.len(),
         transport.packets.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn extract_mpegts_audio_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode extract-mpegts-audio <input.ts> <output.mp2>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let input = std::path::Path::new(&input);
+    let output = std::path::Path::new(&output);
+    let bytes = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let transport =
+        mmrecode_mpegts::demux_transport_stream(&bytes).map_err(|error| error.to_string())?;
+    let audio = transport
+        .mpeg1_audio_bytes()
+        .map_err(|error| error.to_string())?;
+    let frames =
+        mmrecode_mpegaudio::parse_layer2_stream(&audio).map_err(|error| error.to_string())?;
+    std::fs::write(output, &audio)
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+    println!(
+        "Extracted {} MPEG Layer II frame(s), {} Hz, {} channel(s), {} bytes to {}",
+        frames.len(),
+        frames[0].header.sample_rate,
+        frames[0].header.channels,
+        audio.len(),
         output.display()
     );
     Ok(())
@@ -915,6 +1039,19 @@ fn inspect_mpegts(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
             elementary.len()
         );
     }
+    if let Ok(audio) = transport.mpeg1_audio_bytes() {
+        let frames =
+            mmrecode_mpegaudio::parse_layer2_stream(&audio).map_err(|error| error.to_string())?;
+        let header = frames[0].header;
+        println!(
+            "MPEG-1 Audio Layer II: {} Hz, {} channel(s), {} bit/s, {} frame(s), {} elementary byte(s)",
+            header.sample_rate,
+            header.channels,
+            header.bit_rate,
+            frames.len(),
+            audio.len()
+        );
+    }
     Ok(())
 }
 
@@ -1248,8 +1385,9 @@ fn print_help() {
          decode <media-file> <y4m>  Decode JPEG, raw DV, MPEG-2 Video, or MPEG-TS to YUV4MPEG2\n  \
          encode-dv <y4m> <dv>  Encode native-layout Y4M frame(s) as raw DV25\n  \
          encode-mpeg2 <y4m> <m2v> [qscale]  Encode Y4M as MPEG-2 Main Profile Video\n  \
-         mux-mpegts <m2v> <ts>  Mux MPEG-2 Video into a single-program transport stream\n  \
+         mux-mpegts <m2v> <ts> [mp2]  Mux MPEG-2 Video and optional Layer II audio\n  \
          demux-mpegts <ts> <m2v>  Extract the first MPEG-2 Video elementary stream\n  \
+         extract-mpegts-audio <ts> <mp2>  Extract MPEG-1 Audio Layer II\n  \
          plan-mpeg2 <m2v> <start> <end>  Explain copy and bridge-encode picture ranges\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \

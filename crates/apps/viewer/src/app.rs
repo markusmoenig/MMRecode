@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{self, Color32, RichText, Stroke, TextureHandle, TextureOptions};
 use mmrecode_mjpeg::{HuffmanTableClass, Marker, QuantizationPrecision, SegmentData};
+use mmrecode_playback::{PlaybackController, PlaybackEvent, PlaybackTimeline};
 
 use crate::{
+    audio::AudioOutput,
     display::{self, DisplayMode},
     document::{Document, DvInspection, JpegInspection, Mpeg2Inspection, TransportInspection},
 };
@@ -21,6 +26,10 @@ pub(crate) struct ViewerApp {
     structure_view: StructureView,
     pixel_description: Option<String>,
     status: Status,
+    playback: Option<PlaybackController>,
+    audio_output: Option<AudioOutput>,
+    audio_unavailable: bool,
+    volume: f32,
 }
 
 enum Status {
@@ -58,6 +67,10 @@ impl ViewerApp {
             structure_view: StructureView::Image,
             pixel_description: None,
             status: Status::Ready,
+            playback: None,
+            audio_output: None,
+            audio_unavailable: false,
+            volume: 0.8,
         };
         if let Some(path) = initial_path {
             app.open_path(&context.egui_ctx, &path);
@@ -70,7 +83,17 @@ impl ViewerApp {
             Ok(document) => {
                 let frame_count = document.frames.len();
                 let kind = document.kind.label();
+                let timeline = match PlaybackTimeline::new(document.frame_rate, frame_count) {
+                    Ok(timeline) => timeline,
+                    Err(error) => {
+                        self.status = Status::Error(error.to_string());
+                        return;
+                    }
+                };
                 self.path_input = document.path.display().to_string();
+                self.audio_output = None;
+                self.audio_unavailable = false;
+                self.playback = Some(PlaybackController::new(timeline));
                 self.document = Some(document);
                 self.frame_index = 0;
                 self.display_mode = DisplayMode::Composite;
@@ -120,9 +143,144 @@ impl ViewerApp {
         let last = document.frames.len() - 1;
         let next = self.frame_index.saturating_add_signed(delta).min(last);
         if next != self.frame_index {
-            self.frame_index = next;
+            self.pause_playback();
+            self.seek_frame(next, context);
+        }
+    }
+
+    fn seek_frame(&mut self, frame_index: usize, context: &egui::Context) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        let frame_index = frame_index.min(playback.timeline().frame_count() - 1);
+        let position = playback.timeline().position_of_frame(frame_index);
+        playback.seek(position, Instant::now());
+        if let Some(audio) = &self.audio_output
+            && let Err(error) = audio.seek(position)
+        {
+            self.status = Status::Error(error);
+            self.audio_output = None;
+            self.audio_unavailable = true;
+        }
+        self.frame_index = frame_index;
+        self.pixel_description = None;
+        self.refresh_texture(context);
+    }
+
+    fn pause_playback(&mut self) {
+        if let Some(playback) = &mut self.playback {
+            playback.pause(Instant::now());
+        }
+        if let Some(audio) = &self.audio_output {
+            audio.pause();
+        }
+    }
+
+    fn toggle_playback(&mut self, context: &egui::Context) {
+        let playing = self
+            .playback
+            .as_ref()
+            .is_some_and(PlaybackController::is_playing);
+        if playing {
+            self.pause_playback();
+            return;
+        }
+        let has_animation = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.frames.len() > 1);
+        if !has_animation {
+            return;
+        }
+        if self.audio_output.is_none() && !self.audio_unavailable {
+            let track = self
+                .document
+                .as_ref()
+                .and_then(|document| document.audio.clone());
+            if let Some(track) = track {
+                match AudioOutput::open(track, self.volume) {
+                    Ok(output) => self.audio_output = Some(output),
+                    Err(error) => {
+                        self.audio_unavailable = true;
+                        self.status = Status::Error(format!(
+                            "{error}; continuing with silent video playback"
+                        ));
+                    }
+                }
+            }
+        }
+        let now = Instant::now();
+        if let Some(playback) = &mut self.playback {
+            playback.play(now);
+        }
+        let position = self
+            .playback
+            .as_ref()
+            .map_or(Duration::ZERO, PlaybackController::position);
+        if let Some(audio) = &self.audio_output {
+            if let Err(error) = audio.seek(position) {
+                self.status =
+                    Status::Error(format!("{error}; continuing with silent video playback"));
+                self.audio_output = None;
+                self.audio_unavailable = true;
+            } else {
+                audio.play();
+            }
+        }
+        context.request_repaint();
+    }
+
+    fn stop_playback(&mut self, context: &egui::Context) {
+        self.pause_playback();
+        self.seek_frame(0, context);
+    }
+
+    fn tick_playback(&mut self, context: &egui::Context) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        if !playback.is_playing() {
+            return;
+        }
+        let now = Instant::now();
+        let event = if let Some(audio) = &self.audio_output {
+            if audio.is_finished() {
+                playback.advance(now)
+            } else {
+                playback.synchronize(audio.position(), now)
+            }
+        } else {
+            playback.advance(now)
+        };
+        let next_frame = playback.frame_index();
+        if next_frame != self.frame_index {
+            self.frame_index = next_frame;
             self.pixel_description = None;
             self.refresh_texture(context);
+        }
+        match event {
+            PlaybackEvent::None => {}
+            PlaybackEvent::Ended => {
+                if let Some(audio) = &self.audio_output {
+                    audio.pause();
+                }
+            }
+            PlaybackEvent::Looped => {
+                if let Some(audio) = &self.audio_output
+                    && let Err(error) = audio.restart()
+                {
+                    self.status = Status::Error(error);
+                    self.audio_output = None;
+                    self.audio_unavailable = true;
+                }
+            }
+        }
+        if self
+            .playback
+            .as_ref()
+            .is_some_and(PlaybackController::is_playing)
+        {
+            context.request_repaint_after(Duration::from_millis(5));
         }
     }
 
@@ -143,20 +301,7 @@ impl ViewerApp {
             }
 
             ui.separator();
-            let has_previous = self.frame_index > 0;
-            let has_next = self
-                .document
-                .as_ref()
-                .is_some_and(|document| self.frame_index + 1 < document.frames.len());
-            if ui
-                .add_enabled(has_previous, egui::Button::new("◀"))
-                .clicked()
-            {
-                self.move_frame(-1, ui.ctx());
-            }
-            if ui.add_enabled(has_next, egui::Button::new("▶")).clicked() {
-                self.move_frame(1, ui.ctx());
-            }
+            self.playback_toolbar(ui);
 
             ui.separator();
             let old_mode = self.display_mode;
@@ -224,6 +369,78 @@ impl ViewerApp {
         });
     }
 
+    fn playback_toolbar(&mut self, ui: &mut egui::Ui) {
+        let playing = self
+            .playback
+            .as_ref()
+            .is_some_and(PlaybackController::is_playing);
+        let can_play = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.frames.len() > 1);
+        if ui
+            .add_enabled(can_play, egui::Button::new(if playing { "⏸" } else { "▶" }))
+            .on_hover_text(if playing {
+                "Pause (Space)"
+            } else {
+                "Play (Space)"
+            })
+            .clicked()
+        {
+            self.toggle_playback(ui.ctx());
+        }
+        if ui
+            .add_enabled(can_play, egui::Button::new("■"))
+            .on_hover_text("Stop")
+            .clicked()
+        {
+            self.stop_playback(ui.ctx());
+        }
+        if let Some(playback) = &mut self.playback {
+            let mut looping = playback.is_looping();
+            if ui.checkbox(&mut looping, "Loop").changed() {
+                playback.set_looping(looping);
+            }
+        }
+
+        ui.separator();
+        let has_previous = self.frame_index > 0;
+        let has_next = self
+            .document
+            .as_ref()
+            .is_some_and(|document| self.frame_index + 1 < document.frames.len());
+        if ui
+            .add_enabled(has_previous, egui::Button::new("◀"))
+            .on_hover_text("Previous frame")
+            .clicked()
+        {
+            self.move_frame(-1, ui.ctx());
+        }
+        if ui
+            .add_enabled(has_next, egui::Button::new("▶"))
+            .on_hover_text("Next frame")
+            .clicked()
+        {
+            self.move_frame(1, ui.ctx());
+        }
+
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.audio.is_some())
+        {
+            ui.separator();
+            ui.label("Volume");
+            if ui
+                .add(egui::Slider::new(&mut self.volume, 0.0..=1.5).show_value(false))
+                .changed()
+                && let Some(audio) = &self.audio_output
+            {
+                audio.set_volume(self.volume);
+            }
+        }
+    }
+
     fn timeline(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(document) = &self.document {
@@ -241,7 +458,15 @@ impl ViewerApp {
                 ));
                 if old_index != self.frame_index {
                     self.pixel_description = None;
-                    self.refresh_texture(ui.ctx());
+                    self.seek_frame(self.frame_index, ui.ctx());
+                }
+                if let Some(playback) = &self.playback {
+                    ui.separator();
+                    ui.monospace(format!(
+                        "{} / {}",
+                        format_time(playback.position()),
+                        format_time(playback.timeline().duration())
+                    ));
                 }
             } else {
                 ui.label(
@@ -282,59 +507,7 @@ impl ViewerApp {
         ui.heading("Inspector");
         ui.monospace(document.path.display().to_string());
         ui.separator();
-        egui::Grid::new("document-info")
-            .num_columns(2)
-            .striped(true)
-            .show(ui, |ui| {
-                ui.label("Type");
-                ui.label(document.kind.label());
-                ui.end_row();
-                ui.label("File bytes");
-                ui.monospace(document.byte_length.to_string());
-                ui.end_row();
-                ui.label("Dimensions");
-                ui.monospace(format!("{} × {}", record.frame.width, record.frame.height));
-                ui.end_row();
-                ui.label("Format");
-                ui.monospace(format!("{:?}", record.frame.format));
-                ui.end_row();
-                ui.label("Range");
-                ui.monospace(format!("{:?}", record.frame.color.range));
-                ui.end_row();
-                ui.label("Primaries");
-                ui.monospace(
-                    record
-                        .frame
-                        .color
-                        .primaries
-                        .as_deref()
-                        .unwrap_or("unspecified"),
-                );
-                ui.end_row();
-                ui.label("Transfer");
-                ui.monospace(
-                    record
-                        .frame
-                        .color
-                        .transfer
-                        .as_deref()
-                        .unwrap_or("unspecified"),
-                );
-                ui.end_row();
-                ui.label("Matrix");
-                ui.monospace(
-                    record
-                        .frame
-                        .color
-                        .matrix
-                        .as_deref()
-                        .unwrap_or("unspecified"),
-                );
-                ui.end_row();
-                ui.label("Field order");
-                ui.monospace(format!("{:?}", record.frame.field_order));
-                ui.end_row();
-            });
+        show_document_info(ui, document, record);
 
         ui.separator();
         ui.label(RichText::new("Planes").strong());
@@ -447,6 +620,9 @@ impl ViewerApp {
         if direction != 0 {
             self.move_frame(direction, context);
         }
+        if context.input(|input| input.key_pressed(egui::Key::Space)) {
+            self.toggle_playback(context);
+        }
     }
 }
 
@@ -459,6 +635,98 @@ fn display_frame(
         (StructureView::MacroblockMap, _, Some(mpeg2)) => &mpeg2.macroblock_map,
         _ => &record.frame,
     }
+}
+
+fn format_time(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let minutes = total_millis / 60_000;
+    let seconds = total_millis / 1_000 % 60;
+    let millis = total_millis % 1_000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn show_document_info(
+    ui: &mut egui::Ui,
+    document: &Document,
+    record: &crate::document::FrameRecord,
+) {
+    egui::Grid::new("document-info")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("Type");
+            ui.label(document.kind.label());
+            ui.end_row();
+            ui.label("File bytes");
+            ui.monospace(document.byte_length.to_string());
+            ui.end_row();
+            ui.label("Dimensions");
+            ui.monospace(format!("{} × {}", record.frame.width, record.frame.height));
+            ui.end_row();
+            ui.label("Format");
+            ui.monospace(format!("{:?}", record.frame.format));
+            ui.end_row();
+            ui.label("Range");
+            ui.monospace(format!("{:?}", record.frame.color.range));
+            ui.end_row();
+            ui.label("Primaries");
+            ui.monospace(
+                record
+                    .frame
+                    .color
+                    .primaries
+                    .as_deref()
+                    .unwrap_or("unspecified"),
+            );
+            ui.end_row();
+            ui.label("Transfer");
+            ui.monospace(
+                record
+                    .frame
+                    .color
+                    .transfer
+                    .as_deref()
+                    .unwrap_or("unspecified"),
+            );
+            ui.end_row();
+            ui.label("Matrix");
+            ui.monospace(
+                record
+                    .frame
+                    .color
+                    .matrix
+                    .as_deref()
+                    .unwrap_or("unspecified"),
+            );
+            ui.end_row();
+            ui.label("Field order");
+            ui.monospace(format!("{:?}", record.frame.field_order));
+            ui.end_row();
+            ui.label("Playback rate");
+            let assumption = if document.frame_rate_assumed {
+                " (assumed)"
+            } else {
+                ""
+            };
+            ui.monospace(format!(
+                "{}/{} fps{assumption}",
+                document.frame_rate.numerator(),
+                document.frame_rate.denominator()
+            ));
+            ui.end_row();
+            ui.label("Playback audio");
+            if let Some(audio) = &document.audio {
+                ui.monospace(format!(
+                    "{} Hz, {} ch, {}",
+                    audio.sample_rate,
+                    audio.channels,
+                    format_time(audio.duration())
+                ));
+            } else {
+                ui.monospace("none");
+            }
+            ui.end_row();
+        });
 }
 
 fn show_transport_inspection(ui: &mut egui::Ui, transport: &TransportInspection) {
@@ -482,6 +750,12 @@ fn show_transport_inspection(ui: &mut egui::Ui, transport: &TransportInspection)
                 "  PID 0x{pid:04x}, stream type 0x{stream_type:02x}"
             ));
         }
+    }
+    if let Some(audio) = &transport.mpeg_audio {
+        ui.monospace(format!(
+            "MPEG Layer II: {} frames, {} Hz, {} ch, {} bit/s",
+            audio.frame_count, audio.sample_rate, audio.channels, audio.bit_rate
+        ));
     }
     ui.small("Picture byte ranges below are relative to the demultiplexed elementary stream.");
 }
@@ -587,6 +861,7 @@ fn show_dv_inspection(ui: &mut egui::Ui, dv: &DvInspection) {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.tick_playback(ui.ctx());
         self.handle_dropped_file(ui.ctx());
         self.handle_keyboard(ui.ctx());
 

@@ -14,7 +14,9 @@ use std::{
 };
 
 use mmrecode_core::{
-    ColorDescription, ColorRange, Error, FieldOrder, FrameTiming, PixelFormat, Plane, VideoFrame,
+    CodecDescriptor, CodecId, ColorDescription, ColorRange, Error, FieldOrder, FrameTiming,
+    MediaType, Muxer, Packet, PacketFlags, PixelFormat, Plane, Rational, StreamDescriptor,
+    StreamId, Timestamp, VideoFrame,
 };
 use mmrecode_mjpeg::{JpegEncodeOptions, decode_jpeg, encode_jpeg};
 use mmrecode_mpeg2::{FrameRate, Mpeg2EncodeOptions};
@@ -490,6 +492,26 @@ pub unsafe extern "C" fn mmr_mpegts_mux_mpeg2(
     })
 }
 
+/// Muxes complete MPEG-2 Video and MPEG-1 Layer II streams with A/V timing.
+///
+/// # Safety
+///
+/// Both input pointers must identify their corresponding readable lengths.
+/// `out_buffer` must be writable, zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpegts_mux_mpeg2_mp2(
+    video_data: *const u8,
+    video_len: usize,
+    audio_data: *const u8,
+    audio_len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpegts_mux_av_impl(video_data, video_len, audio_data, audio_len, out_buffer) }
+    })
+}
+
 /// Extracts the first MPEG-2 Video elementary stream from MPEG-TS.
 ///
 /// # Safety
@@ -505,6 +527,24 @@ pub unsafe extern "C" fn mmr_mpegts_demux_mpeg2(
     ffi_status(|| {
         // SAFETY: pointer validation is centralized in the implementation.
         unsafe { mpegts_transform_impl(data, len, out_buffer, false) }
+    })
+}
+
+/// Extracts the first MPEG-1 Audio Layer II elementary stream from MPEG-TS.
+///
+/// # Safety
+///
+/// `data` must identify `len` readable bytes. `out_buffer` must be writable,
+/// zero-initialized, and carry the correct structure size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmr_mpegts_demux_mp2(
+    data: *const u8,
+    len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: pointer validation is centralized in the implementation.
+        unsafe { mpegts_demux_audio_impl(data, len, out_buffer) }
     })
 }
 
@@ -812,6 +852,157 @@ unsafe fn mpegts_transform_impl(
     Ok(())
 }
 
+unsafe fn mpegts_mux_av_impl(
+    video_data: *const u8,
+    video_len: usize,
+    audio_data: *const u8,
+    audio_len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> ApiResult<()> {
+    if out_buffer.is_null() {
+        return Err(ApiError::InvalidArgument("out_buffer is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output structure.
+    let out_buffer = unsafe { &mut *out_buffer };
+    validate_buffer_output(out_buffer)?;
+    *out_buffer = MmrBuffer::empty();
+    let video = unsafe { borrowed_bytes(video_data, video_len, "video_data")? };
+    let audio = unsafe { borrowed_bytes(audio_data, audio_len, "audio_data")? };
+    *out_buffer = MmrBuffer::from_vec(mux_mpeg2_mp2(video, audio)?);
+    Ok(())
+}
+
+unsafe fn mpegts_demux_audio_impl(
+    data: *const u8,
+    len: usize,
+    out_buffer: *mut MmrBuffer,
+) -> ApiResult<()> {
+    if out_buffer.is_null() {
+        return Err(ApiError::InvalidArgument("out_buffer is null".into()));
+    }
+    // SAFETY: the caller guarantees a writable output structure.
+    let out_buffer = unsafe { &mut *out_buffer };
+    validate_buffer_output(out_buffer)?;
+    *out_buffer = MmrBuffer::empty();
+    let input = unsafe { borrowed_bytes(data, len, "data")? };
+    let audio = mmrecode_mpegts::demux_transport_stream(input)?.mpeg1_audio_bytes()?;
+    mmrecode_mpegaudio::parse_layer2_stream(&audio)?;
+    *out_buffer = MmrBuffer::from_vec(audio);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn mux_mpeg2_mp2(video: &[u8], audio: &[u8]) -> ApiResult<Vec<u8>> {
+    let stream = mmrecode_mpeg2::parse_stream(video)?;
+    let dependencies = mmrecode_mpeg2::analyze_dependencies(&stream)?;
+    let audio_frames = mmrecode_mpegaudio::parse_layer2_stream(audio)?;
+    let frame_rate = stream.pictures()[0].sequence.frame_rate;
+    let video_time = Rational::new(frame_rate.denominator(), frame_rate.numerator())?;
+    let audio_time = Rational::new(1, i64::from(audio_frames[0].header.sample_rate))?;
+    let clock = Rational::new(1, 90_000)?;
+    let mut muxer = mmrecode_mpegts::MpegTsMuxer::new();
+    let video_id = muxer.add_stream(StreamDescriptor {
+        id: StreamId(0),
+        codec: CodecDescriptor {
+            codec_id: CodecId::new("video/mpeg2"),
+            codec_tag: None,
+            media_type: MediaType::Video,
+            configuration: Vec::new(),
+        },
+        time_base: clock,
+    })?;
+    let audio_id = muxer.add_stream(StreamDescriptor {
+        id: StreamId(0),
+        codec: CodecDescriptor {
+            codec_id: CodecId::new("audio/mpeg1"),
+            codec_tag: None,
+            media_type: MediaType::Audio,
+            configuration: Vec::new(),
+        },
+        time_base: clock,
+    })?;
+    let mut packets = Vec::with_capacity(stream.pictures().len() + audio_frames.len());
+    for (index, (picture, dependency)) in stream.pictures().iter().zip(&dependencies).enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            stream.pictures()[index - 1].source_range.end
+        };
+        let end = if index + 1 == stream.pictures().len() {
+            video.len()
+        } else {
+            picture.source_range.end
+        };
+        let mut flags = PacketFlags::empty();
+        if dependency.random_access == mmrecode_core::RandomAccessKind::Clean {
+            flags.insert(PacketFlags::KEY);
+        }
+        packets.push((
+            timestamp_sort_key(dependency.decode_order, video_time)?,
+            Packet {
+                stream_id: video_id,
+                data: video[start..end].to_vec(),
+                pts: Some(Timestamp {
+                    value: dependency.presentation_order,
+                    time_base: video_time,
+                }),
+                dts: Some(Timestamp {
+                    value: dependency.decode_order,
+                    time_base: video_time,
+                }),
+                duration: Some(Timestamp {
+                    value: 1,
+                    time_base: video_time,
+                }),
+                flags,
+                side_data: Vec::new(),
+            },
+        ));
+    }
+    for frame in &audio_frames {
+        let sample = i64::try_from(frame.index)
+            .map_err(|_| {
+                ApiError::Core(Error::InvalidData("audio frame index exceeds i64".into()))
+            })?
+            .checked_mul(i64::from(frame.header.samples_per_frame))
+            .ok_or_else(|| {
+                ApiError::Core(Error::InvalidData("audio timestamp overflows".into()))
+            })?;
+        packets.push((
+            timestamp_sort_key(sample, audio_time)?,
+            Packet {
+                stream_id: audio_id,
+                data: frame.data(audio).to_vec(),
+                pts: Some(Timestamp {
+                    value: sample,
+                    time_base: audio_time,
+                }),
+                dts: None,
+                duration: Some(Timestamp {
+                    value: i64::from(frame.header.samples_per_frame),
+                    time_base: audio_time,
+                }),
+                flags: PacketFlags::empty(),
+                side_data: Vec::new(),
+            },
+        ));
+    }
+    packets.sort_by_key(|(timestamp, _)| *timestamp);
+    for (_, packet) in packets {
+        muxer.write_packet(packet)?;
+    }
+    muxer.finalize()?;
+    Ok(muxer.into_bytes()?)
+}
+
+fn timestamp_sort_key(value: i64, time_base: Rational) -> ApiResult<i128> {
+    i128::from(value)
+        .checked_mul(i128::from(time_base.numerator()))
+        .and_then(|scaled| scaled.checked_mul(90_000))
+        .map(|scaled| scaled / i128::from(time_base.denominator()))
+        .ok_or_else(|| ApiError::Core(Error::InvalidData("timestamp rescaling overflows".into())))
+}
+
 fn validate_owned_frame_output(out_frame: &MmrVideoFrame) -> ApiResult<()> {
     if out_frame.struct_size != size_of::<MmrVideoFrame>() {
         return Err(ApiError::InvalidArgument(format!(
@@ -1013,6 +1204,7 @@ mod tests {
     const DV: &[u8] = include_bytes!("../../../testdata/dv/valid/dv25-525-60-one-frame.dv");
     const MPEG2: &[u8] =
         include_bytes!("../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
+    const MP2: &[u8] = include_bytes!("../../../testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2");
 
     #[test]
     fn c_boundary_decodes_and_reencodes_a_frame() {
@@ -1199,6 +1391,33 @@ mod tests {
         // SAFETY: both allocations originated from this library and are freed once.
         unsafe {
             mmr_buffer_free(&raw mut elementary);
+            mmr_buffer_free(&raw mut transport);
+        }
+    }
+
+    #[test]
+    fn c_boundary_muxes_and_extracts_mpegts_audio() {
+        let mut transport = MmrBuffer::empty();
+        // SAFETY: all pointers refer to live storage for the duration of the call.
+        let status = unsafe {
+            mmr_mpegts_mux_mpeg2_mp2(
+                MPEG2.as_ptr(),
+                MPEG2.len(),
+                MP2.as_ptr(),
+                MP2.len(),
+                &raw mut transport,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let mut audio = MmrBuffer::empty();
+        // SAFETY: the transport allocation remains readable during extraction.
+        let status = unsafe { mmr_mpegts_demux_mp2(transport.data, transport.len, &raw mut audio) };
+        assert_eq!(status, STATUS_OK);
+        // SAFETY: the returned allocation contains `len` initialized bytes.
+        assert_eq!(unsafe { slice::from_raw_parts(audio.data, audio.len) }, MP2);
+        // SAFETY: both allocations originated from this library and are freed once.
+        unsafe {
+            mmr_buffer_free(&raw mut audio);
             mmr_buffer_free(&raw mut transport);
         }
     }

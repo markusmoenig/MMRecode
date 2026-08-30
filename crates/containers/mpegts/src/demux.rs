@@ -32,18 +32,18 @@ pub struct TransportStream {
 }
 
 impl TransportStream {
-    /// Returns the first MPEG-2 Video elementary stream reconstructed from PES payloads.
+    /// Concatenates PES payloads for the first stream matching `codec_id`.
     ///
     /// # Errors
     ///
-    /// Returns an error when no MPEG-2 Video stream exists or its size overflows.
-    pub fn mpeg2_video_bytes(&self) -> Result<Vec<u8>> {
+    /// Returns an error when the codec is absent, its payload is empty, or its size overflows.
+    pub fn elementary_stream_bytes(&self, codec_id: &str) -> Result<Vec<u8>> {
         let descriptor = self
             .streams
             .iter()
-            .find(|stream| stream.codec.codec_id.as_str() == "video/mpeg2")
+            .find(|stream| stream.codec.codec_id.as_str() == codec_id)
             .ok_or_else(|| {
-                Error::Unsupported("transport stream has no MPEG-2 Video program".into())
+                Error::Unsupported(format!("transport stream has no {codec_id} stream"))
             })?;
         let byte_count = self
             .elementary_packets
@@ -60,11 +60,29 @@ impl TransportStream {
             }
         }
         if bytes.is_empty() {
-            return Err(Error::InvalidData(
-                "MPEG-2 Video PID contains no PES payload".into(),
-            ));
+            return Err(Error::InvalidData(format!(
+                "{codec_id} PID contains no PES payload"
+            )));
         }
         Ok(bytes)
+    }
+
+    /// Returns the first MPEG-2 Video elementary stream reconstructed from PES payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no MPEG-2 Video stream exists or its size overflows.
+    pub fn mpeg2_video_bytes(&self) -> Result<Vec<u8>> {
+        self.elementary_stream_bytes("video/mpeg2")
+    }
+
+    /// Returns the first MPEG-1 Audio elementary stream reconstructed from PES payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no MPEG-1 Audio stream exists or its size overflows.
+    pub fn mpeg1_audio_bytes(&self) -> Result<Vec<u8>> {
+        self.elementary_stream_bytes("audio/mpeg1")
     }
 }
 

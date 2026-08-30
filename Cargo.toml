@@ -6,10 +6,12 @@ members = [
     "crates/cli",
     "crates/codecs/dv",
     "crates/codecs/mjpeg",
+    "crates/codecs/mpegaudio",
     "crates/codecs/mpeg2",
     "crates/containers/mpegts",
     "crates/containers/y4m",
     "crates/core",
+    "crates/playback",
     "crates/quality",
     "crates/testkit",
 ]
@@ -30,11 +32,14 @@ mmrecode-capi = { path = "crates/capi" }
 mmrecode-core = { path = "crates/core" }
 mmrecode-dv = { path = "crates/codecs/dv" }
 mmrecode-mjpeg = { path = "crates/codecs/mjpeg" }
+mmrecode-mpegaudio = { path = "crates/codecs/mpegaudio" }
 mmrecode-mpeg2 = { path = "crates/codecs/mpeg2" }
 mmrecode-mpegts = { path = "crates/containers/mpegts" }
+mmrecode-playback = { path = "crates/playback" }
 mmrecode-quality = { path = "crates/quality" }
 mmrecode-testkit = { path = "crates/testkit" }
 mmrecode-y4m = { path = "crates/containers/y4m" }
+rodio = { version = "=0.22.2", default-features = false, features = ["playback", "symphonia-mp2"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

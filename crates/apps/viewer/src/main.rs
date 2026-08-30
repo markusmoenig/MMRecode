@@ -17,5 +17,6 @@ fn main() -> eframe::Result {
 }
 
 mod app;
+mod audio;
 mod display;
 mod document;

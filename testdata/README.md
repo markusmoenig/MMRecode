@@ -58,3 +58,8 @@ vector descriptions, checksums, and regeneration command.
 
 `mpegts/valid/` contains an independently generated single-program 188-byte transport stream with
 MPEG-2 Video. See [`mpegts/README.md`](mpegts/README.md) for provenance and regeneration details.
+
+## MPEG audio corpus
+
+`mpegaudio/valid/` contains a synthetic 48 kHz stereo MPEG-1 Audio Layer II elementary stream.
+See [`mpegaudio/README.md`](mpegaudio/README.md) for framing scope and provenance.

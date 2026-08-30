@@ -56,7 +56,8 @@ Dependencies flow downward only:
 The diagram shows conceptual layers; `mmrecode-bitstream` depends on `mmrecode-core` for common
 errors, while codec crates depend on both. `mmrecode-core` itself has no MMRecode dependencies.
 `mmrecode-viewer`, like the CLI, is an application at the top of the graph and may consume codecs,
-containers, and quality tools without becoming a dependency of any library crate.
+containers, playback, and quality tools without becoming a dependency of any codec or container
+crate.
 
 Forbidden dependencies include:
 
@@ -78,11 +79,13 @@ crates/
 ├── bitstream/               mmrecode-bitstream
 ├── codecs/
 │   ├── mjpeg/               mmrecode-mjpeg
+│   ├── mpegaudio/           mmrecode-mpegaudio; Layer II framing/timing
 │   ├── dv/                  mmrecode-dv; raw-DV25 slice
 │   └── mpeg2/               mmrecode-mpeg2; MPEG-2 Video elementary-stream slice
 ├── containers/
 │   ├── mpegts/              mmrecode-mpegts; H.222.0 transport slice
 │   └── y4m/                 mmrecode-y4m
+├── playback/                mmrecode-playback; timeline/clock policy
 ├── quality/                 mmrecode-quality
 ├── testkit/                 mmrecode-testkit
 ├── capi/                    mmrecode-capi; experimental C boundary
@@ -334,11 +337,12 @@ Container implementations do not own:
 `mmrecode-mpegts` implements strict 188-byte packet parsing, adaptation/PCR fields, per-PID
 continuity, pointer-aware PAT/PMT section reassembly with CRC validation, program and stream
 discovery, and PES reassembly with PTS/DTS. Its muxer accepts generic MPEG-2 Video packets and
-emits a deterministic single-program stream with repeated PSI, PCR, random-access flags, and exact
-90 kHz timestamp rescaling. The CLI supplies picture boundaries and codec dependency timing; the
-container crate never parses MPEG-2 picture syntax.
+MPEG-1 Audio Layer II packets and emits a deterministic single-program stream with repeated PSI,
+PCR, random-access flags, exact 90 kHz timestamp rescaling, and A/V interleaving. The CLI supplies
+video picture dependencies and audio frame timing from codec crates; the container crate never
+parses either codec's elementary syntax.
 
-The slice deliberately does not claim live broadcast-system coverage: audio interleaving,
+The slice deliberately does not claim live broadcast-system coverage: other audio codecs,
 multi-program muxing, 192/204-byte variants, DVB/ATSC service information, scrambling, CBR
 null-packet scheduling, jitter recovery, indexing, and timestamp-wrap-aware seeking remain future
 work. Program Stream and MXF are separate container families rather than modes of this crate.
@@ -437,6 +441,19 @@ later motion-vector arrows and slice overlays—read public inspection structure
 GUI concerns inside codec implementations. Reusable presentation machinery should be extracted to
 a library crate only when the editor or another application actually needs it.
 
+The first reusable presentation boundary is now `mmrecode-playback`. It owns exact fixed-frame-rate
+timeline mapping and play/pause/seek/loop clock state, but it knows nothing about GUI frameworks,
+audio devices, codecs, or containers. The viewer supplies either a monotonic wall clock or rendered
+audio position. Audio is the master clock when present; video selects the corresponding display
+frame and may skip frames rather than allowing A/V drift.
+
+Device output and temporary MP2-to-PCM decoding remain application-local. `mmrecode-viewer` uses
+Rodio with its pure-Rust Symphonia MP2 backend and predecodes short inspection media. This does not
+turn Symphonia into MMRecode's normative MPEG audio implementation: `mmrecode-mpegaudio` still owns
+validated Layer II framing, and a native sample decoder remains a separate codec milestone. Long
+programs will require bounded packet/frame/audio queues rather than the viewer's current whole-file
+model.
+
 ## Registration
 
 Static Rust dependencies are sufficient initially. Applications instantiate the implementations
@@ -448,8 +465,8 @@ should be considered only after a stable C ABI exists; Rust trait-object ABI is 
 ## C ABI and bindings
 
 `mmrecode-capi` began experimentally after the first end-to-end MJPEG slice and now exercises
-baseline JPEG, raw DV25, complete MPEG-2 elementary-stream decode/encode, and MPEG-TS mux/demux
-ownership.
+baseline JPEG, raw DV25, complete MPEG-2 elementary-stream decode/encode, and MPEG-TS video/audio
+mux/demux ownership.
 It exposes planar frame views, owned output buffers, version queries, structure-size validation,
 and thread-local diagnostics without declaring the ABI stable. Stateful streaming handles remain a
 later design step rather than wrappers around unproven lifecycle assumptions.
@@ -503,6 +520,10 @@ Before publishing crates:
 All current crates inherit `Apache-2.0` from the workspace. Third-party code must not be copied into
 the repository merely because its functionality is useful. Every dependency and adapted algorithm
 requires provenance and license review.
+
+The viewer's Rodio dependency is MIT/Apache-2.0; Rodio's selected Symphonia MP2 backend is MPL-2.0.
+It is confined to the application dependency graph, and no Symphonia source is copied or modified
+inside MMRecode. Binary distribution must retain the applicable third-party notices.
 
 Apache-2.0's contributor patent grant covers only claims licensable by a contributor under the
 license terms. It does not grant third-party patent-pool rights for standardized media formats.
