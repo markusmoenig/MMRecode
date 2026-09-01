@@ -27,4 +27,4 @@ pub use frame::{FrameTiming, Plane, VideoFrame};
 pub use packet::{Packet, PacketFlags, PacketSideData};
 pub use pixel::{ColorDescription, ColorRange, FieldOrder, PixelFormat};
 pub use stream::{CodecDescriptor, CodecId, FourCc, MediaType, StreamDescriptor, StreamId};
-pub use time::{Rational, Timestamp};
+pub use time::{Rational, Timestamp, TimestampRounding};

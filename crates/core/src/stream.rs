@@ -3,7 +3,7 @@
 use crate::Rational;
 
 /// Stable stream identifier within a demuxer or muxer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StreamId(pub u32);
 
 /// A four-byte container codec or handler tag.

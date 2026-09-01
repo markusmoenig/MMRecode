@@ -19,6 +19,8 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-mpeg2`: MPEG-2 Video parsing, I/P/B reconstruction/encoding, and dependency planning
 - `mmrecode-mpegts`: 188-byte MPEG-2 Transport Stream demuxing and deterministic muxing
 - `mmrecode-y4m`: simple uncompressed test input and output
+- `mmrecode-edit`: codec-independent sources, tracks, clips, effects, transitions, and output intent
+- `mmrecode-render`: explicit render planning and independent-frame packet-copy execution
 - `mmrecode-playback`: exact fixed-rate timelines and audio-clock synchronization
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
@@ -32,6 +34,15 @@ The constrained Motion JPEG vertical slice is implemented end to end: multi-fram
 output, baseline syntax inspection, reference decoding and encoding, internal encoder
 reconstruction, deterministic regression vectors, frame-quality reports, and independent FFmpeg
 checks. APIs remain intentionally unstable while coverage and conformance are expanded.
+
+The first codec-independent editing slice is implemented in `mmrecode-edit` and
+`mmrecode-render`. It validates sources, streams, tracks, clips, time ranges, effects, transitions,
+and output intent, then plans and executes packet-aligned cuts and concatenation for independently
+coded video. The executor preserves encoded payloads and side data while rebasing PTS/DTS and
+stream identifiers; real DV and MJPEG integration tests prove reordered output without
+re-encoding.
+Effects, transitions, audio, non-frame-aligned cuts, direct muxer driving, and MPEG-2 bridge
+execution remain explicit subsequent slices.
 
 The second codec slice is implemented in `mmrecode-dv`. It recognizes
 525/60 and 625/50 DV25, indexes and validates every 80-byte DIF block, retains subcode/VAUX/AAUX

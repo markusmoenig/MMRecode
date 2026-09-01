@@ -26,7 +26,7 @@ roadmap does not turn every possible feature into an immediate commitment.
 **Status:** Foundational media, packet, stream, time, dependency, codec, container, bit reader/writer,
 VLC, and start-code types exist.
 
-- [ ] Add checked timestamp rescaling with explicit rounding and overflow policies.
+- [x] Add checked timestamp rescaling with explicit rounding and overflow policies.
 - [ ] Design reusable frame/audio buffer ownership: borrowed views, reference counting, pooling,
   alignment, and eventual hardware-surface handles.
 - [ ] Exercise metadata and unknown side-data preservation through demux, edit, and remux paths.
@@ -49,7 +49,8 @@ vectors.
 - [ ] Improve restart-marker recovery and damaged-frame reporting/concealment.
 - [ ] Support field-based/interlaced Motion JPEG conventions used by capture hardware.
 - [ ] Add integer/SIMD transform and color-conversion paths after profiling the reference path.
-- [ ] Connect per-frame packet copying and selective re-encoding to `mmrecode-render`.
+- [x] Connect lossless per-frame packet copying and concatenation to `mmrecode-render`.
+- [ ] Add selective MJPEG frame re-encoding when an edit changes decoded pixels.
 - [ ] Add AVI and QuickTime/MOV mappings in their container crates.
 
 ## DV
@@ -64,7 +65,8 @@ interoperability vectors.
 - [ ] Cover locked/unlocked audio and additional valid audio/channel arrangements.
 - [ ] Add DVCPRO25, DVCPRO50, and DVCPRO HD only when a concrete workflow requires them.
 - [ ] Add threaded/SIMD hot paths after profiling.
-- [ ] Connect frame-copy/selective-reencode cuts to `mmrecode-render`.
+- [x] Connect lossless frame-copy cuts and concatenation to `mmrecode-render`.
+- [ ] Add selective DV frame re-encoding when an edit changes decoded pixels.
 - [ ] Add AVI and QuickTime/MOV wrapping in their container crates.
 
 ## MPEG-2 Video
@@ -134,17 +136,23 @@ deterministic A/V muxing.
 
 ## Editing and minimal-recompression rendering
 
-**Status:** The shared dependency vocabulary and MPEG-2 damage planner exist. The generic edit model
-and render executor have not been created.
+**Status:** The shared dependency vocabulary and MPEG-2 damage planner exist. `mmrecode-edit` now
+models sources, streams, tracks, clips, exact ranges, effects, transitions, and output intent.
+`mmrecode-render` plans and executes packet-aligned, independent-frame DV and MJPEG
+cut/concatenate paths with payload and side-data preservation plus exact timestamp rewriting. It
+does not yet drive a muxer directly or regenerate changed frames.
 
-- [ ] Create `mmrecode-edit` with sources, tracks, clips, ranges, transitions, effects, and output
+- [x] Create `mmrecode-edit` with sources, tracks, clips, ranges, transitions, effects, and output
   intent without codec-specific syntax.
-- [ ] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
+- [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
-- [ ] Implement the first independent-frame cut/concatenate path with MJPEG or DV.
+- [x] Implement the first independent-frame cut/concatenate path with DV.
+- [ ] Drive a selected container muxer directly instead of returning container-ready packets.
+- [x] Add an MJPEG dependency analyzer and connect the same independent-frame path.
 - [ ] Implement MPEG-2 GOP-aware cuts and bridge encoding using `DependencyAnalyzer` output.
 - [ ] Define exact edit-boundary rules for video frames, audio samples, preroll, and A/V sync.
-- [ ] Preserve codec parameters and ancillary metadata whenever packets can be copied.
+- [x] Verify codec-parameter compatibility and preserve packet flags and side data in the initial
+  packet-copy path.
 - [ ] Make every render plan explainable: copied/reencoded ranges, causes, dependencies, expected
   quality loss, and byte/time estimates.
 - [ ] Add deterministic output, cancellation, progress reporting, and recoverable failure handling.

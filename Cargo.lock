@@ -1557,6 +1557,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmrecode-edit"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-core",
+]
+
+[[package]]
 name = "mmrecode-mjpeg"
 version = "0.0.1"
 dependencies = [
@@ -1605,6 +1612,16 @@ name = "mmrecode-quality"
 version = "0.0.1"
 dependencies = [
  "mmrecode-core",
+]
+
+[[package]]
+name = "mmrecode-render"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-core",
+ "mmrecode-dv",
+ "mmrecode-edit",
+ "mmrecode-mjpeg",
 ]
 
 [[package]]

@@ -1,0 +1,20 @@
+[package]
+name = "mmrecode-render"
+description = "Codec-independent render planning and execution for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mmrecode-core.workspace = true
+mmrecode-edit.workspace = true
+
+[dev-dependencies]
+mmrecode-dv.workspace = true
+mmrecode-mjpeg.workspace = true
+
+[lints]
+workspace = true

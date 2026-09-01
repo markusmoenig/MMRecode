@@ -360,7 +360,7 @@ reference behavior into `AccessUnitInfo`:
 - Random-access strength
 - Parameter fingerprint relevant to splicing
 
-A future `mmrecode-render` crate will construct an explicit plan:
+`mmrecode-render` constructs an explicit plan using this operation vocabulary:
 
 ```rust
 pub enum RenderOperation {
@@ -374,11 +374,22 @@ pub enum RenderOperation {
 }
 ```
 
-The generic planner propagates edit damage through the reference graph. Codec-specific adapters
-determine whether a reconnection is valid and which parameters the bridge encoder must match.
+The initial implemented slice accepts one gap-free video track of clean, reference-free access
+units. It verifies packet-aligned clip boundaries, exact duration mapping, codec and parameter
+compatibility, then emits and executes `CopyPackets`, `RewriteTimestamps`, and `Mux` operations.
+Encoded payloads, flags, and opaque side data are preserved. The executor returns container-ready
+packets; directly driving a selected muxer is a subsequent slice.
 
-`mmrecode-edit` is separate. It models user intent—sources, clips, tracks, ranges, effects, and
-transitions—without deciding how encoded data is regenerated.
+`mmrecode-edit` is separate and implemented as a codec-independent intent model. It owns sources,
+stream references, tracks, clips, exact source/timeline ranges, effects, transitions, and output
+intent without deciding how encoded data is regenerated. Its initial schema is deliberately
+in-memory and version-agnostic; serialization, speed mapping, automation curves, and nested
+sequences should follow demonstrated render requirements.
+
+The next generic planner slice will consume inter-frame dependency graphs. Codec-specific adapters
+determine whether a reconnection is valid and which parameters a bridge encoder must match. The
+existing MPEG-2 planner already proves codec-local damage propagation but is not yet connected to
+the generic executor.
 
 ## Quality and verification
 

@@ -12,7 +12,7 @@ mod syntax;
 mod tables;
 mod transform;
 
-pub use codec::{CODEC_NAME, MjpegDecoder, MjpegEncoder};
+pub use codec::{CODEC_NAME, MjpegDecoder, MjpegDependencyAnalyzer, MjpegEncoder};
 pub use decoder::{DecodedComponent, DecodedJpeg, JpegColorModel, decode_jpeg};
 pub use encoder::{EncodedJpeg, JpegEncodeOptions, encode_jpeg};
 pub use parser::parse_jpeg;

@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 
 use mmrecode_core::{
-    CodecDescriptor, CodecId, Decoder, Encoder, Error, FrameTiming, MediaType, Packet, PacketFlags,
-    PixelFormat, Result, StreamId, VideoEncoderSettings, VideoFrame,
+    AccessUnitInfo, CodecDescriptor, CodecId, Decoder, DependencyAnalyzer, Encoder, Error,
+    FrameTiming, MediaType, Packet, PacketFlags, ParameterFingerprint, PictureId, PictureKind,
+    PixelFormat, RandomAccessKind, Result, StreamId, VideoEncoderSettings, VideoFrame,
 };
 
-use crate::{JpegEncodeOptions, decode_jpeg, encode_jpeg};
+use crate::{JpegEncodeOptions, JpegImage, SegmentData, decode_jpeg, encode_jpeg, parse_jpeg};
 
 /// Canonical `MMRecode` codec identifier for Motion JPEG.
 pub const CODEC_NAME: &str = "video/mjpeg";
@@ -202,19 +203,89 @@ impl Encoder for MjpegEncoder {
     }
 }
 
+/// Dependency analyzer for independently coded JPEG pictures.
+#[derive(Clone, Debug, Default)]
+pub struct MjpegDependencyAnalyzer {
+    next_picture: u64,
+}
+
+impl DependencyAnalyzer for MjpegDependencyAnalyzer {
+    fn analyze_access_unit(&mut self, packet: &Packet) -> Result<AccessUnitInfo> {
+        let image = parse_jpeg(&packet.data)?;
+        let frame = image
+            .frame_header()
+            .ok_or_else(|| Error::InvalidData("JPEG access unit has no frame header".into()))?;
+        let picture_id = PictureId(self.next_picture);
+        let order = i64::try_from(self.next_picture)
+            .map_err(|_| Error::InvalidState("Motion JPEG picture order exceeds i64".into()))?;
+        self.next_picture = self
+            .next_picture
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidState("Motion JPEG picture identifier overflow".into()))?;
+        Ok(AccessUnitInfo {
+            picture_id,
+            picture_kind: PictureKind::Intra,
+            decode_order: order,
+            presentation_order: order,
+            references: Vec::new(),
+            random_access: RandomAccessKind::Clean,
+            parameters: parameter_fingerprint(&image, frame),
+        })
+    }
+}
+
+fn parameter_fingerprint(image: &JpegImage, frame: &crate::FrameHeader) -> ParameterFingerprint {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    hash_value(&mut hash, u64::from(frame.sample_precision));
+    hash_value(&mut hash, u64::from(frame.width));
+    hash_value(&mut hash, u64::from(frame.height));
+    hash_value(&mut hash, frame.components.len() as u64);
+    for component in &frame.components {
+        hash_value(&mut hash, u64::from(component.id));
+        hash_value(&mut hash, u64::from(component.horizontal_sampling));
+        hash_value(&mut hash, u64::from(component.vertical_sampling));
+    }
+    hash_value(&mut hash, u64::from(image.jfif_header().is_some()));
+    let adobe_transform = image
+        .segments
+        .iter()
+        .find_map(|segment| match &segment.data {
+            SegmentData::Application(application)
+                if application.number == 14
+                    && application.data.len() >= 12
+                    && application.data.starts_with(b"Adobe") =>
+            {
+                Some(application.data[11])
+            }
+            _ => None,
+        });
+    hash_value(&mut hash, adobe_transform.map_or(u64::MAX, u64::from));
+    ParameterFingerprint(hash)
+}
+
+fn hash_value(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use mmrecode_core::{
-        CodecDescriptor, CodecId, Decoder, Encoder, MediaType, Packet, PacketFlags, PixelFormat,
-        Rational, StreamId, VideoEncoderSettings,
+        CodecDescriptor, CodecId, Decoder, DependencyAnalyzer, Encoder, MediaType, Packet,
+        PacketFlags, PixelFormat, RandomAccessKind, Rational, StreamId, VideoEncoderSettings,
     };
 
-    use super::{CODEC_NAME, MjpegDecoder, MjpegEncoder};
+    use super::{CODEC_NAME, MjpegDecoder, MjpegDependencyAnalyzer, MjpegEncoder};
 
     const BASELINE_420_JPEG: &[u8] =
         include_bytes!("../../../../testdata/jpeg/valid/baseline-420.jpg");
+    const UNKNOWN_APP_JPEG: &[u8] =
+        include_bytes!("../../../../testdata/jpeg/valid/unknown-app-marker.jpg");
+    const GRAY_JPEG: &[u8] = include_bytes!("../../../../testdata/jpeg/valid/restart-interval.jpg");
 
     #[test]
     fn streaming_decoder_produces_a_video_frame() {
@@ -267,5 +338,33 @@ mod tests {
         assert!(packet.flags.contains(PacketFlags::KEY));
         assert!(crate::parse_jpeg(&packet.data).is_ok());
         assert!(encoder.receive_reconstructed_frame().unwrap().is_some());
+    }
+
+    #[test]
+    fn dependency_analyzer_reports_clean_intra_pictures() {
+        let packet = |data: &[u8]| Packet {
+            stream_id: StreamId(0),
+            data: data.to_vec(),
+            pts: None,
+            dts: None,
+            duration: None,
+            flags: PacketFlags::empty(),
+            side_data: Vec::new(),
+        };
+        let mut analyzer = MjpegDependencyAnalyzer::default();
+        let first = analyzer
+            .analyze_access_unit(&packet(BASELINE_420_JPEG))
+            .unwrap();
+        let second = analyzer
+            .analyze_access_unit(&packet(UNKNOWN_APP_JPEG))
+            .unwrap();
+        let gray = analyzer.analyze_access_unit(&packet(GRAY_JPEG)).unwrap();
+
+        assert_eq!(first.random_access, RandomAccessKind::Clean);
+        assert!(first.references.is_empty());
+        assert_eq!(first.presentation_order, 0);
+        assert_eq!(second.presentation_order, 1);
+        assert_eq!(first.parameters, second.parameters);
+        assert_ne!(first.parameters, gray.parameters);
     }
 }

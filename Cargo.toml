@@ -11,8 +11,10 @@ members = [
     "crates/containers/mpegts",
     "crates/containers/y4m",
     "crates/core",
+    "crates/edit",
     "crates/playback",
     "crates/quality",
+    "crates/render",
     "crates/testkit",
 ]
 resolver = "3"
@@ -31,12 +33,14 @@ mmrecode-bitstream = { path = "crates/bitstream" }
 mmrecode-capi = { path = "crates/capi" }
 mmrecode-core = { path = "crates/core" }
 mmrecode-dv = { path = "crates/codecs/dv" }
+mmrecode-edit = { path = "crates/edit" }
 mmrecode-mjpeg = { path = "crates/codecs/mjpeg" }
 mmrecode-mpegaudio = { path = "crates/codecs/mpegaudio" }
 mmrecode-mpeg2 = { path = "crates/codecs/mpeg2" }
 mmrecode-mpegts = { path = "crates/containers/mpegts" }
 mmrecode-playback = { path = "crates/playback" }
 mmrecode-quality = { path = "crates/quality" }
+mmrecode-render = { path = "crates/render" }
 mmrecode-testkit = { path = "crates/testkit" }
 mmrecode-y4m = { path = "crates/containers/y4m" }
 rodio = { version = "=0.22.2", default-features = false, features = ["playback", "symphonia-mp2"] }

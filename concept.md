@@ -234,8 +234,106 @@ Pictures 767–2140: copied unchanged
 Copied encoded payload: 98.4%
 ```
 
-Editing is intentionally not part of the initial implementation milestone. The codec and packet
-APIs must preserve the timing and dependency information needed to add it later without a rewrite.
+Editing was intentionally excluded from the first codec milestone. The initial codec-independent
+edit model and render planner now establish the boundary: edit descriptions express intent, codec
+analyzers expose dependencies, and render planning decides what can be copied and what must be
+reconstructed. Broader editing behavior should grow on this boundary rather than leaking timeline
+semantics into codecs or containers.
+
+## Terminal-first editor
+
+The first serious MMRecode editor should be a terminal-first, command-driven media editor with an
+integrated visual and audio preview. It is not merely a collection of transcoding commands. It is
+an interactive editing environment in which a sequence is a navigable hierarchy of media objects.
+
+The interaction model resembles a small shell:
+
+```text
+mmrecode edit interview.mov
+
+pwd
+/sequence/main
+
+ls tracks
+cd tracks/video-1/clips/0
+info
+trim in +12f
+split 00:00:18:04
+play around cursor
+```
+
+Tracks, clips, transitions, effects, groups, and graphical elements are addressable objects. A
+user can move recursively into an object, inspect it, modify it, and return to a higher context:
+
+```text
+cd clips/0
+mkdir fx/lower-third
+cd fx/lower-third
+
+rect add name=background left=5% bottom=6% width=40% height=12% \
+    fill=#101018e8 radius=12
+text add "Hallo" name=title parent=background align=right \
+    valign=center padding=24
+active 00:00:12:12 for 4s
+fade in 8f
+```
+
+Familiar structural commands such as `ls`, `cd`, `pwd`, `tree`, `info`, `set`, `add`, `rm`, `mv`,
+and `cp` should be complemented by media commands such as `play`, `seek`, `trim`, `split`, `ripple`,
+`keyframe`, `render`, and `explain`. Mutating commands participate in undoable transactions so a
+multi-command edit can be committed or reverted as one operation. Human-friendly indices may be
+accepted interactively, while command history and saved projects retain stable object identifiers.
+
+Time notation must be explicit and frame-accurate. Depending on context, the editor may accept
+timecode (`00:00:12:12`), seconds plus frames (`12s+12f`), absolute frames (`312f`), decimal media
+time (`12.480s`), and relative expressions (`+8f` or `start+12f`). The resolved time base and any
+rounding must remain visible rather than becoming an implicit user-interface decision.
+
+### One command model, multiple frontends
+
+The terminal language must not become the editor's internal API. Commands are parsed into a typed,
+versionable edit-command model which operates on the same edit sequence used by rendering:
+
+```text
+terminal command ─┐
+natural language ─┼──> typed edit commands ──> edit sequence ──> render planner
+graphical timeline┘
+```
+
+This permits a future graphical timeline, scripting API, and natural-language assistant to be
+different frontends for identical operations. The graphical editor should emit typed commands
+directly rather than constructing shell strings. Natural-language requests should likewise compile
+to inspectable commands and present ambiguous or destructive interpretations before applying them.
+A session can therefore be replayed, diffed, automated, tested, or shared without depending on the
+frontend that created it.
+
+### Preview and render transparency
+
+The terminal editor should provide real moving-picture and synchronized-audio preview. Where
+available, native terminal image protocols can deliver full-color frames efficiently; a detached
+preview window and simpler textual fallbacks keep the editor useful across terminals. Preview is a
+consumer of the same media graph, effects, clock, and color rules as final rendering, although it
+may deliberately select lower-resolution or proxy processing for responsiveness.
+
+Codec-aware behavior should be visible during editing. Commands such as `explain` should report
+which areas will be copied, timestamp-rewritten, bridge-encoded, or fully rendered and why. This
+makes minimal recompression an understandable property of an edit rather than a surprising export
+optimization.
+
+The initial editor scope should remain focused:
+
+- Frame-accurate cuts, trims, splits, ordering, and ripple operations
+- Text, rectangles, images, groups, anchors, alignment, transforms, and opacity
+- Effect ranges, fades, and keyframes
+- Audio levels, fades, playback, and synchronization
+- Terminal preview and optional detached visual preview
+- Undo, redo, transactions, history, diffing, and project persistence
+- Render-plan explanation and flattening through the modular renderer
+
+More elaborate compositing, collaborative workflows, interactive-video authoring, and a graphical
+timeline can follow after this command model proves expressive and pleasant in real editing work.
+Interactive or dynamic content may remain live in MMRecode projects and be flattened to conventional
+codec-independent video for services such as YouTube.
 
 ## Initial experiment
 
