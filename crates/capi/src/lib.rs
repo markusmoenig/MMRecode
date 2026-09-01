@@ -822,6 +822,7 @@ unsafe fn mpeg2_encode_impl(
             })?,
             progressive: c_boolean(options.progressive, "progressive")?,
             top_field_first: c_boolean(options.top_field_first, "top_field_first")?,
+            sequence: mmrecode_mpeg2::Mpeg2SequenceSettings::default(),
         },
     )?;
     *out_buffer = MmrBuffer::from_vec(encoded.data);

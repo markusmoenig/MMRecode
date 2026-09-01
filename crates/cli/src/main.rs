@@ -7,6 +7,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
@@ -36,6 +37,8 @@ fn run() -> Result<(), String> {
         Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
         Some("extract-mpegts-audio") => extract_mpegts_audio_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
+        Some("render-plan") => render_plan_command(&mut arguments),
+        Some("render") => render_command(&mut arguments),
         Some("decode") => {
             let input = arguments
                 .next()
@@ -451,6 +454,307 @@ fn plan_mpeg2(input: &std::path::Path, edited: std::ops::Range<i64>) -> Result<(
         encoded_count
     );
     Ok(())
+}
+
+#[derive(Debug)]
+struct RenderCliOptions {
+    display_frame: i64,
+    replacement: std::ffi::OsString,
+    audio: Option<std::ffi::OsString>,
+    audio_boundary: mmrecode_render::AudioBoundaryPolicy,
+}
+
+fn render_plan_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = render_plan_usage();
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let options = parse_render_options(arguments, usage)?;
+    run_mpeg2_render(
+        std::path::Path::new(&input),
+        None,
+        &options,
+        RenderCommandMode::Plan,
+    )
+}
+
+fn render_command(arguments: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
+    let usage = render_usage();
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let options = parse_render_options(arguments, usage)?;
+    run_mpeg2_render(
+        std::path::Path::new(&input),
+        Some(std::path::Path::new(&output)),
+        &options,
+        RenderCommandMode::Execute,
+    )
+}
+
+const fn render_plan_usage() -> &'static str {
+    "usage: mmrecode render-plan <input.m2v> --replace <display-frame> <replacement.y4m> [--audio <input.mp2>] [--audio-end <exact|contained|cover>]"
+}
+
+const fn render_usage() -> &'static str {
+    "usage: mmrecode render <input.m2v> <output.ts> --replace <display-frame> <replacement.y4m> [--audio <input.mp2>] [--audio-end <exact|contained|cover>]"
+}
+
+fn parse_render_options(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+    usage: &str,
+) -> Result<RenderCliOptions, String> {
+    let mut display_frame = None;
+    let mut replacement = None;
+    let mut audio = None;
+    let mut audio_boundary = mmrecode_render::AudioBoundaryPolicy::Exact;
+    let mut has_audio_boundary = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("--replace") => {
+                if replacement.is_some() {
+                    return Err("--replace may only be specified once".to_owned());
+                }
+                display_frame = Some(parse_i64_argument(
+                    arguments.next(),
+                    "display-frame",
+                    usage,
+                )?);
+                replacement = Some(arguments.next().ok_or_else(|| usage.to_owned())?);
+            }
+            Some("--audio") => {
+                if audio.is_some() {
+                    return Err("--audio may only be specified once".to_owned());
+                }
+                audio = Some(arguments.next().ok_or_else(|| usage.to_owned())?);
+            }
+            Some("--audio-end") => {
+                if has_audio_boundary {
+                    return Err("--audio-end may only be specified once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| usage.to_owned())?
+                    .into_string()
+                    .map_err(|_| "audio-end policy must be valid UTF-8".to_owned())?;
+                audio_boundary = match value.as_str() {
+                    "exact" => mmrecode_render::AudioBoundaryPolicy::Exact,
+                    "contained" => mmrecode_render::AudioBoundaryPolicy::Contained,
+                    "cover" => mmrecode_render::AudioBoundaryPolicy::Cover,
+                    _ => {
+                        return Err(format!(
+                            "unknown audio-end policy '{value}'; expected exact, contained, or cover"
+                        ));
+                    }
+                };
+                has_audio_boundary = true;
+            }
+            _ => return Err(usage.to_owned()),
+        }
+    }
+    Ok(RenderCliOptions {
+        display_frame: display_frame.ok_or_else(|| usage.to_owned())?,
+        replacement: replacement.ok_or_else(|| usage.to_owned())?,
+        audio,
+        audio_boundary,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderCommandMode {
+    Plan,
+    Execute,
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_mpeg2_render(
+    input: &std::path::Path,
+    output: Option<&std::path::Path>,
+    options: &RenderCliOptions,
+    mode: RenderCommandMode,
+) -> Result<(), String> {
+    let source_id = mmrecode_edit::SourceId(0);
+    let stream_id = mmrecode_core::StreamId(0);
+    let clip_id = mmrecode_edit::ClipId(0);
+    let bytes = std::fs::read(input)
+        .map_err(|error| format!("cannot read '{}': {error}", input.display()))?;
+    let packet_source = mmrecode_render::analyze_mpeg2_source(&bytes, source_id, stream_id)
+        .map_err(|error| error.to_string())?;
+    let first_packet = packet_source
+        .packets
+        .first()
+        .ok_or_else(|| "MPEG-2 input contains no pictures".to_owned())?;
+    let time_base = first_packet
+        .packet
+        .pts
+        .ok_or_else(|| "analyzed MPEG-2 picture has no PTS".to_owned())?
+        .time_base;
+    let picture_count = i64::try_from(packet_source.packets.len())
+        .map_err(|_| "MPEG-2 picture count exceeds i64".to_owned())?;
+    if !(0..picture_count).contains(&options.display_frame) {
+        return Err(format!(
+            "display frame {} is outside input range 0..{picture_count}",
+            options.display_frame
+        ));
+    }
+    let full_range = cli_time_range(0, picture_count, time_base)?;
+    let sequence = mmrecode_edit::EditSequence {
+        time_base,
+        sources: vec![mmrecode_edit::MediaSource {
+            id: source_id,
+            locator: input.to_string_lossy().into_owned(),
+            streams: vec![mmrecode_core::StreamDescriptor {
+                id: stream_id,
+                codec: mmrecode_core::CodecDescriptor {
+                    codec_id: mmrecode_core::CodecId::new("video/mpeg2"),
+                    codec_tag: None,
+                    media_type: mmrecode_core::MediaType::Video,
+                    configuration: Vec::new(),
+                },
+                time_base,
+            }],
+        }],
+        tracks: vec![mmrecode_edit::Track {
+            id: mmrecode_edit::TrackId(0),
+            media_type: mmrecode_core::MediaType::Video,
+            clips: vec![mmrecode_edit::Clip {
+                id: clip_id,
+                source_id,
+                source_stream_id: stream_id,
+                source_range: full_range,
+                timeline_range: full_range,
+                effects: Vec::new(),
+            }],
+            transitions: Vec::new(),
+        }],
+        output: mmrecode_edit::OutputIntent {
+            time_base,
+            container: Some("container/mpegts".into()),
+            video_codec: Some(mmrecode_core::CodecId::new("video/mpeg2")),
+            audio_codec: options
+                .audio
+                .as_ref()
+                .map(|_| mmrecode_core::CodecId::new("audio/mpeg1")),
+        },
+    };
+    let change_end = options
+        .display_frame
+        .checked_add(1)
+        .ok_or_else(|| "changed frame range overflows".to_owned())?;
+    let render_plan = mmrecode_render::plan_interframe_video(
+        &sequence,
+        std::slice::from_ref(&packet_source),
+        &[mmrecode_render::VideoChange {
+            clip_id,
+            timeline_range: cli_time_range(options.display_frame, change_end, time_base)?,
+        }],
+    )
+    .map_err(|error| error.to_string())?;
+    let replacement = read_single_y4m(std::path::Path::new(&options.replacement))?;
+    let mpeg2_output = mmrecode_render::execute_mpeg2_plan_with_report(
+        &render_plan,
+        std::slice::from_ref(&packet_source),
+        &[mmrecode_render::Mpeg2FrameReplacement {
+            timeline_pts: mmrecode_core::Timestamp {
+                value: options.display_frame,
+                time_base,
+            },
+            frame: replacement,
+        }],
+        mmrecode_render::Mpeg2BridgeOptions::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let audio_data = options
+        .audio
+        .as_deref()
+        .map(|path| {
+            let path = std::path::Path::new(path);
+            std::fs::read(path)
+                .map_err(|error| format!("cannot read '{}': {error}", path.display()))
+        })
+        .transpose()?;
+    let audio = audio_data
+        .as_deref()
+        .map(|data| mmrecode_render::Layer2AudioInput {
+            data,
+            start: mmrecode_core::Timestamp {
+                value: 0,
+                time_base,
+            },
+        });
+    let delivery = mmrecode_render::plan_mpeg2_mpegts(
+        &render_plan,
+        &mpeg2_output.packets,
+        audio,
+        mmrecode_render::MpegTsRenderOptions {
+            audio_boundary: options.audio_boundary,
+            ..mmrecode_render::MpegTsRenderOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    println!("MMRecode render plan: {}", input.display());
+    println!("Changed display frame: {}", options.display_frame);
+    println!("Decision: {}", render_plan.decisions[0].reason);
+    println!(
+        "Work: {} decode, {} encode, {} copy packet(s)",
+        render_plan.summary.decoded_frames,
+        render_plan.summary.encoded_frames,
+        render_plan.summary.copied_packets
+    );
+    println!("{}", mpeg2_output.splice.explanation());
+    println!("{}", delivery.report().explanation());
+    if mode == RenderCommandMode::Execute {
+        let output = output.ok_or_else(|| "render output path is missing".to_owned())?;
+        let executed =
+            mmrecode_render::execute_mpeg2_mpegts(&delivery).map_err(|error| error.to_string())?;
+        std::fs::write(output, &executed.data)
+            .map_err(|error| format!("cannot write '{}': {error}", output.display()))?;
+        println!("{}", executed.report.explanation());
+        println!(
+            "Wrote {} bytes to {}",
+            executed.data.len(),
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+fn cli_time_range(
+    start: i64,
+    end: i64,
+    time_base: mmrecode_core::Rational,
+) -> Result<mmrecode_edit::TimeRange, String> {
+    mmrecode_edit::TimeRange::new(
+        mmrecode_core::Timestamp {
+            value: start,
+            time_base,
+        },
+        mmrecode_core::Timestamp {
+            value: end,
+            time_base,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_single_y4m(path: &std::path::Path) -> Result<mmrecode_core::VideoFrame, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open '{}': {error}", path.display()))?;
+    let mut reader = mmrecode_y4m::Y4mReader::new(std::io::BufReader::new(file));
+    let frame = reader
+        .read_frame()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("replacement Y4M '{}' contains no frames", path.display()))?;
+    if reader
+        .read_frame()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(format!(
+            "replacement Y4M '{}' must contain exactly one frame",
+            path.display()
+        ));
+    }
+    Ok(frame)
 }
 
 fn encode_mpeg2(
@@ -1389,6 +1693,10 @@ fn print_help() {
          demux-mpegts <ts> <m2v>  Extract the first MPEG-2 Video elementary stream\n  \
          extract-mpegts-audio <ts> <mp2>  Extract MPEG-1 Audio Layer II\n  \
          plan-mpeg2 <m2v> <start> <end>  Explain copy and bridge-encode picture ranges\n  \
+         render-plan <m2v> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
+             Validate and explain one MPEG-2 replacement render without writing a container\n  \
+         render <m2v> <ts> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
+             Smart-render one MPEG-2 replacement into MPEG-TS\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \

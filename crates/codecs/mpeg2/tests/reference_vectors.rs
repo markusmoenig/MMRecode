@@ -2,7 +2,8 @@
 #![allow(clippy::cast_precision_loss)]
 
 use mmrecode_mpeg2::{
-    ChromaFormat, Mpeg2EncodeOptions, PictureStructure, PictureType, SmartRenderDisposition,
+    ChromaFormat, ColourDescription, Mpeg2EncodeOptions, Mpeg2QuantMatrices, Mpeg2SequenceSettings,
+    PictureStructure, PictureType, SequenceDisplayExtension, SmartRenderDisposition,
     analyze_dependencies, decode_stream, encode_stream, parse_stream, plan_smart_render,
 };
 
@@ -380,6 +381,97 @@ fn main_level_encoder_rejects_unsupported_frame_rate() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("Main Level"));
+}
+
+#[test]
+fn native_encoder_round_trips_sequence_metadata_and_custom_matrices() {
+    let frames = decode_stream(PROGRESSIVE)
+        .unwrap()
+        .into_iter()
+        .take(4)
+        .map(|picture| picture.frame)
+        .collect::<Vec<_>>();
+    let mut matrices = Mpeg2QuantMatrices::default();
+    matrices.intra[1] = 23;
+    matrices.non_intra[2] = 19;
+    matrices.chroma_intra[3] = 31;
+    matrices.chroma_non_intra[4] = 21;
+    let display = SequenceDisplayExtension {
+        video_format: 5,
+        colour_description: Some(ColourDescription {
+            colour_primaries: 5,
+            transfer_characteristics: 6,
+            matrix_coefficients: 6,
+        }),
+        display_horizontal_size: 90,
+        display_vertical_size: 60,
+    };
+    let encoded = encode_stream(
+        &frames,
+        Mpeg2EncodeOptions {
+            gop_size: 4,
+            sequence: Mpeg2SequenceSettings {
+                aspect_ratio_information: 3,
+                bit_rate: 8_000_000,
+                vbv_buffer_size_bits: 224 * 16_384,
+                display: Some(display),
+                quant_matrices: matrices,
+                timecode_start_frame: 25 * 3_600,
+                ..Mpeg2SequenceSettings::default()
+            },
+            ..Mpeg2EncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let stream = parse_stream(&encoded.data).unwrap();
+    let sequence = &stream.pictures()[0].sequence;
+
+    assert_eq!(stream.sequence_headers()[0].aspect_ratio_information, 3);
+    assert_eq!(sequence.display, Some(display));
+    assert_eq!(sequence.intra_quantizer_matrix, matrices.intra);
+    assert_eq!(sequence.non_intra_quantizer_matrix, matrices.non_intra);
+    assert_eq!(
+        sequence.chroma_intra_quantizer_matrix,
+        matrices.chroma_intra
+    );
+    assert_eq!(
+        sequence.chroma_non_intra_quantizer_matrix,
+        matrices.chroma_non_intra
+    );
+    assert_eq!(sequence.bit_rate, Some(8_000_000));
+    assert_eq!(sequence.vbv_buffer_size_bits, 224 * 16_384);
+    assert_eq!(
+        (stream.groups()[0].hours, stream.groups()[0].minutes),
+        (1, 0)
+    );
+    compare_reconstruction_with_ffmpeg(&encoded.data);
+}
+
+#[test]
+fn encoder_computes_drop_frame_gop_timecode() {
+    let frame = decode_stream(PROGRESSIVE).unwrap().remove(0).frame;
+    let encoded = encode_stream(
+        &[frame],
+        Mpeg2EncodeOptions {
+            frame_rate: mmrecode_mpeg2::FrameRate::Fps29_97,
+            sequence: Mpeg2SequenceSettings {
+                // The first minute contains all 1,800 physical frames; labels
+                // ;00 and ;01 are skipped when the second minute begins.
+                timecode_start_frame: 1_800,
+                drop_frame_timecode: true,
+                ..Mpeg2SequenceSettings::default()
+            },
+            ..Mpeg2EncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let stream = parse_stream(&encoded.data).unwrap();
+    let group = stream.groups()[0];
+    assert!(group.drop_frame_flag);
+    assert_eq!(
+        (group.hours, group.minutes, group.seconds, group.pictures),
+        (0, 1, 0, 2)
+    );
 }
 
 #[test]

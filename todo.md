@@ -11,12 +11,12 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 ## Suggested next milestones
 
-1. Build the first `mmrecode-edit` and `mmrecode-render` vertical slice around independent-frame
-   MJPEG/DV cuts, packet copying, selective re-encoding, timestamp rewriting, and muxing.
-2. Extend that executor to MPEG-2 GOP-aware bridge encoding using the dependency plans already
-   produced by `mmrecode-mpeg2`.
-3. Add bounded streaming, indexing, seeking, and decode queues to playback and the viewer.
-4. Add AVI as the first additional production container for MJPEG and DV workflows.
+1. Add the first typed edit-command model and minimal terminal shell now that the render path can
+   produce a verified edited file.
+2. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
+3. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
+   third-party plugins.
+4. Add bounded streaming, indexing, seeking, and decode queues to playback and the viewer.
 5. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
    the reusable codec layer.
 6. Start H.264 only after the edit/render interfaces have been exercised by the existing codecs.
@@ -74,11 +74,21 @@ interoperability vectors.
 **Status:** Constrained Main Profile 4:2:0 progressive/interlaced frame-picture slice complete for
 typed parsing, I/P/B reconstruction, deterministic encoding, open/closed GOP dependency analysis,
 smart-render planning, API, CLI, C API, viewer, and FFmpeg vectors. The existing `plan-mpeg2`
-command plans damage propagation; it does not yet execute an edited render.
+CLI command only plans damage propagation; the optional Rust renderer now executes frame-accurate
+cuts and concatenation across compatible MPEG-2 sources. The current long-form render CLI remains
+a testing harness rather than the intended editor interface.
 
-- [ ] Execute bridge plans through `mmrecode-render`: copy unaffected pictures, decode the damaged
-  region, bridge-encode it, rewrite timestamps, and mux the result.
-- [ ] Match source sequence/GOP parameters at bridge boundaries and validate splice continuity.
+- [x] Translate decode-order dependencies and frame-aligned changes into generic render operations,
+  including copied output slots, affected-picture propagation, and unchanged reference preroll.
+- [x] Execute bridge plans through the optional native renderer adapter: copy unaffected pictures,
+  decode reference preroll, apply replacement frames, bridge-encode the affected region, rewrite
+  timestamps, and validate the elementary-stream splice.
+- [x] Preserve aspect, display/colour metadata, profile/level, and all luma/chroma quantizer
+  matrices at bridge boundaries; recompute GOP timecode from the source origin; deliberately
+  preserve or report rewrites of bitrate, VBV-buffer, and picture-delay signalling.
+- [x] Select frame-aligned source ranges across compatible MPEG-2 inputs, regenerate dependency-
+  damaged cut boundaries, resume packet copying at safe points, and produce a continuous output
+  timeline.
 - [ ] Implement field-picture decoding and encoding.
 - [ ] Implement dual-prime prediction.
 - [ ] Add native encoder motion search for B pictures; the current encoder uses zero-vector
@@ -111,7 +121,8 @@ PCM.
 
 **Status:** Single-program 188-byte TS slice complete for PAT/PMT discovery, continuity and CRC
 validation, PES reassembly, PTS/DTS/PCR timing, MPEG-2 Video demux, optional Layer II audio, and
-deterministic A/V muxing.
+deterministic A/V muxing. The optional renderer adapter now directly delivers smart-rendered MPEG-2
+plus complete Layer II frames with an inspectable A/V boundary report.
 
 - [ ] Add incremental streaming demux and mux APIs instead of requiring complete buffers.
 - [ ] Build timestamp/keyframe indexes for seeking and handle 33-bit timestamp wrap explicitly.
@@ -139,18 +150,33 @@ deterministic A/V muxing.
 **Status:** The shared dependency vocabulary and MPEG-2 damage planner exist. `mmrecode-edit` now
 models sources, streams, tracks, clips, exact ranges, effects, transitions, and output intent.
 `mmrecode-render` plans and executes packet-aligned, independent-frame DV and MJPEG
-cut/concatenate paths with payload and side-data preservation plus exact timestamp rewriting. It
-does not yet drive a muxer directly or regenerate changed frames.
+cut/concatenate paths with payload and side-data preservation plus exact timestamp rewriting. Its
+generic inter-frame planner now maps MPEG-2 reference graphs and changed frame ranges into copy,
+decode, effect, and bridge/full-encode operations with decode-preroll accounting. It selects exact
+ranges across compatible sources and regenerates dependencies crossing either cut boundary. The
+optional MPEG-2 adapter executes those fixed-rate bridge plans and validates the splice. Its optional
+MPEG-TS delivery adapter drives the muxer directly and applies an explicit exact/contained/cover
+policy to complete Layer II frames. Broader sample-domain audio editing remains unimplemented.
 
 - [x] Create `mmrecode-edit` with sources, tracks, clips, ranges, transitions, effects, and output
   intent without codec-specific syntax.
 - [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
 - [x] Implement the first independent-frame cut/concatenate path with DV.
-- [ ] Drive a selected container muxer directly instead of returning container-ready packets.
+- [x] Drive the MPEG-TS muxer directly for the first MPEG-2 Video plus optional Layer II delivery
+  path while retaining a separately inspectable dry-run plan.
+- [ ] Generalize direct delivery across other selected containers and stream combinations.
 - [x] Add an MJPEG dependency analyzer and connect the same independent-frame path.
-- [ ] Implement MPEG-2 GOP-aware cuts and bridge encoding using `DependencyAnalyzer` output.
-- [ ] Define exact edit-boundary rules for video frames, audio samples, preroll, and A/V sync.
+- [x] Plan MPEG-2 GOP-aware regeneration through generic operations using `DependencyAnalyzer`
+  output, including dependency propagation and decode preroll.
+- [x] Execute MPEG-2 bridge encoding for one complete fixed-rate source and splice regenerated
+  packets into byte-preserved copied output with native and FFmpeg validation.
+- [x] Extend MPEG-2 planning/execution to frame-accurate ranges from multiple compatible sources,
+  including non-contiguous decode-order selection at cut ends and continuous output timestamps.
+- [x] Define the first exact A/V end policy for frame-aligned MPEG-2 and complete Layer II frames:
+  reject, contain, or cover a fractional audio-frame boundary without silent rounding.
+- [ ] Extend edit-boundary rules to decoded audio samples, audio preroll, fades/mixes, and general
+  multi-track A/V sync.
 - [x] Verify codec-parameter compatibility and preserve packet flags and side data in the initial
   packet-copy path.
 - [ ] Make every render plan explainable: copied/reencoded ranges, causes, dependencies, expected
@@ -158,6 +184,29 @@ does not yet drive a muxer directly or regenerate changed frames.
 - [ ] Add deterministic output, cancellation, progress reporting, and recoverable failure handling.
 - [ ] Add transitions/effects only after the copy/reencode boundary machinery is verified.
 - [ ] Expose stable editing/rendering entry points through the C API after the Rust model settles.
+
+## Effects, compositing, and authoring plugins
+
+**Status:** Architectural direction only. Final effects are CPU-authoritative; GPU execution is an
+optional backend. Plugins exchange versioned semantic values rather than internal Rust objects.
+
+- [ ] Define typed scene objects for text, paths, rectangles, images, groups, transforms, layout,
+  timing, and animation without tying them to a renderer.
+- [ ] Define the safe, bounded MMFX language and typed portable IR, including color, sampling,
+  coordinate, edge, precision, and time semantics.
+- [ ] Implement a scalar CPU reference backend with deterministic golden tests.
+- [ ] Add tiled multithreaded and SIMD CPU execution with correct halos for large-radius effects and
+  differential testing against the reference backend.
+- [ ] Add controlled text shaping, font fallback, vector rasterization, high-quality antialiasing,
+  and linear-light/high-precision compositing.
+- [ ] Add optional WGSL/wgpu preview execution from the same IR; keep backend and preview-quality
+  choices explicit.
+- [ ] Define a versioned plugin manifest, capability model, typed protocol, diagnostics, lifecycle,
+  caching, and determinism contract.
+- [ ] Support built-in Rust plugins plus sandboxed WASM/WASI and external-process plugins without
+  treating Rust trait objects as a stable binary ABI.
+- [ ] Use a Markdown composition generator as the first semantic authoring-plugin proof: headings,
+  media, code, diagrams, and timing should become editable scene/timeline objects.
 
 ## Playback engine
 
@@ -231,9 +280,12 @@ test. ABI stability is not yet promised.
 ## CLI and high-level Rust API
 
 **Status:** Inspection, decode/encode, verification/comparison, DV audio extraction, MPEG-2
-planning, and MPEG-TS mux/demux commands exist. `edit` and `benchmark` remain planned.
+planning, MPEG-TS mux/demux, and bounded one-frame `render-plan`/`render` commands exist. `edit` and
+`benchmark` remain planned.
 
-- [ ] Add `edit`/`render-plan`/`render` commands with dry-run explanations.
+- [x] Add bounded MPEG-2/Layer II `render-plan` and `render` commands with replacement-frame input,
+  dry-run explanation, and explicit audio-end policy.
+- [ ] Add the interactive/scripted `edit` command over a shared typed command model.
 - [ ] Add corpus benchmark commands and machine-readable results.
 - [ ] Add optional structured JSON output for inspection, verification, and render plans.
 - [ ] Add stdin/stdout and incremental operation where formats permit it.

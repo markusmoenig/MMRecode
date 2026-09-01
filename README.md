@@ -20,7 +20,8 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-mpegts`: 188-byte MPEG-2 Transport Stream demuxing and deterministic muxing
 - `mmrecode-y4m`: simple uncompressed test input and output
 - `mmrecode-edit`: codec-independent sources, tracks, clips, effects, transitions, and output intent
-- `mmrecode-render`: explicit render planning and independent-frame packet-copy execution
+- `mmrecode-render`: explicit render planning, minimal-recompression execution, and optional
+  MPEG-TS delivery
 - `mmrecode-playback`: exact fixed-rate timelines and audio-clock synchronization
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
@@ -40,9 +41,22 @@ The first codec-independent editing slice is implemented in `mmrecode-edit` and
 and output intent, then plans and executes packet-aligned cuts and concatenation for independently
 coded video. The executor preserves encoded payloads and side data while rebasing PTS/DTS and
 stream identifiers; real DV and MJPEG integration tests prove reordered output without
-re-encoding.
-Effects, transitions, audio, non-frame-aligned cuts, direct muxer driving, and MPEG-2 bridge
-execution remain explicit subsequent slices.
+re-encoding. The generic inter-frame planner now consumes decode-order reference graphs, propagates
+frame-aligned changes, identifies unchanged decode preroll, and reserves exact copy and bridge-
+encode packet slots. Its decisions match the MPEG-2 codec-local smart-render planner on real I/P/B
+test data. It now selects frame-accurate ranges across multiple compatible sources, regenerates
+references damaged by a cut, and returns to byte-preserving copy at the next safe point. With the
+opt-in `mmrecode-render/mpeg2` feature, the native executor accepts replacement frames, encodes
+closed bridge GOPs, preserves unaffected packet payloads, and validates the final splice with both
+MMRecode and FFmpeg. The opt-in `mpegts` feature adds a dry-runnable direct mux
+path for those packets plus optional MPEG-1 Layer II audio. It reports copied/regenerated work and
+uses an explicit exact/contained/cover complete-audio-frame policy; the resulting A/V transport is
+validated by native demux/decode and FFmpeg. Bridge encoding now preserves aspect, display/colour,
+profile/level, and all four quantizer matrices; recomputes closed-GOP timecode from the source
+origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Transitions,
+sample-level audio editing, multi-clip audio, transitions, and production VBV continuity remain
+subsequent slices. Existing long-form render commands are development harnesses; the intended
+editor surface is a shared typed command language for script and interactive terminal modes.
 
 The second codec slice is implemented in `mmrecode-dv`. It recognizes
 525/60 and 625/50 DV25, indexes and validates every 80-byte DIF block, retains subcode/VAUX/AAUX
@@ -87,6 +101,14 @@ cargo run -p mmrecode-cli -- \
   plan-mpeg2 testdata/mpeg2/valid/main-ml-progressive-open-gop.m2v 9 10
 cargo run -p mmrecode-cli -- \
   decode testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode-mpeg2.y4m
+cargo run -p mmrecode-cli -- \
+  render-plan testdata/mpeg2/valid/main-ml-progressive-ibp.m2v \
+  --replace 3 /tmp/replacement.y4m \
+  --audio testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2 --audio-end exact
+cargo run -p mmrecode-cli -- \
+  render testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode-render.ts \
+  --replace 3 /tmp/replacement.y4m \
+  --audio testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2 --audio-end exact
 cargo run -p mmrecode-cli -- \
   encode-mpeg2 /tmp/mmrecode-mpeg2.y4m /tmp/mmrecode-roundtrip.m2v 8
 cargo run -p mmrecode-cli -- \

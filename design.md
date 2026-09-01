@@ -288,6 +288,12 @@ GOPs, zero-vector B prediction, and VBR delay signalling; adaptive rate control 
 scheduler remain follow-on work. These limits are explicit API errors and documented in the crate
 README rather than silent approximations.
 
+Encoder sequence settings separate coding tools from splice metadata. They control aspect ratio,
+display/colour description, profile/level, four natural-order quantizer matrices, declared
+bitrate/VBV size, and GOP timecode origin. Custom matrices affect coefficient quantization and are
+also written into sequence/quant-matrix syntax. Drop-frame timecode is computed for 30000/1001
+content rather than treated as a punctuation flag.
+
 ### Avoid premature algorithm abstraction
 
 Codecs may share concepts without sharing implementations.
@@ -374,11 +380,12 @@ pub enum RenderOperation {
 }
 ```
 
-The initial implemented slice accepts one gap-free video track of clean, reference-free access
-units. It verifies packet-aligned clip boundaries, exact duration mapping, codec and parameter
+The independent-frame slice accepts one gap-free video track of clean, reference-free access units.
+It verifies packet-aligned clip boundaries, exact duration mapping, codec and parameter
 compatibility, then emits and executes `CopyPackets`, `RewriteTimestamps`, and `Mux` operations.
 Encoded payloads, flags, and opaque side data are preserved. The executor returns container-ready
-packets; directly driving a selected muxer is a subsequent slice.
+packets. Direct delivery remains an optional adapter so the generic planner does not depend on all
+containers.
 
 `mmrecode-edit` is separate and implemented as a codec-independent intent model. It owns sources,
 stream references, tracks, clips, exact source/timeline ranges, effects, transitions, and output
@@ -386,10 +393,31 @@ intent without deciding how encoded data is regenerated. Its initial schema is d
 in-memory and version-agnostic; serialization, speed mapping, automation curves, and nested
 sequences should follow demonstrated render requirements.
 
-The next generic planner slice will consume inter-frame dependency graphs. Codec-specific adapters
-determine whether a reconnection is valid and which parameters a bridge encoder must match. The
-existing MPEG-2 planner already proves codec-local damage propagation but is not yet connected to
-the generic executor.
+The generic inter-frame planner consumes decode-ordered `AccessUnitInfo` graphs for frame-aligned
+ranges from one or more compatible sources. Each encode operation carries the exact source packet
+indices represented by its output slots. References crossing a cut boundary force regeneration;
+damage then propagates through retained dependents until copying is safe again. The planner also
+maps exact timeline changes into directly edited pictures, identifies unchanged reference preroll,
+and reserves output packet slots for copied and regenerated runs. A real MPEG-2 I/P/B integration
+test proves both codec-local damage propagation and a multi-source boundary splice. The packet
+executor can losslessly process unchanged MPEG-2 regions. An optional MPEG-2 adapter executes regeneration:
+it supplies decoded source pictures and explicit replacements to the native encoder, creates a
+closed GOP for each affected run, fills reserved decode-order packet slots, and validates the
+resulting elementary stream through parse, dependency analysis, native reconstruction, and FFmpeg.
+The feature boundary keeps the generic renderer independent of MPEG-2 unless selected. Exact
+display/colour metadata, aspect ratio, profile/level, and luma/chroma matrices are now preserved by
+bridge runs. GOP timecodes are recomputed from the source origin. `Mpeg2SpliceReport` classifies
+each field as preserved, absent, recomputed, or rewritten. The reference encoder rewrites
+incompatible source bitrate/VBV declarations to its explicit Main-Level bounds and uses
+`vbv_delay = 0xffff`; production buffer continuity remains follow-on work.
+
+The optional `mpegts` render feature is the first direct-delivery adapter. It validates a gap-free
+MPEG-2 presentation timeline, frames optional Layer II without decoding it, and creates an
+inspectable A/V packet schedule before muxing. Complete audio frames use an explicit `Exact`,
+`Contained`, or `Cover` end policy with rational timestamp comparisons. Executing the plan then
+registers the selected streams and feeds that exact schedule to `MpegTsMuxer`; planning itself emits
+no container bytes. This keeps edit-boundary policy in rendering and H.222.0 syntax in the
+container crate.
 
 ## Quality and verification
 
@@ -471,7 +499,31 @@ Static Rust dependencies are sufficient initially. Applications instantiate the 
 they use.
 
 A registry may later map codec identifiers and container probes to constructors. Dynamic plugins
-should be considered only after a stable C ABI exists; Rust trait-object ABI is not a plugin ABI.
+must not use Rust trait objects as a binary ABI.
+
+Extensibility is broader than runtime codec loading. The future plugin model distinguishes media
+importers, composition generators, semantic object renderers, MMFX modules, codecs/containers,
+exporters, and command extensions. Built-ins can implement Rust traits directly. Third-party
+plugins cross a versioned protocol boundary through sandboxed WASM/WASI or an external process,
+with a stable C ABI reserved for native integrations that truly require it.
+
+Every external plugin has a manifest declaring its API version, plugin kind, input/output media
+types, capabilities, and determinism claim. Plugins exchange typed edit commands, scene objects,
+packets, frames, or documented document trees; they never receive the editor's private Rust data
+structures. A Markdown composition plugin should be an early proof because it exercises structured
+authoring without requiring frame-level access.
+
+## Effect execution
+
+The planned MMFX source language compiles into a typed backend-neutral IR. Its normative execution
+path is a safe scalar CPU interpreter or compiler. Multithreaded tiled and SIMD CPU backends are
+tested against that reference and are the default candidates for high-quality final rendering.
+Typography, vector coverage, large-radius filters, color conversion, and blending therefore remain
+under MMRecode's explicit quality and precision policy.
+
+WGSL/wgpu is an optional backend for responsive preview and compatible accelerated renders. It
+consumes the same IR rather than defining separate effect behavior. Backend choice, preview proxies,
+and any quality reduction are explicit render settings.
 
 ## C ABI and bindings
 

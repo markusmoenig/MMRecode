@@ -14,6 +14,16 @@ conformance or production encoder performance.
   control; separate luma/chroma quant matrices
 - Decode/presentation reordering, closed/open GOP reference graphs, clean/recovery random access,
   parameter fingerprints, and explainable smart-render damage propagation
+- Integration coverage proving that the codec-independent renderer reproduces MPEG-2 dependency
+  propagation, retains unaffected coded pictures, and includes reference-picture decode preroll
+- Optional renderer integration that replaces a frame inside an I/P/B GOP, generates a closed
+  bridge GOP, copies the following GOP payloads unchanged, and validates the splice natively and
+  with FFmpeg
+- Splice-fidelity controls preserving aspect ratio, sequence display/colour metadata,
+  profile/level, and separate luma/chroma matrices; source-origin GOP timecode recomputation and
+  explicit bitrate/VBV rewrite reporting
+- Optional render delivery that combines the splice with complete Layer II audio frames, exposes
+  exact/contained/cover A/V end policy in a dry-run report, and drives the MPEG-TS muxer
 - Deterministic Main Profile/Main Level closed-GOP encoder with I/P/B ordering, integer-pixel P
   motion search, bidirectional B prediction, slice rows, native reconstruction, and VBR delay
   signalling under the Main Level header bounds
@@ -30,6 +40,10 @@ conformance or production encoder performance.
   than searched, and there is no production VBV scheduler or adaptive rate-control loop.
 - Damaged-slice concealment, slice/thread parallelism, SIMD, hardware acceleration, transport
   streams, program streams, MXF, and other container mappings remain separate follow-on work.
+- The renderer's first bridge executor handles one complete fixed-rate source and emits fresh
+  sequence headers. Display metadata and custom matrices are preserved, while the reference
+  encoder deliberately declares its own bitrate/VBV bounds and unspecified VBR picture delay.
+  Production VBV continuity is not claimed.
 
 These boundaries are intentional: supported streams are reconstructed and externally checked;
 unsupported syntax is surfaced instead of being silently approximated.

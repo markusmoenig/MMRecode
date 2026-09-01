@@ -1536,11 +1536,13 @@ version = "0.0.1"
 dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
+ "mmrecode-edit",
  "mmrecode-mjpeg",
  "mmrecode-mpeg2",
  "mmrecode-mpegaudio",
  "mmrecode-mpegts",
  "mmrecode-quality",
+ "mmrecode-render",
  "mmrecode-y4m",
 ]
 
@@ -1622,6 +1624,9 @@ dependencies = [
  "mmrecode-dv",
  "mmrecode-edit",
  "mmrecode-mjpeg",
+ "mmrecode-mpeg2",
+ "mmrecode-mpegaudio",
+ "mmrecode-mpegts",
 ]
 
 [[package]]

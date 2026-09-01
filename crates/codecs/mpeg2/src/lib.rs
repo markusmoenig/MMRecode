@@ -19,7 +19,9 @@ pub use dependency::{
     Mpeg2DependencyAnalyzer, SmartRenderDisposition, SmartRenderPicture, SmartRenderPlan,
     analyze_dependencies, plan_smart_render,
 };
-pub use encoder::{EncodedMpeg2, Mpeg2EncodeOptions, encode_stream};
+pub use encoder::{
+    EncodedMpeg2, Mpeg2EncodeOptions, Mpeg2QuantMatrices, Mpeg2SequenceSettings, encode_stream,
+};
 pub use parser::{Mpeg2Stream, Picture, Slice, StartCodeUnit, parse_stream, scan_start_codes};
 pub use syntax::{
     ChromaFormat, ColourDescription, Extension, FrameRate, GroupHeader, PictureCodingExtension,

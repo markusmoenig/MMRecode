@@ -8,13 +8,24 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+mpeg2 = ["dep:mmrecode-mpeg2"]
+mpegts = ["mpeg2", "dep:mmrecode-mpegaudio", "dep:mmrecode-mpegts"]
+
 [dependencies]
 mmrecode-core.workspace = true
 mmrecode-edit.workspace = true
+mmrecode-mpegaudio = { workspace = true, optional = true }
+mmrecode-mpeg2 = { workspace = true, optional = true }
+mmrecode-mpegts = { workspace = true, optional = true }
 
 [dev-dependencies]
 mmrecode-dv.workspace = true
 mmrecode-mjpeg.workspace = true
+mmrecode-mpegaudio.workspace = true
+mmrecode-mpeg2.workspace = true
+mmrecode-mpegts.workspace = true
 
 [lints]
 workspace = true

@@ -4,10 +4,11 @@ use mmrecode_bitstream::BitWriter;
 use mmrecode_core::{Error, PixelFormat, Result, VideoFrame};
 
 use crate::{
-    FrameRate, PictureType, decode_stream,
+    FrameRate, PictureType, SequenceDisplayExtension, decode_stream,
     tables::{
-        CODED_BLOCK_PATTERN, DC_CHROMA, DC_LUMA, DCT_COEFFICIENT_ZERO, LEVEL,
-        MACROBLOCK_ADDRESS_INCREMENT, MACROBLOCK_B, MACROBLOCK_P, MOTION_CODE, RUN, ZIGZAG,
+        CODED_BLOCK_PATTERN, DC_CHROMA, DC_LUMA, DCT_COEFFICIENT_ZERO, DEFAULT_INTRA_MATRIX,
+        DEFAULT_NON_INTRA_MATRIX, LEVEL, MACROBLOCK_ADDRESS_INCREMENT, MACROBLOCK_B, MACROBLOCK_P,
+        MOTION_CODE, RUN, ZIGZAG,
     },
     transform::forward_dct,
 };
@@ -15,6 +16,74 @@ use crate::{
 const ESCAPE_SYMBOL: usize = 111;
 const EOB_SYMBOL: usize = 112;
 const F_CODE: u8 = 3;
+
+/// Quantizer matrices used and signalled by the encoder, in natural coefficient order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mpeg2QuantMatrices {
+    /// Luma intra matrix.
+    pub intra: [u8; 64],
+    /// Luma non-intra matrix.
+    pub non_intra: [u8; 64],
+    /// Chroma intra matrix.
+    pub chroma_intra: [u8; 64],
+    /// Chroma non-intra matrix.
+    pub chroma_non_intra: [u8; 64],
+}
+
+impl Default for Mpeg2QuantMatrices {
+    fn default() -> Self {
+        let intra = std::array::from_fn(|index| {
+            u8::try_from(DEFAULT_INTRA_MATRIX[index])
+                .expect("default MPEG-2 intra matrix values fit u8")
+        });
+        let non_intra = std::array::from_fn(|index| {
+            u8::try_from(DEFAULT_NON_INTRA_MATRIX[index])
+                .expect("default MPEG-2 non-intra matrix values fit u8")
+        });
+        Self {
+            intra,
+            non_intra,
+            chroma_intra: intra,
+            chroma_non_intra: non_intra,
+        }
+    }
+}
+
+/// Sequence and GOP metadata controlled independently from picture coding tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mpeg2SequenceSettings {
+    /// MPEG aspect-ratio information code.
+    pub aspect_ratio_information: u8,
+    /// Declared upper-bound input bitrate in bits per second, in 400-bit/s units.
+    pub bit_rate: u64,
+    /// Declared VBV buffer size in bits, in 16,384-bit units.
+    pub vbv_buffer_size_bits: u64,
+    /// MPEG-2 profile-and-level indication.
+    pub profile_and_level_indication: u8,
+    /// Optional sequence display and colour metadata.
+    pub display: Option<SequenceDisplayExtension>,
+    /// Quantizer matrices used for coding and written into the sequence.
+    pub quant_matrices: Mpeg2QuantMatrices,
+    /// Absolute first-frame timecode origin for the encoded segment.
+    pub timecode_start_frame: u64,
+    /// Use SMPTE drop-frame numbering for 30000/1001 content.
+    pub drop_frame_timecode: bool,
+}
+
+impl Default for Mpeg2SequenceSettings {
+    fn default() -> Self {
+        Self {
+            aspect_ratio_information: 1,
+            bit_rate: 15_000_000,
+            vbv_buffer_size_bits: 112 * 16_384,
+            profile_and_level_indication: 0x48,
+            display: None,
+            quant_matrices: Mpeg2QuantMatrices::default(),
+            timecode_start_frame: 0,
+            drop_frame_timecode: false,
+        }
+    }
+}
 
 /// Deterministic MPEG-2 encoder settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +102,8 @@ pub struct Mpeg2EncodeOptions {
     pub progressive: bool,
     /// Top-field-first flag for interlaced frame pictures.
     pub top_field_first: bool,
+    /// Sequence/display, matrix, rate-signalling, and GOP timecode settings.
+    pub sequence: Mpeg2SequenceSettings,
 }
 
 impl Default for Mpeg2EncodeOptions {
@@ -45,6 +116,7 @@ impl Default for Mpeg2EncodeOptions {
             motion_search_range: 4,
             progressive: true,
             top_field_first: false,
+            sequence: Mpeg2SequenceSettings::default(),
         }
     }
 }
@@ -72,15 +144,19 @@ pub struct EncodedMpeg2 {
 /// Returns an error for empty or inconsistent input, invalid options, entropy overflow, or an
 /// internally undecodable generated stream.
 pub fn encode_stream(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Result<EncodedMpeg2> {
-    validate_input(frames, options)?;
+    validate_input(frames, &options)?;
     let mut data = Vec::new();
-    write_sequence_header(&mut data, frames[0].width, frames[0].height, options)?;
-    write_sequence_extension(&mut data, options)?;
+    write_sequence_header(&mut data, frames[0].width, frames[0].height, &options)?;
+    write_sequence_extension(&mut data, &options)?;
+    if let Some(display) = options.sequence.display {
+        write_sequence_display_extension(&mut data, display)?;
+    }
+    write_chroma_quant_matrix_extension(&mut data, options.sequence.quant_matrices)?;
     let mut picture_types = Vec::with_capacity(frames.len());
 
     for gop_start in (0..frames.len()).step_by(options.gop_size) {
         let gop_end = (gop_start + options.gop_size).min(frames.len());
-        write_group_header(&mut data, gop_start, options)?;
+        write_group_header(&mut data, gop_start, &options)?;
         encode_and_append_picture(
             &mut data,
             &frames[gop_start],
@@ -88,7 +164,7 @@ pub fn encode_stream(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Resu
             None,
             PictureType::I,
             0,
-            options,
+            &options,
         )?;
         picture_types.push(PictureType::I);
         let mut previous_reference_index = gop_start;
@@ -105,7 +181,7 @@ pub fn encode_stream(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Resu
                 None,
                 PictureType::P,
                 next_reference_index - gop_start,
-                options,
+                &options,
             )?;
             picture_types.push(PictureType::P);
             let next_reconstruction = decode_last_reference(&data)?;
@@ -122,7 +198,7 @@ pub fn encode_stream(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Resu
                     Some(&next_reconstruction),
                     PictureType::B,
                     display_index - gop_start,
-                    options,
+                    &options,
                 )?;
                 picture_types.push(PictureType::B);
             }
@@ -142,7 +218,7 @@ pub fn encode_stream(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Resu
     })
 }
 
-fn validate_input(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Result<()> {
+fn validate_input(frames: &[VideoFrame], options: &Mpeg2EncodeOptions) -> Result<()> {
     let first = frames
         .first()
         .ok_or_else(|| Error::InvalidData("cannot encode an empty MPEG-2 sequence".into()))?;
@@ -164,6 +240,7 @@ fn validate_input(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Result<
             "MPEG-2 quantizer code must be 1..=31 and search range at most 7".into(),
         ));
     }
+    validate_sequence_settings(options)?;
     if matches!(
         options.frame_rate,
         FrameRate::Fps50 | FrameRate::Fps59_94 | FrameRate::Fps60
@@ -207,6 +284,68 @@ fn validate_input(frames: &[VideoFrame], options: Mpeg2EncodeOptions) -> Result<
     Ok(())
 }
 
+fn validate_sequence_settings(options: &Mpeg2EncodeOptions) -> Result<()> {
+    let sequence = options.sequence;
+    if !(1..=4).contains(&sequence.aspect_ratio_information) {
+        return Err(Error::Unsupported(
+            "MPEG-2 encoder supports aspect-ratio information codes 1 through 4".into(),
+        ));
+    }
+    if sequence.profile_and_level_indication != 0x48 {
+        return Err(Error::Unsupported(
+            "MPEG-2 reference encoder only emits Main Profile at Main Level (0x48)".into(),
+        ));
+    }
+    if sequence.bit_rate == 0 || !sequence.bit_rate.is_multiple_of(400) {
+        return Err(Error::InvalidData(
+            "MPEG-2 declared bitrate must be a non-zero multiple of 400 bit/s".into(),
+        ));
+    }
+    let bit_rate_value = sequence.bit_rate / 400;
+    if bit_rate_value >= (1_u64 << 30) {
+        return Err(Error::InvalidData(
+            "MPEG-2 declared bitrate exceeds its 30-bit syntax field".into(),
+        ));
+    }
+    if sequence.vbv_buffer_size_bits == 0
+        || !sequence.vbv_buffer_size_bits.is_multiple_of(16_384)
+        || sequence.vbv_buffer_size_bits / 16_384 >= (1_u64 << 18)
+    {
+        return Err(Error::InvalidData(
+            "MPEG-2 VBV buffer size must fit the non-zero 18-bit syntax in 16,384-bit units".into(),
+        ));
+    }
+    if sequence.drop_frame_timecode && options.frame_rate != FrameRate::Fps29_97 {
+        return Err(Error::Unsupported(
+            "drop-frame GOP timecode requires 30000/1001 fps".into(),
+        ));
+    }
+    if let Some(display) = sequence.display
+        && (display.video_format > 7
+            || display.display_horizontal_size == 0
+            || display.display_horizontal_size >= (1 << 14)
+            || display.display_vertical_size == 0
+            || display.display_vertical_size >= (1 << 14))
+    {
+        return Err(Error::InvalidData(
+            "invalid MPEG-2 sequence display metadata".into(),
+        ));
+    }
+    for matrix in [
+        &sequence.quant_matrices.intra,
+        &sequence.quant_matrices.non_intra,
+        &sequence.quant_matrices.chroma_intra,
+        &sequence.quant_matrices.chroma_non_intra,
+    ] {
+        if matrix.contains(&0) {
+            return Err(Error::InvalidData(
+                "MPEG-2 quantizer matrices cannot contain zero".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_planes(frame: &VideoFrame) -> Result<()> {
     let expected = [
         (frame.width, frame.height),
@@ -236,38 +375,49 @@ fn write_sequence_header(
     data: &mut Vec<u8>,
     width: usize,
     height: usize,
-    options: Mpeg2EncodeOptions,
+    options: &Mpeg2EncodeOptions,
 ) -> Result<()> {
     append_start_code(data, 0xb3);
     let mut bits = BitWriter::new();
     bits.write_bits(u64::try_from(width).map_err(integer_error)?, 12)?;
     bits.write_bits(u64::try_from(height).map_err(integer_error)?, 12)?;
-    bits.write_bits(1, 4)?;
+    bits.write_bits(u64::from(options.sequence.aspect_ratio_information), 4)?;
     bits.write_bits(u64::from(options.frame_rate.code()), 4)?;
-    // Main Profile/Main Level permits a maximum VBV input rate of 15 Mbit/s.
-    bits.write_bits(37_500, 18)?;
+    let bit_rate_value = options.sequence.bit_rate / 400;
+    bits.write_bits(bit_rate_value & ((1 << 18) - 1), 18)?;
     bits.write_bit(true)?;
-    bits.write_bits(112, 10)?;
+    let vbv_value = options.sequence.vbv_buffer_size_bits / 16_384;
+    bits.write_bits(vbv_value & ((1 << 10) - 1), 10)?;
     bits.write_bit(false)?;
-    bits.write_bit(false)?;
-    bits.write_bit(false)?;
+    write_matrix(
+        &mut bits,
+        &options.sequence.quant_matrices.intra,
+        &default_intra_matrix_array(),
+    )?;
+    write_matrix(
+        &mut bits,
+        &options.sequence.quant_matrices.non_intra,
+        &default_non_intra_matrix_array(),
+    )?;
     bits.align_to_byte();
     data.extend(bits.into_bytes());
     Ok(())
 }
 
-fn write_sequence_extension(data: &mut Vec<u8>, options: Mpeg2EncodeOptions) -> Result<()> {
+fn write_sequence_extension(data: &mut Vec<u8>, options: &Mpeg2EncodeOptions) -> Result<()> {
     append_start_code(data, 0xb5);
     let mut bits = BitWriter::new();
     bits.write_bits(1, 4)?;
-    bits.write_bits(0x48, 8)?;
+    bits.write_bits(u64::from(options.sequence.profile_and_level_indication), 8)?;
     bits.write_bit(options.progressive)?;
     bits.write_bits(1, 2)?;
     bits.write_bits(0, 2)?;
     bits.write_bits(0, 2)?;
-    bits.write_bits(0, 12)?;
+    let bit_rate_value = options.sequence.bit_rate / 400;
+    bits.write_bits(bit_rate_value >> 18, 12)?;
     bits.write_bit(true)?;
-    bits.write_bits(0, 8)?;
+    let vbv_value = options.sequence.vbv_buffer_size_bits / 16_384;
+    bits.write_bits(vbv_value >> 10, 8)?;
     bits.write_bit(options.b_frames == 0)?;
     bits.write_bits(0, 2)?;
     bits.write_bits(0, 5)?;
@@ -276,39 +426,142 @@ fn write_sequence_extension(data: &mut Vec<u8>, options: Mpeg2EncodeOptions) -> 
     Ok(())
 }
 
+fn write_sequence_display_extension(
+    data: &mut Vec<u8>,
+    display: SequenceDisplayExtension,
+) -> Result<()> {
+    append_start_code(data, 0xb5);
+    let mut bits = BitWriter::new();
+    bits.write_bits(2, 4)?;
+    bits.write_bits(u64::from(display.video_format), 3)?;
+    bits.write_bit(display.colour_description.is_some())?;
+    if let Some(colour) = display.colour_description {
+        bits.write_bits(u64::from(colour.colour_primaries), 8)?;
+        bits.write_bits(u64::from(colour.transfer_characteristics), 8)?;
+        bits.write_bits(u64::from(colour.matrix_coefficients), 8)?;
+    }
+    bits.write_bits(u64::from(display.display_horizontal_size), 14)?;
+    bits.write_bit(true)?;
+    bits.write_bits(u64::from(display.display_vertical_size), 14)?;
+    bits.align_to_byte();
+    data.extend(bits.into_bytes());
+    Ok(())
+}
+
+fn write_chroma_quant_matrix_extension(
+    data: &mut Vec<u8>,
+    matrices: Mpeg2QuantMatrices,
+) -> Result<()> {
+    let write_chroma_intra = matrices.chroma_intra != matrices.intra;
+    let write_chroma_non_intra = matrices.chroma_non_intra != matrices.non_intra;
+    if !write_chroma_intra && !write_chroma_non_intra {
+        return Ok(());
+    }
+    append_start_code(data, 0xb5);
+    let mut bits = BitWriter::new();
+    bits.write_bits(3, 4)?;
+    bits.write_bit(false)?;
+    bits.write_bit(false)?;
+    write_optional_matrix(&mut bits, write_chroma_intra, &matrices.chroma_intra)?;
+    write_optional_matrix(
+        &mut bits,
+        write_chroma_non_intra,
+        &matrices.chroma_non_intra,
+    )?;
+    bits.align_to_byte();
+    data.extend(bits.into_bytes());
+    Ok(())
+}
+
+fn write_matrix(bits: &mut BitWriter, matrix: &[u8; 64], default: &[u8; 64]) -> Result<()> {
+    let present = matrix != default;
+    write_optional_matrix(bits, present, matrix)
+}
+
+fn write_optional_matrix(bits: &mut BitWriter, present: bool, matrix: &[u8; 64]) -> Result<()> {
+    bits.write_bit(present)?;
+    if present {
+        for &position in &ZIGZAG {
+            bits.write_bits(u64::from(matrix[position]), 8)?;
+        }
+    }
+    Ok(())
+}
+
+fn default_intra_matrix_array() -> [u8; 64] {
+    std::array::from_fn(|index| {
+        u8::try_from(DEFAULT_INTRA_MATRIX[index])
+            .expect("default MPEG-2 intra matrix values fit u8")
+    })
+}
+
+fn default_non_intra_matrix_array() -> [u8; 64] {
+    std::array::from_fn(|index| {
+        u8::try_from(DEFAULT_NON_INTRA_MATRIX[index])
+            .expect("default MPEG-2 non-intra matrix values fit u8")
+    })
+}
+
 fn write_group_header(
     data: &mut Vec<u8>,
     frame_index: usize,
-    options: Mpeg2EncodeOptions,
+    options: &Mpeg2EncodeOptions,
 ) -> Result<()> {
     append_start_code(data, 0xb8);
-    let fps = match options.frame_rate {
-        FrameRate::Fps23_976 | FrameRate::Fps24 => 24,
-        FrameRate::Fps25 => 25,
-        FrameRate::Fps29_97 | FrameRate::Fps30 => 30,
-        FrameRate::Fps50 => 50,
-        FrameRate::Fps59_94 | FrameRate::Fps60 => 60,
-    };
-    let total_seconds = frame_index / fps.max(1);
-    let pictures = frame_index % fps.max(1);
+    let absolute_frame = options
+        .sequence
+        .timecode_start_frame
+        .checked_add(u64::try_from(frame_index).map_err(integer_error)?)
+        .ok_or_else(|| Error::InvalidData("MPEG-2 GOP timecode frame count overflows".into()))?;
+    let (hours, minutes, seconds, pictures) = gop_timecode(absolute_frame, options)?;
     let mut bits = BitWriter::new();
-    bits.write_bit(false)?;
-    bits.write_bits(
-        u64::try_from((total_seconds / 3_600) % 24).map_err(integer_error)?,
-        5,
-    )?;
-    bits.write_bits(
-        u64::try_from((total_seconds / 60) % 60).map_err(integer_error)?,
-        6,
-    )?;
+    bits.write_bit(options.sequence.drop_frame_timecode)?;
+    bits.write_bits(u64::from(hours), 5)?;
+    bits.write_bits(u64::from(minutes), 6)?;
     bits.write_bit(true)?;
-    bits.write_bits(u64::try_from(total_seconds % 60).map_err(integer_error)?, 6)?;
-    bits.write_bits(u64::try_from(pictures).map_err(integer_error)?, 6)?;
+    bits.write_bits(u64::from(seconds), 6)?;
+    bits.write_bits(u64::from(pictures), 6)?;
     bits.write_bit(true)?;
     bits.write_bit(false)?;
     bits.align_to_byte();
     data.extend(bits.into_bytes());
     Ok(())
+}
+
+fn gop_timecode(frame: u64, options: &Mpeg2EncodeOptions) -> Result<(u8, u8, u8, u8)> {
+    let nominal_fps = match options.frame_rate {
+        FrameRate::Fps23_976 | FrameRate::Fps24 => 24_u64,
+        FrameRate::Fps25 => 25,
+        FrameRate::Fps29_97 | FrameRate::Fps30 => 30,
+        FrameRate::Fps50 => 50,
+        FrameRate::Fps59_94 | FrameRate::Fps60 => 60,
+    };
+    let numbered_frame = if options.sequence.drop_frame_timecode {
+        let ten_minute_blocks = frame / 17_982;
+        let remainder = frame % 17_982;
+        let dropped = ten_minute_blocks
+            .checked_mul(18)
+            .and_then(|value| {
+                value.checked_add(if remainder >= 2 {
+                    2 * ((remainder - 2) / 1_798)
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| Error::InvalidData("drop-frame timecode overflows".into()))?;
+        frame
+            .checked_add(dropped)
+            .ok_or_else(|| Error::InvalidData("drop-frame timecode overflows".into()))?
+    } else {
+        frame
+    };
+    let total_seconds = numbered_frame / nominal_fps;
+    Ok((
+        u8::try_from((total_seconds / 3_600) % 24).map_err(integer_error)?,
+        u8::try_from((total_seconds / 60) % 60).map_err(integer_error)?,
+        u8::try_from(total_seconds % 60).map_err(integer_error)?,
+        u8::try_from(numbered_frame % nominal_fps).map_err(integer_error)?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,7 +572,7 @@ fn encode_and_append_picture(
     next: Option<&VideoFrame>,
     picture_type: PictureType,
     temporal_reference: usize,
-    options: Mpeg2EncodeOptions,
+    options: &Mpeg2EncodeOptions,
 ) -> Result<()> {
     write_picture_header(data, picture_type, temporal_reference)?;
     write_picture_coding_extension(data, options)?;
@@ -395,7 +648,7 @@ fn write_picture_header(
     Ok(())
 }
 
-fn write_picture_coding_extension(data: &mut Vec<u8>, options: Mpeg2EncodeOptions) -> Result<()> {
+fn write_picture_coding_extension(data: &mut Vec<u8>, options: &Mpeg2EncodeOptions) -> Result<()> {
     append_start_code(data, 0xb5);
     let mut bits = BitWriter::new();
     bits.write_bits(8, 4)?;
@@ -428,7 +681,7 @@ fn encode_macroblock(
     mb_x: usize,
     mb_y: usize,
     picture_type: PictureType,
-    options: Mpeg2EncodeOptions,
+    options: &Mpeg2EncodeOptions,
     dc_predictor: &mut [i32; 3],
     motion_predictor: &mut [i32; 2],
 ) -> Result<()> {
@@ -437,10 +690,15 @@ fn encode_macroblock(
         bits.write_bit(true)?;
         for block in 0..6 {
             let coefficients = forward_dct(&read_intra_block(source, mb_x, mb_y, block));
+            let matrix = if block < 4 {
+                &options.sequence.quant_matrices.intra
+            } else {
+                &options.sequence.quant_matrices.chroma_intra
+            };
             write_intra_block(
                 bits,
                 block,
-                &quantize_intra(&coefficients, qscale),
+                &quantize_intra(&coefficients, qscale, matrix),
                 dc_predictor,
             )?;
         }
@@ -479,7 +737,12 @@ fn encode_macroblock(
             forward_motion,
             backward_motion,
         )?;
-        *quantized = quantize_non_intra(&forward_dct(&residual), qscale);
+        let matrix = if block < 4 {
+            &options.sequence.quant_matrices.non_intra
+        } else {
+            &options.sequence.quant_matrices.chroma_non_intra
+        };
+        *quantized = quantize_non_intra(&forward_dct(&residual), qscale, matrix);
         if quantized.iter().any(|&value| value != 0) {
             cbp |= 1 << (5 - block);
         }
@@ -520,21 +783,22 @@ fn encode_macroblock(
     Ok(())
 }
 
-fn quantize_intra(coefficients: &[i32; 64], qscale: i32) -> [i16; 64] {
+fn quantize_intra(coefficients: &[i32; 64], qscale: i32, matrix: &[u8; 64]) -> [i16; 64] {
     let mut output = [0_i16; 64];
     output[0] = i16::try_from((coefficients[0] + 4) / 8).unwrap_or(255);
     for position in 1..64 {
-        let divisor = qscale * i32::from(default_intra_matrix(position));
+        let divisor = qscale * i32::from(matrix[position]);
         let value = divide_round(coefficients[position] * 16, divisor).clamp(-2_047, 2_047);
         output[position] = i16::try_from(value).unwrap_or_default();
     }
     output
 }
 
-fn quantize_non_intra(coefficients: &[i32; 64], qscale: i32) -> [i16; 64] {
+fn quantize_non_intra(coefficients: &[i32; 64], qscale: i32, matrix: &[u8; 64]) -> [i16; 64] {
     let mut output = [0_i16; 64];
     for position in 0..64 {
-        let value = divide_round(coefficients[position], qscale).clamp(-2_047, 2_047);
+        let divisor = qscale * i32::from(matrix[position]);
+        let value = divide_round(coefficients[position] * 16, divisor).clamp(-2_047, 2_047);
         output[position] = i16::try_from(value).unwrap_or_default();
     }
     output
@@ -546,15 +810,6 @@ fn divide_round(value: i32, divisor: i32) -> i32 {
     } else {
         (value + divisor / 2) / divisor
     }
-}
-
-fn default_intra_matrix(position: usize) -> u8 {
-    const MATRIX: [u8; 64] = [
-        8, 16, 19, 22, 26, 27, 29, 34, 16, 16, 22, 24, 27, 29, 34, 37, 19, 22, 26, 27, 29, 34, 34,
-        38, 22, 22, 26, 27, 29, 34, 37, 40, 22, 26, 27, 29, 32, 35, 40, 48, 26, 27, 29, 32, 35, 40,
-        48, 58, 26, 27, 29, 34, 38, 46, 56, 69, 27, 29, 35, 38, 46, 56, 69, 83,
-    ];
-    MATRIX[position]
 }
 
 fn write_intra_block(

@@ -240,11 +240,20 @@ analyzers expose dependencies, and render planning decides what can be copied an
 reconstructed. Broader editing behavior should grow on this boundary rather than leaking timeline
 semantics into codecs or containers.
 
+The first end-to-end delivery path now applies that separation to MPEG-2 Video plus optional MPEG-1
+Layer II audio in MPEG-TS. Container planning is inspectable before bytes are written, and a caller
+must explicitly choose whether a fractional audio-frame boundary is rejected, ends inside the
+video, or covers it with one final complete frame. This is a deliberately narrow policy proof; it
+does not replace future sample-domain audio editing.
+
 ## Terminal-first editor
 
 The first serious MMRecode editor should be a terminal-first, command-driven media editor with an
 integrated visual and audio preview. It is not merely a collection of transcoding commands. It is
 an interactive editing environment in which a sequence is a navigable hierarchy of media objects.
+The same concise commands must also run from a project/script file. Long FFmpeg-style option lists
+may exist for diagnostics and automated integration tests, but they are not the primary authoring
+interface.
 
 The interaction model resembles a small shell:
 
@@ -335,6 +344,50 @@ timeline can follow after this command model proves expressive and pleasant in r
 Interactive or dynamic content may remain live in MMRecode projects and be flattened to conventional
 codec-independent video for services such as YouTube.
 
+### CPU-authoritative effects and typography
+
+Final rendering should prioritize reproducible quality over meeting a real-time frame deadline. A
+future MMFX language should compile to a typed portable effect IR with a scalar CPU reference
+backend. A tiled, multithreaded and SIMD CPU backend can optimize that same behavior while retaining
+differential tests against the reference. Large filter radii need explicit tile halos rather than
+quietly changing the algorithm at tile boundaries.
+
+Text shaping, layout, vector rasterization, antialiasing, and compositing should have controlled CPU
+implementations suitable for high-resolution typography and large-radius effects. Final
+compositing should use explicit color spaces and sufficient precision rather than inheriting a
+display API's blending behavior.
+
+An optional WGSL/wgpu backend remains valuable for interactive preview and effects that map well to
+the GPU. It must consume the same IR and must not define MMFX semantics. Preview may use proxies or
+reduced quality; final CPU rendering never has to sacrifice quality to meet a presentation clock.
+
+### Modular authoring plugins
+
+Plugins extend more than codecs and pixel effects. Useful plugin categories include media importers,
+composition generators, semantic scene objects, effect modules, codecs, containers, exporters, and
+terminal-command extensions. A Markdown-to-video plugin is a representative composition generator:
+
+```text
+Markdown source
+      ↓
+document AST
+      ↓
+typed edit commands and semantic scene objects
+      ↓
+ordinary MMRecode preview, editing, and rendering
+```
+
+Headings should remain editable text objects, embedded media should become clips, and diagrams or
+code blocks should remain structured wherever practical. YouTube delivery flattens the final
+composition, but the project remains semantic and editable.
+
+Built-in plugins may use internal Rust traits. Third-party boundaries should use a versioned
+manifest and durable data protocol rather than Rust trait-object ABI. Portable sandboxed WASM/WASI
+and language-independent external processes are preferred extension mechanisms. Manifests declare
+plugin kind, accepted and produced media types, API version, required capabilities, and whether the
+plugin claims deterministic output. Plugins produce typed commands, scene nodes, packets, frames,
+or other defined values; they do not receive unrestricted mutable access to editor internals.
+
 ## Initial experiment
 
 The project should earn continued investment through bounded vertical slices.
@@ -381,10 +434,20 @@ audio encoding, damage reporting, CLI/viewer/C integration, and independent FFmp
 The first MPEG-2 Video slice now covers typed elementary-stream structure, sequence display and
 quant matrices, progressive and interlaced Main Profile 4:2:0 frame pictures, I/P/B reconstruction,
 deterministic constrained Main Profile/Main Level encoding, open/closed GOP references, clean and
-recovery entry points, and explainable bridge-encode propagation. It deliberately stops short of a
-generic timeline/render crate: the dependency data and codec-local smart-render plan prove that the
-future editor can be codec-independent without pretending that packet copy, timestamps, muxing,
-field pictures, dual-prime prediction, or production VBV control are already solved.
+recovery entry points, and explainable bridge-encode propagation. The first generic inter-frame
+render planner now consumes that dependency data, reproduces MPEG-2 damage propagation, identifies
+decode preroll, and reserves copy and regeneration packet ranges. Its optional MPEG-2 executor now
+regenerates a changed region as a closed GOP, preserves unaffected payloads, and validates the
+splice. Bridge headers now preserve aspect, display/colour metadata, profile/level, and all luma and
+chroma quantizer matrices. GOP timecode is recomputed from the source origin. Bitrate, VBV-buffer,
+and picture-delay signalling are preserved only when honest for the reference encoder, otherwise
+rewritten and reported. The inter-frame planner and MPEG-2 executor now also
+accept frame-aligned ranges from multiple compatible sources: reference-damaged cut boundaries are
+regenerated, safe regions return to byte-preserving packet copy, and packet timestamps form one
+continuous timeline. Multi-clip audio, field pictures, dual-prime prediction, and production VBV
+control remain explicit subsequent work.
+The first direct delivery adapter schedules the resulting packets with optional Layer II audio and
+drives the MPEG-TS muxer from the same explainable dry-run plan.
 
 The first container slice now covers 188-byte MPEG-2 Transport Stream structure, PAT/PMT program
 discovery, PES and 90 kHz timestamp reconstruction, and deterministic single-program MPEG-2 Video
