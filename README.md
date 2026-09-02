@@ -19,7 +19,7 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-mpeg2`: MPEG-2 Video parsing, I/P/B reconstruction/encoding, and dependency planning
 - `mmrecode-mpegts`: 188-byte MPEG-2 Transport Stream demuxing and deterministic muxing
 - `mmrecode-y4m`: simple uncompressed test input and output
-- `mmrecode-edit`: codec-independent sources, tracks, clips, effects, transitions, and output intent
+- `mmrecode-edit`: recursive linked-media authoring, typed editor commands, and flattened render intent
 - `mmrecode-render`: explicit render planning, minimal-recompression execution, and optional
   MPEG-TS delivery
 - `mmrecode-playback`: exact fixed-rate timelines and audio-clock synchronization
@@ -37,9 +37,13 @@ reconstruction, deterministic regression vectors, frame-quality reports, and ind
 checks. APIs remain intentionally unstable while coverage and conformance are expanded.
 
 The first codec-independent editing slice is implemented in `mmrecode-edit` and
-`mmrecode-render`. It validates sources, streams, tracks, clips, time ranges, effects, transitions,
-and output intent, then plans and executes packet-aligned cuts and concatenation for independently
-coded video. The executor preserves encoded payloads and side data while rebasing PTS/DTS and
+`mmrecode-render`. The project and every media node now expose an ordered local timeline of linked
+child media without artificial track/folder levels. Stable media and placement identities support
+recursive paths, aliases, reuse, cycle rejection, exact local source/timeline ranges, and typed
+`cd`/`ls`/`add`/`in`/`out` commands with undo/redo. `mmrecode edit` and `mmrecode edit <script>`
+share one parser and session. The existing flattened intent validates sources, streams, tracks,
+clips, time ranges, effects, transitions, and output intent, then plans and executes packet-aligned
+cuts and concatenation for independently coded video. The executor preserves encoded payloads and side data while rebasing PTS/DTS and
 stream identifiers; real DV and MJPEG integration tests prove reordered output without
 re-encoding. The generic inter-frame planner now consumes decode-order reference graphs, propagates
 frame-aligned changes, identifies unchanged decode preroll, and reserves exact copy and bridge-
@@ -53,8 +57,9 @@ path for those packets plus optional MPEG-1 Layer II audio. It reports copied/re
 uses an explicit exact/contained/cover complete-audio-frame policy; the resulting A/V transport is
 validated by native demux/decode and FFmpeg. Bridge encoding now preserves aspect, display/colour,
 profile/level, and all four quantizer matrices; recomputes closed-GOP timecode from the source
-origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Transitions,
-sample-level audio editing, multi-clip audio, transitions, and production VBV continuity remain
+origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Project persistence,
+graph-to-render compilation, terminal image preview, sample-level audio editing, multi-clip audio,
+transitions, and production VBV continuity remain
 subsequent slices. Existing long-form render commands are development harnesses; the intended
 editor surface is a shared typed command language for script and interactive terminal modes.
 

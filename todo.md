@@ -11,15 +11,17 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 ## Suggested next milestones
 
-1. Add the first typed edit-command model and minimal terminal shell now that the render path can
-   produce a verified edited file.
-2. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
-3. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
+1. Persist the recursive media project, add managed/external media import, and compile the first
+   source-media placement into existing render intent.
+2. Add terminal preview backends and interactive `in`/`out` adjustment modes on the shared command
+   session.
+3. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
+4. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
    third-party plugins.
-4. Add bounded streaming, indexing, seeking, and decode queues to playback and the viewer.
-5. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
+5. Add bounded streaming, indexing, seeking, and decode queues to playback and the viewer.
+6. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
    the reusable codec layer.
-6. Start H.264 only after the edit/render interfaces have been exercised by the existing codecs.
+7. Start H.264 only after the edit/render interfaces have been exercised by the existing codecs.
 
 ## Shared core and bitstream
 
@@ -148,7 +150,9 @@ plus complete Layer II frames with an inspectable A/V boundary report.
 ## Editing and minimal-recompression rendering
 
 **Status:** The shared dependency vocabulary and MPEG-2 damage planner exist. `mmrecode-edit` now
-models sources, streams, tracks, clips, exact ranges, effects, transitions, and output intent.
+models a recursive linked-media authoring graph plus the flattened sources/tracks/clips render
+intent. Its first typed session navigates placement links and runs identical concise commands from
+scripts or the interactive prompt.
 `mmrecode-render` plans and executes packet-aligned, independent-frame DV and MJPEG
 cut/concatenate paths with payload and side-data preservation plus exact timestamp rewriting. Its
 generic inter-frame planner now maps MPEG-2 reference graphs and changed frame ranges into copy,
@@ -160,6 +164,16 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
 
 - [x] Create `mmrecode-edit` with sources, tracks, clips, ranges, transitions, effects, and output
   intent without codec-specific syntax.
+- [x] Add the recursive media authoring graph: stable reusable media and placement-link IDs, local
+  source/timeline ranges, ordered children, contextual paths, and cycle rejection.
+- [x] Add the first shared typed command/session layer and `mmrecode edit [script]` frontend with
+  `pwd`, `ls`, `info`, `cd`, `add`, `in`, `out`, undo, and redo.
+- [ ] Persist a versioned project snapshot with project-relative managed media and explicit external
+  links, fingerprints, relinking, and collect/portable-copy behavior.
+- [ ] Compile recursive source-media placements into the existing flattened `EditSequence` render
+  intent.
+- [ ] Add capability-selected terminal preview plus interactive adjustment keymaps that emit the
+  same canonical typed trim commands.
 - [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
 - [x] Implement the first independent-frame cut/concatenate path with DV.

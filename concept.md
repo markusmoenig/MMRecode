@@ -249,49 +249,79 @@ does not replace future sample-domain audio editing.
 ## Terminal-first editor
 
 The first serious MMRecode editor should be a terminal-first, command-driven media editor with an
-integrated visual and audio preview. It is not merely a collection of transcoding commands. It is
-an interactive editing environment in which a sequence is a navigable hierarchy of media objects.
+integrated visual and audio preview. It is not merely a collection of transcoding commands. The
+project is the root media timeline, and linked media recursively establish further local timelines.
+The hierarchy is therefore the media composition itself, not a filesystem of bins, conventional
+video/audio tracks, or artificial folders such as `Main`, `Background`, or `Titles`.
 The same concise commands must also run from a project/script file. Long FFmpeg-style option lists
 may exist for diagnostics and automated integration tests, but they are not the primary authoring
 interface.
 
-The interaction model resembles a small shell:
+Every media kind participates in the same recursive abstraction: source video, audio, still images,
+text, shapes, generators, masks, effects, and compound compositions. A media link places a child
+inside its parent's local time and carries instance-specific source range, timeline range,
+transform, and overrides. The underlying media has stable identity and may be linked more than
+once. A navigable path identifies one placement context rather than claiming filesystem ownership.
+
+The interaction model resembles a small shell over this linked media graph:
 
 ```text
-mmrecode edit interview.mov
+mmrecode edit
 
 pwd
-/sequence/main
+/
 
-ls tracks
-cd tracks/video-1/clips/0
+ls
+Clip0     |---------- video ----------|
+Music     |~~~~~~~~~~~~ audio ~~~~~~~~~~~~~|
+EndTitle  |                            [text]|
+
+cd Clip0
+pwd
+/Clip0
+
+ls
+Title       |      [text]       |
+ColorGrade  |===================|
+Mask        |       [mask]      |
+
 info
-trim in +12f
-split 00:00:18:04
+in +12f
 play around cursor
 ```
 
-Tracks, clips, transitions, effects, groups, and graphical elements are addressable objects. A
-user can move recursively into an object, inspect it, modify it, and return to a higher context:
+`cd` follows media-placement links. `ls` visualizes the child media in the current media's local
+timeline rather than listing folders. The prompt is a breadcrumb through link aliases, for example
+`Film > Clip0 > Title`. Commands without an explicit target operate in this current local time and
+composition context. Fully qualified paths make scripts deterministic.
+
+A user can move recursively into any media object, inspect it, modify it, and return to its parent:
 
 ```text
-cd clips/0
-mkdir fx/lower-third
-cd fx/lower-third
-
-rect add name=background left=5% bottom=6% width=40% height=12% \
+cd Clip0
+text add "Hallo" as Title at 12:12 for 4s
+cd Title
+rect add as Background left=5% bottom=6% width=40% height=12% \
     fill=#101018e8 radius=12
-text add "Hallo" name=title parent=background align=right \
-    valign=center padding=24
-active 00:00:12:12 for 4s
 fade in 8f
 ```
 
-Familiar structural commands such as `ls`, `cd`, `pwd`, `tree`, `info`, `set`, `add`, `rm`, `mv`,
-and `cp` should be complemented by media commands such as `play`, `seek`, `trim`, `split`, `ripple`,
-`keyframe`, `render`, and `explain`. Mutating commands participate in undoable transactions so a
-multi-command edit can be committed or reverted as one operation. Human-friendly indices may be
-accepted interactively, while command history and saved projects retain stable object identifiers.
+There is no separate track object required by the authoring abstraction: ordered child links are
+the local timeline and composition order. Render compilation may derive typed audio/video/scene
+lanes internally without imposing them on the user. Source-media registration and relinking can
+still have a separate browser mode, but it is not the primary editing hierarchy.
+
+Familiar navigation commands such as `ls`, `cd`, `pwd`, `tree`, and `info` should be complemented by
+media commands such as `add`, `in`, `out`, `play`, `seek`, `split`, `ripple`, `keyframe`, `render`,
+and `explain`. Mutating commands participate in undoable transactions so a multi-command edit can
+be committed or reverted as one operation. Human-friendly aliases may be accepted interactively,
+while command history and saved projects retain stable media and link identifiers.
+
+Each navigation step establishes local presentation time. Child timing is relative to its parent;
+by default children follow the parent's presentation time when that placement moves. Source-time
+mapping remains explicit so trims cannot silently change whether an attachment follows presentation
+or original source time. Composition cycles are invalid even though reusable media may have several
+acyclic placements.
 
 Time notation must be explicit and frame-accurate. Depending on context, the editor may accept
 timecode (`00:00:12:12`), seconds plus frames (`12s+12f`), absolute frames (`312f`), decimal media
@@ -305,7 +335,7 @@ versionable edit-command model which operates on the same edit sequence used by 
 
 ```text
 terminal command ─┐
-natural language ─┼──> typed edit commands ──> edit sequence ──> render planner
+natural language ─┼──> typed edit commands ──> linked media graph ──> render intent/planner
 graphical timeline┘
 ```
 
@@ -315,6 +345,13 @@ directly rather than constructing shell strings. Natural-language requests shoul
 to inspectable commands and present ambiguous or destructive interpretations before applying them.
 A session can therefore be replayed, diffed, automated, tested, or shared without depending on the
 frontend that created it.
+
+The first implemented command slice establishes this boundary in `mmrecode-edit`. `MediaProject`
+stores stable media definitions and timed placement links; `MediaPath` traverses placement context;
+and `EditorSession` applies typed navigation, add, trim, undo, and redo commands. Both
+`mmrecode edit` and `mmrecode edit <script>` call the same parser/session implementation. Project
+persistence, source import, graph-to-render compilation, and terminal preview remain explicit next
+slices rather than hidden behavior in this prototype.
 
 ### Preview and render transparency
 

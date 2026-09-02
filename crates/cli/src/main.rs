@@ -36,6 +36,7 @@ fn run() -> Result<(), String> {
         Some("mux-mpegts") => mux_mpegts_command(&mut arguments),
         Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
         Some("extract-mpegts-audio") => extract_mpegts_audio_command(&mut arguments),
+        Some("edit") => editor_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
         Some("render-plan") => render_plan_command(&mut arguments),
         Some("render") => render_command(&mut arguments),
@@ -109,6 +110,123 @@ fn run() -> Result<(), String> {
         Some(other) => Err(format!(
             "command '{other}' is not implemented; run 'mmrecode help' for available commands"
         )),
+    }
+}
+
+fn editor_command(arguments: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
+    let script = arguments.next();
+    if arguments.next().is_some() {
+        return Err("usage: mmrecode edit [command-script]".into());
+    }
+    let project_name = script
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_stem)
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Untitled");
+    let time_base = mmrecode_core::Rational::new(1, 25).map_err(|error| error.to_string())?;
+    let project = mmrecode_edit::MediaProject::new(project_name, time_base)
+        .map_err(|error| error.to_string())?;
+    let mut session = mmrecode_edit::EditorSession::new(project);
+    if let Some(script) = script {
+        run_editor_script(std::path::Path::new(&script), &mut session)
+    } else {
+        run_editor_interactive(&mut session)
+    }
+}
+
+fn run_editor_script(
+    path: &std::path::Path,
+    session: &mut mmrecode_edit::EditorSession,
+) -> Result<(), String> {
+    use std::io::BufRead as _;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open editor script '{}': {error}", path.display()))?;
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!(
+                "cannot read editor script '{}' line {}: {error}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if execute_editor_line(session, &line)
+            .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))?
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_editor_interactive(session: &mut mmrecode_edit::EditorSession) -> Result<(), String> {
+    use std::io::{BufRead as _, Write as _};
+
+    println!("MMRecode linked-media editor prototype. Type 'help' for commands.");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        let prompt = session.prompt().map_err(|error| error.to_string())?;
+        print!("{prompt} > ");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("cannot flush editor prompt: {error}"))?;
+        let mut line = String::new();
+        if input
+            .read_line(&mut line)
+            .map_err(|error| format!("cannot read editor command: {error}"))?
+            == 0
+        {
+            break;
+        }
+        match execute_editor_line(session, &line) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => eprintln!("mmrecode edit: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn execute_editor_line(
+    session: &mut mmrecode_edit::EditorSession,
+    line: &str,
+) -> Result<bool, String> {
+    let Some(command) = mmrecode_edit::parse_command(line).map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    let output = session.apply(command).map_err(|error| error.to_string())?;
+    if output == mmrecode_edit::CommandOutput::Quit {
+        return Ok(true);
+    }
+    print_editor_output(output);
+    Ok(false)
+}
+
+fn print_editor_output(output: mmrecode_edit::CommandOutput) {
+    match output {
+        mmrecode_edit::CommandOutput::Text(text) => println!("{text}"),
+        mmrecode_edit::CommandOutput::Listing(entries) => {
+            if entries.is_empty() {
+                println!("(empty local timeline)");
+            }
+            for entry in entries {
+                println!(
+                    "{:<16} [{:<10}] |{}f-----{}f|",
+                    entry.alias,
+                    entry.kind.as_str(),
+                    entry.timeline_range.start.value,
+                    entry.timeline_range.end.value
+                );
+            }
+        }
+        mmrecode_edit::CommandOutput::Changed { description, path } => {
+            println!("ok: {description}  [{path}]");
+        }
+        _ => {}
     }
 }
 
@@ -1684,7 +1802,8 @@ fn print_help() {
     println!(
         "MMRecode media-codec tools\n\n\
          Usage: mmrecode <command> [arguments]\n\n\
-         Available commands:\n  inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
+         Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
+         inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
          decode <media-file> <y4m>  Decode JPEG, raw DV, MPEG-2 Video, or MPEG-TS to YUV4MPEG2\n  \
          encode-dv <y4m> <dv>  Encode native-layout Y4M frame(s) as raw DV25\n  \
@@ -1701,7 +1820,7 @@ fn print_help() {
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \
          help                 Show this help\n  version              Show the version\n\n\
-         Planned commands:\n  edit\n  benchmark"
+         Planned commands:\n  benchmark"
     );
 }
 

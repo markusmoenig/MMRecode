@@ -10,6 +10,15 @@ use mmrecode_core::{
     CodecId, Error, MediaType, Rational, Result, StreamDescriptor, StreamId, Timestamp,
 };
 
+mod command;
+mod project;
+
+pub use command::{CommandOutput, EditCommand, EditorSession, FrameValue, parse_command};
+pub use project::{
+    MediaId, MediaKind, MediaLink, MediaLinkId, MediaListing, MediaNode, MediaOrigin, MediaPath,
+    MediaProject,
+};
+
 /// Stable identifier for one media source in an edit sequence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SourceId(pub u32);

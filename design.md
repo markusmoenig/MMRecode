@@ -387,11 +387,19 @@ Encoded payloads, flags, and opaque side data are preserved. The executor return
 packets. Direct delivery remains an optional adapter so the generic planner does not depend on all
 containers.
 
-`mmrecode-edit` is separate and implemented as a codec-independent intent model. It owns sources,
-stream references, tracks, clips, exact source/timeline ranges, effects, transitions, and output
-intent without deciding how encoded data is regenerated. Its initial schema is deliberately
-in-memory and version-agnostic; serialization, speed mapping, automation curves, and nested
-sequences should follow demonstrated render requirements.
+`mmrecode-edit` separates the recursive authoring model from the flattened render intent. The
+authoring project is a linked media graph: the project root and every media node expose an ordered
+local timeline of child placements. A placement link owns its alias, parent-local timeline range,
+child source range, and eventually transform/override data. Paths traverse links and establish a
+local editing context; they are not filesystem ownership. Stable media and link identifiers allow
+one media definition to be placed more than once while keeping instance edits unambiguous. Cycles
+are forbidden in the composition graph.
+
+The existing `EditSequence` remains the renderer-facing, codec-independent intent model. A later
+compiler flattens the recursive graph into sources, typed streams, tracks, clips, exact ranges,
+effects, transitions, and output intent without making codecs or containers understand authoring
+navigation. This also lets terminal commands, scripts, a GUI, and AI operate on the same typed
+authoring commands while preview and final render consume compiled graph state.
 
 The generic inter-frame planner consumes decode-ordered `AccessUnitInfo` graphs for frame-aligned
 ranges from one or more compatible sources. Each encode operation carries the exact source packet
