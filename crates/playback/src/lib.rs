@@ -1,8 +1,12 @@
 //! Reusable media timeline and playback-clock primitives.
 
+mod mpeg2;
+
 use std::time::{Duration, Instant};
 
 use mmrecode_core::{Error, Rational, Result};
+
+pub use mpeg2::{IndexedMpeg2Frame, Mpeg2PlaybackEvent, Mpeg2PlaybackSource, Mpeg2VideoIndex};
 
 /// A fixed-rate video timeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

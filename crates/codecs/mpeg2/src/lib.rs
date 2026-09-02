@@ -13,7 +13,8 @@ mod tables;
 mod transform;
 
 pub use decoder::{
-    DecodedMpeg2Picture, MacroblockCoding, MacroblockInfo, MotionType, decode_stream,
+    DecodedMpeg2Picture, MacroblockCoding, MacroblockInfo, MotionType, Mpeg2PictureDecoder,
+    decode_stream,
 };
 pub use dependency::{
     Mpeg2DependencyAnalyzer, SmartRenderDisposition, SmartRenderPicture, SmartRenderPlan,

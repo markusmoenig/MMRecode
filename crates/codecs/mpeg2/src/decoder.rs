@@ -238,6 +238,72 @@ struct FieldMotion {
     field_select: usize,
 }
 
+/// Picture-at-a-time MPEG-2 reconstruction state.
+///
+/// The decoder retains only the two reference pictures needed by MPEG-2 prediction. Callers can
+/// therefore drive reconstruction from an indexed elementary stream without retaining every
+/// decoded frame. Start a fresh instance at a clean intra-coded random-access picture when
+/// seeking.
+#[derive(Clone, Debug, Default)]
+pub struct Mpeg2PictureDecoder {
+    older_reference: Option<FrameBuffer>,
+    newer_reference: Option<FrameBuffer>,
+}
+
+impl Mpeg2PictureDecoder {
+    /// Reconstructs one parsed picture in elementary-stream decode order.
+    ///
+    /// `decode_order` and `presentation_order` come from dependency analysis. The caller must feed
+    /// pictures in decode order, beginning with an independently decodable I picture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported picture organization, malformed coded data, or missing
+    /// prediction references.
+    pub fn decode_picture(
+        &mut self,
+        data: &[u8],
+        picture: &Picture,
+        decode_order: i64,
+        presentation_order: i64,
+    ) -> Result<DecodedMpeg2Picture> {
+        if picture.sequence.chroma_format != ChromaFormat::Yuv420 {
+            return Err(Error::Unsupported(
+                "MPEG-2 decoder currently supports Main Profile 4:2:0 video".into(),
+            ));
+        }
+        if picture.coding_extension.picture_structure != PictureStructure::Frame {
+            return Err(Error::Unsupported(
+                "MPEG-2 field pictures are not yet reconstructed".into(),
+            ));
+        }
+        let mut buffer = FrameBuffer::new(picture.sequence.width, picture.sequence.height)?;
+        let macroblocks = decode_picture_data(
+            data,
+            picture,
+            &mut buffer,
+            self.older_reference.as_ref(),
+            self.newer_reference.as_ref(),
+        )?;
+        let frame = buffer.to_video_frame(picture, presentation_order)?;
+        let decoded = DecodedMpeg2Picture {
+            frame,
+            picture_type: picture.header.picture_coding_type,
+            decode_order,
+            presentation_order,
+            macroblocks,
+        };
+        if matches!(
+            picture.header.picture_coding_type,
+            PictureType::I | PictureType::P
+        ) {
+            self.older_reference = self.newer_reference.take();
+            self.newer_reference = Some(buffer);
+        }
+        Ok(decoded)
+    }
+}
+
 /// Decodes every picture in a Main Profile 4:2:0 MPEG-2 elementary stream.
 ///
 /// Returned pictures are in presentation order even though reconstruction occurs in coded decode
@@ -255,51 +321,23 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<DecodedMpeg2Picture>> {
 
 fn decode_parsed_stream(stream: &Mpeg2Stream<'_>) -> Result<Vec<DecodedMpeg2Picture>> {
     let dependencies = analyze_dependencies(stream)?;
-    let mut older_reference: Option<FrameBuffer> = None;
-    let mut newer_reference: Option<FrameBuffer> = None;
-    let mut decoded = Vec::with_capacity(stream.pictures().len());
+    let mut decoder = Mpeg2PictureDecoder::default();
+    let mut pictures = Vec::with_capacity(stream.pictures().len());
 
     for (picture, access) in stream.pictures().iter().zip(&dependencies) {
-        if picture.sequence.chroma_format != ChromaFormat::Yuv420 {
-            return Err(Error::Unsupported(
-                "MPEG-2 decoder currently supports Main Profile 4:2:0 video".into(),
-            ));
-        }
-        if picture.coding_extension.picture_structure != PictureStructure::Frame {
-            return Err(Error::Unsupported(
-                "MPEG-2 field pictures are not yet reconstructed".into(),
-            ));
-        }
-        let mut buffer = FrameBuffer::new(picture.sequence.width, picture.sequence.height)?;
-        let macroblocks = decode_picture(
+        pictures.push(decoder.decode_picture(
             stream.data(),
             picture,
-            &mut buffer,
-            older_reference.as_ref(),
-            newer_reference.as_ref(),
-        )?;
-        let frame = buffer.to_video_frame(picture, access.presentation_order)?;
-        decoded.push(DecodedMpeg2Picture {
-            frame,
-            picture_type: picture.header.picture_coding_type,
-            decode_order: access.decode_order,
-            presentation_order: access.presentation_order,
-            macroblocks,
-        });
-        if matches!(
-            picture.header.picture_coding_type,
-            PictureType::I | PictureType::P
-        ) {
-            older_reference = newer_reference;
-            newer_reference = Some(buffer);
-        }
+            access.decode_order,
+            access.presentation_order,
+        )?);
     }
-    decoded.sort_by_key(|picture| picture.presentation_order);
-    Ok(decoded)
+    pictures.sort_by_key(|picture| picture.presentation_order);
+    Ok(pictures)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn decode_picture(
+fn decode_picture_data(
     data: &[u8],
     picture: &Picture,
     destination: &mut FrameBuffer,

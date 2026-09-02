@@ -13,6 +13,7 @@ use mmrecode_mjpeg::JpegImage;
 use mmrecode_mpeg2::{
     MacroblockCoding, MacroblockInfo, MotionType, PictureStructure, PictureType, SequenceParameters,
 };
+use mmrecode_playback::{Mpeg2PlaybackEvent, Mpeg2PlaybackSource};
 
 use crate::audio::{AudioTrack, decode_mpeg_layer2};
 
@@ -43,7 +44,7 @@ pub(crate) struct JpegInspection {
 }
 
 pub(crate) struct FrameRecord {
-    pub(crate) frame: VideoFrame,
+    pub(crate) frame: Option<VideoFrame>,
     pub(crate) jpeg: Option<JpegInspection>,
     pub(crate) dv: Option<DvInspection>,
     pub(crate) mpeg2: Option<Mpeg2Inspection>,
@@ -84,8 +85,8 @@ pub(crate) struct Mpeg2Inspection {
     pub(crate) references: Vec<u64>,
     pub(crate) random_access: RandomAccessKind,
     pub(crate) slice_count: usize,
-    pub(crate) macroblocks: Vec<MacroblockInfo>,
-    pub(crate) macroblock_map: VideoFrame,
+    pub(crate) macroblocks: Option<Vec<MacroblockInfo>>,
+    pub(crate) macroblock_map: Option<VideoFrame>,
     pub(crate) progressive_frame: bool,
     pub(crate) top_field_first: bool,
     pub(crate) repeat_first_field: bool,
@@ -111,7 +112,19 @@ pub(crate) struct Document {
     pub(crate) frame_rate: Rational,
     pub(crate) frame_rate_assumed: bool,
     pub(crate) audio: Option<AudioTrack>,
+    mpeg2_playback: Option<Mpeg2PlaybackState>,
 }
+
+#[derive(Debug)]
+struct Mpeg2PlaybackState {
+    source: Mpeg2PlaybackSource,
+    generation: u64,
+    requested_range: Range<usize>,
+}
+
+const MPEG2_LOOK_AHEAD: usize = 23;
+const MPEG2_REFILL_THRESHOLD: usize = 12;
+const MPEG2_CACHE_FRAMES: usize = 36;
 
 impl Document {
     pub(crate) fn load(path: &Path) -> Result<Self, String> {
@@ -134,6 +147,115 @@ impl Document {
         }
     }
 
+    pub(crate) fn request_frame(&mut self, frame_index: usize) -> Result<(), String> {
+        let Some(playback) = &mut self.mpeg2_playback else {
+            return Ok(());
+        };
+        if frame_index >= self.frames.len() {
+            return Err(format!("frame {frame_index} is outside the document"));
+        }
+        let cached = self.frames[frame_index].frame.is_some();
+        let request_pending = self.frames[playback.requested_range.clone()]
+            .iter()
+            .any(|record| record.frame.is_none());
+        let remaining_prefetch = playback.requested_range.end.saturating_sub(frame_index);
+        let target = if cached {
+            if playback.requested_range.start > frame_index {
+                return Ok(());
+            }
+            if playback.requested_range.contains(&frame_index)
+                && (remaining_prefetch > MPEG2_REFILL_THRESHOLD || request_pending)
+            {
+                return Ok(());
+            }
+            if playback.requested_range.contains(&frame_index) {
+                playback.requested_range.end
+            } else {
+                frame_index.saturating_add(1)
+            }
+        } else if playback.requested_range.contains(&frame_index) {
+            return Ok(());
+        } else {
+            frame_index
+        };
+        if target >= self.frames.len() {
+            return Ok(());
+        }
+        let generation = playback.source.request(target, MPEG2_LOOK_AHEAD)?;
+        playback.generation = generation;
+        playback.requested_range = target
+            ..target
+                .saturating_add(MPEG2_LOOK_AHEAD)
+                .saturating_add(1)
+                .min(self.frames.len());
+        Ok(())
+    }
+
+    pub(crate) fn poll_decoded_frames(&mut self, current_frame: usize) -> Result<bool, String> {
+        let Some(playback) = &mut self.mpeg2_playback else {
+            return Ok(false);
+        };
+        let mut current_changed = false;
+        while let Some(event) = playback.source.try_event()? {
+            match event {
+                Mpeg2PlaybackEvent::Frame {
+                    generation,
+                    frame_index,
+                    picture,
+                } if generation == playback.generation => {
+                    let picture = *picture;
+                    let Some(record) = self.frames.get_mut(frame_index) else {
+                        continue;
+                    };
+                    let Some(inspection) = record.mpeg2.as_mut() else {
+                        continue;
+                    };
+                    inspection.macroblock_map = Some(macroblock_map(
+                        inspection.sequence.width,
+                        inspection.sequence.height,
+                        inspection.picture_type,
+                        &picture.macroblocks,
+                    ));
+                    inspection.macroblocks = Some(picture.macroblocks);
+                    record.frame = Some(picture.frame);
+                    current_changed |= frame_index == current_frame;
+                }
+                Mpeg2PlaybackEvent::Error {
+                    generation,
+                    message,
+                } if generation == 0 || generation == playback.generation => {
+                    return Err(message);
+                }
+                Mpeg2PlaybackEvent::Frame { .. } | Mpeg2PlaybackEvent::Error { .. } => {}
+            }
+        }
+        evict_mpeg2_frames(&mut self.frames, current_frame, MPEG2_CACHE_FRAMES);
+        Ok(current_changed)
+    }
+
+    pub(crate) fn frame_is_ready(&self, frame_index: usize) -> bool {
+        self.frames
+            .get(frame_index)
+            .is_some_and(|record| record.frame.is_some())
+    }
+
+    pub(crate) fn buffered_frames(&self, frame_index: usize, limit: usize) -> usize {
+        self.frames
+            .iter()
+            .skip(frame_index)
+            .take(limit)
+            .take_while(|record| record.frame.is_some())
+            .count()
+    }
+
+    pub(crate) fn pending_decode(&self) -> bool {
+        self.mpeg2_playback.as_ref().is_some_and(|playback| {
+            self.frames[playback.requested_range.clone()]
+                .iter()
+                .any(|record| record.frame.is_none())
+        })
+    }
+
     fn load_mjpeg(path: &Path, bytes: &[u8]) -> Result<Self, String> {
         let byte_length = bytes.len();
         let mut remaining = bytes;
@@ -154,7 +276,7 @@ impl Document {
                 .checked_add(consumed)
                 .ok_or_else(|| "JPEG source offset overflow".to_owned())?;
             frames.push(FrameRecord {
-                frame,
+                frame: Some(frame),
                 jpeg: Some(JpegInspection {
                     source_range: file_offset..end,
                     image,
@@ -177,6 +299,7 @@ impl Document {
             frame_rate: Rational::new(25, 1).expect("constant frame rate is valid"),
             frame_rate_assumed: true,
             audio: None,
+            mpeg2_playback: None,
         })
     }
 
@@ -218,7 +341,7 @@ impl Document {
             )
             .map_err(|error| format!("frame {} video: {error}", index + 1))?;
             frames.push(FrameRecord {
-                frame: decoded.frame,
+                frame: Some(decoded.frame),
                 jpeg: None,
                 dv: Some(DvInspection {
                     source_range: index * profile.frame_size..(index + 1) * profile.frame_size,
@@ -247,6 +370,7 @@ impl Document {
             frame_rate: profile.frame_rate(),
             frame_rate_assumed: false,
             audio,
+            mpeg2_playback: None,
         })
     }
 
@@ -259,7 +383,7 @@ impl Document {
             .map_err(|error| format!("frame {}: {error}", frames.len() + 1))?
         {
             frames.push(FrameRecord {
-                frame,
+                frame: Some(frame),
                 jpeg: None,
                 dv: None,
                 mpeg2: None,
@@ -279,69 +403,39 @@ impl Document {
                 .unwrap_or_else(|| Rational::new(25, 1).expect("constant frame rate is valid")),
             frame_rate_assumed: declared_frame_rate.is_none(),
             audio: None,
+            mpeg2_playback: None,
         })
     }
 
     fn load_mpeg2(path: &Path, bytes: &[u8]) -> Result<Self, String> {
-        let stream = mmrecode_mpeg2::parse_stream(bytes).map_err(|error| error.to_string())?;
-        let dependencies =
-            mmrecode_mpeg2::analyze_dependencies(&stream).map_err(|error| error.to_string())?;
-        let mut decoded =
-            mmrecode_mpeg2::decode_stream(bytes).map_err(|error| error.to_string())?;
-        decoded.sort_by_key(|picture| picture.decode_order);
-        if decoded.len() != stream.pictures().len() || decoded.len() != dependencies.len() {
-            return Err(
-                "MPEG-2 parser, dependency analyzer, and decoder disagree on picture count".into(),
-            );
-        }
-
-        let mut frames = Vec::with_capacity(decoded.len());
-        for ((picture, access), decoded) in stream.pictures().iter().zip(&dependencies).zip(decoded)
-        {
-            let macroblock_map = macroblock_map(
-                picture.sequence.width,
-                picture.sequence.height,
-                picture.header.picture_coding_type,
-                &decoded.macroblocks,
-            );
+        let playback_source = Mpeg2PlaybackSource::new(bytes.to_vec())?;
+        let mut frames = Vec::with_capacity(playback_source.index().frame_count());
+        for indexed in playback_source.index().frames() {
             frames.push(FrameRecord {
-                frame: decoded.frame,
+                frame: None,
                 jpeg: None,
                 dv: None,
                 mpeg2: Some(Mpeg2Inspection {
-                    source_range: picture.source_range.clone(),
-                    sequence: picture.sequence.clone(),
-                    picture_type: picture.header.picture_coding_type,
-                    picture_structure: picture.coding_extension.picture_structure,
-                    temporal_reference: picture.header.temporal_reference,
-                    decode_order: access.decode_order,
-                    presentation_order: access.presentation_order,
-                    references: access
-                        .references
-                        .iter()
-                        .map(|reference| reference.0)
-                        .collect(),
-                    random_access: access.random_access,
-                    slice_count: picture.slices.len(),
-                    macroblocks: decoded.macroblocks,
-                    macroblock_map,
-                    progressive_frame: picture.coding_extension.progressive_frame,
-                    top_field_first: picture.coding_extension.top_field_first,
-                    repeat_first_field: picture.coding_extension.repeat_first_field,
+                    source_range: indexed.source_range.clone(),
+                    sequence: indexed.sequence.clone(),
+                    picture_type: indexed.picture_type,
+                    picture_structure: indexed.picture_structure,
+                    temporal_reference: indexed.temporal_reference,
+                    decode_order: indexed.decode_order,
+                    presentation_order: indexed.presentation_order,
+                    references: indexed.references.clone(),
+                    random_access: indexed.random_access,
+                    slice_count: indexed.slice_count,
+                    macroblocks: None,
+                    macroblock_map: None,
+                    progressive_frame: indexed.coding_extension.progressive_frame,
+                    top_field_first: indexed.coding_extension.top_field_first,
+                    repeat_first_field: indexed.coding_extension.repeat_first_field,
                 }),
             });
         }
-        frames.sort_by_key(|record| {
-            record
-                .mpeg2
-                .as_ref()
-                .map_or(i64::MAX, |mpeg2| mpeg2.presentation_order)
-        });
-        let frame_rate = frames
-            .first()
-            .and_then(|record| record.mpeg2.as_ref())
-            .map(|mpeg2| mpeg2.sequence.frame_rate)
-            .ok_or_else(|| "MPEG-2 stream contains no displayable pictures".to_owned())?;
+        let frame_rate = playback_source.index().frame_rate();
+        let generation = 0;
         Ok(Self {
             path: path.to_owned(),
             byte_length: bytes.len(),
@@ -351,6 +445,11 @@ impl Document {
             frame_rate,
             frame_rate_assumed: false,
             audio: None,
+            mpeg2_playback: Some(Mpeg2PlaybackState {
+                source: playback_source,
+                generation,
+                requested_range: 0..0,
+            }),
         })
     }
 
@@ -414,6 +513,30 @@ impl Document {
         document.transport = Some(inspection);
         document.audio = playback_audio;
         Ok(document)
+    }
+}
+
+fn evict_mpeg2_frames(frames: &mut [FrameRecord], focus: usize, capacity: usize) {
+    let mut decoded = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.mpeg2.is_some() && record.frame.is_some())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    decoded.sort_by_key(|&index| {
+        if index >= focus {
+            (0_u8, index - focus)
+        } else {
+            (1_u8, focus - index)
+        }
+    });
+    for index in decoded.into_iter().skip(capacity) {
+        let record = &mut frames[index];
+        record.frame = None;
+        if let Some(inspection) = &mut record.mpeg2 {
+            inspection.macroblocks = None;
+            inspection.macroblock_map = None;
+        }
     }
 }
 
@@ -558,7 +681,21 @@ fn dif_map(parsed: &mmrecode_dv::DvFrame<'_>) -> VideoFrame {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    fn wait_for_frame(document: &mut Document, frame_index: usize) {
+        document.request_frame(frame_index).expect("request frame");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !document.frame_is_ready(frame_index) {
+            document
+                .poll_decoded_frames(frame_index)
+                .expect("decode frames");
+            assert!(Instant::now() < deadline, "timed out decoding frame");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn loads_concatenated_mjpeg_frames() {
@@ -585,7 +722,10 @@ mod tests {
         let data = include_bytes!("../../../../testdata/dv/valid/dv25-525-60-one-frame.dv");
         let document = Document::load_dv(Path::new("frame.dv"), data).expect("valid DV map");
         assert_eq!(document.kind, MediaKind::RawDv);
-        assert_eq!(document.frames[0].frame.width, DvProfile::DV25_525_60.width);
+        assert_eq!(
+            document.frames[0].frame.as_ref().unwrap().width,
+            DvProfile::DV25_525_60.width
+        );
         let inspection = document.frames[0].dv.as_ref().expect("DV inspection");
         assert_eq!(inspection.dif_map.width, 150);
         assert_eq!(inspection.dif_map.height, 10);
@@ -602,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn loads_mpeg2_in_presentation_order_with_macroblock_maps() {
+    fn indexes_mpeg2_then_decodes_requested_macroblock_maps() {
         let bytes = include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
-        let document =
+        let mut document =
             Document::load_mpeg2(Path::new("progressive.m2v"), bytes).expect("valid MPEG-2");
         assert_eq!(document.kind, MediaKind::Mpeg2Elementary);
         assert_eq!(document.frames.len(), 12);
@@ -614,11 +754,27 @@ mod tests {
             .map(|frame| frame.mpeg2.as_ref().unwrap().presentation_order)
             .collect();
         assert_eq!(presentation, (0..12).collect::<Vec<_>>());
+        assert!(document.frames.iter().all(|frame| frame.frame.is_none()));
+        wait_for_frame(&mut document, 0);
         let first = document.frames[0].mpeg2.as_ref().unwrap();
         assert_eq!(first.picture_type, PictureType::I);
-        assert_eq!(first.macroblock_map.width, 96);
-        assert_eq!(first.macroblock_map.height, 64);
-        assert!(!first.macroblocks.is_empty());
+        assert_eq!(first.macroblock_map.as_ref().unwrap().width, 96);
+        assert_eq!(first.macroblock_map.as_ref().unwrap().height, 64);
+        assert!(!first.macroblocks.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_prefetch_frames_do_not_supersede_the_active_request() {
+        let bytes = include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
+        let mut document =
+            Document::load_mpeg2(Path::new("progressive.m2v"), bytes).expect("valid MPEG-2");
+        document.request_frame(0).expect("initial request");
+        let generation = document.mpeg2_playback.as_ref().unwrap().generation;
+        document.request_frame(1).expect("covered frame request");
+        assert_eq!(
+            document.mpeg2_playback.as_ref().unwrap().generation,
+            generation
+        );
     }
 
     #[test]
@@ -646,4 +802,53 @@ mod tests {
         assert_eq!(playback_audio.samples.len(), 45_118);
         assert_eq!(playback_audio.duration().as_micros(), 469_979);
     }
+
+    #[test]
+    fn sustained_playback_keeps_future_frames_across_refills() {
+        let gop = include_bytes!("../../../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
+        let bytes = gop.repeat(10);
+        let mut document =
+            Document::load_mpeg2(Path::new("long.m2v"), &bytes).expect("load long MPEG-2 sample");
+        document.request_frame(0).expect("initial request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut current = 0_usize;
+        while current < 120 {
+            document.poll_decoded_frames(current).expect("poll decoder");
+            document.request_frame(current).expect("request current");
+            if document.frame_is_ready(current) {
+                current += 1;
+                continue;
+            }
+            let needed = document
+                .frames
+                .len()
+                .saturating_sub(current)
+                .min(PLAYBACK_TEST_PREROLL);
+            while document.buffered_frames(current, needed) < needed {
+                document
+                    .poll_decoded_frames(current)
+                    .expect("poll buffering decoder");
+                document
+                    .request_frame(current)
+                    .expect("extend buffering request");
+                assert!(
+                    Instant::now() < deadline,
+                    "stalled at frame {current}, request {:?}, ready {:?}",
+                    document
+                        .mpeg2_playback
+                        .as_ref()
+                        .map(|playback| playback.requested_range.clone()),
+                    document
+                        .frames
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| record.frame.is_some().then_some(index))
+                        .collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    const PLAYBACK_TEST_PREROLL: usize = 12;
 }

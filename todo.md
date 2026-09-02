@@ -13,12 +13,13 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 1. Persist the recursive media project, add managed/external media import, and compile the first
    source-media placement into existing render intent.
-2. Add terminal preview backends and interactive `in`/`out` adjustment modes on the shared command
-   session.
+2. Integrate the capability-selected terminal preview backend into the shared command session and
+   add interactive `in`/`out` adjustment modes.
 3. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
 4. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
    third-party plugins.
-5. Add bounded streaming, indexing, seeking, and decode queues to playback and the viewer.
+5. Extend the new indexed MPEG-2 preview path with incremental TS demux, streaming audio, buffering,
+   and backpressure.
 6. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
    the reusable codec layer.
 7. Start H.264 only after the edit/render interfaces have been exercised by the existing codecs.
@@ -172,8 +173,12 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
   links, fingerprints, relinking, and collect/portable-copy behavior.
 - [ ] Compile recursive source-media placements into the existing flattened `EditSequence` render
   intent.
-- [ ] Add capability-selected terminal preview plus interactive adjustment keymaps that emit the
-  same canonical typed trim commands.
+- [x] Prove capability-selected Kitty, Sixel, iTerm2, and 24-bit half-block terminal preview with
+  real asynchronous MPEG-2 ES/TS playback, stepping, seeking, looping, and bounded buffering.
+- [x] Add a double-buffered direct Kitty playback path for flicker-free local terminal
+  video in Kitty-compatible terminals such as Ghostty.
+- [ ] Embed terminal preview in `mmrecode edit` and add interactive adjustment keymaps that emit
+  the same canonical typed trim commands.
 - [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
 - [x] Implement the first independent-frame cut/concatenate path with DV.
@@ -225,24 +230,30 @@ optional backend. Plugins exchange versioned semantic values rather than interna
 ## Playback engine
 
 **Status:** Exact fixed-rate timelines, play/pause/stop/seek/step/loop behavior, and wall/external
-audio clocks exist. Codec-vector playback is functional; long media is still predecoded by the
-viewer.
+audio clocks exist. MPEG-2 now has a lightweight presentation/dependency index, picture-at-a-time
+worker decoding from clean random-access points, seek generations, and a bounded viewer frame
+cache. Other codecs and audio still use eager paths.
 
 - [ ] Add timestamp-indexed variable-frame-rate timelines.
-- [ ] Add bounded packet, decode, audio, and presentation queues with backpressure.
-- [ ] Add keyframe-aware seeking, decoder preroll, and discontinuity flushing.
+- [x] Add indexed, bounded, asynchronous MPEG-2 picture decode and presentation caching.
+- [x] Add clean-random-access MPEG-2 seeking with decoder preroll and stale-request cancellation.
+- [x] Add MPEG-2 file preroll plus clock-safe automatic pause/resume on decode underflow.
+- [ ] Add bounded container-packet and audio queues with explicit backpressure.
+- [ ] Add discontinuity flushing and recovery behavior for damaged/live inputs.
 - [ ] Add reusable audio resampling, channel conversion, device-format negotiation, and clock
   latency/drift compensation.
-- [ ] Define buffering and underflow behavior for files and live inputs.
+- [ ] Generalize buffering and underflow policy from MPEG-2 files to other codecs and live inputs.
 - [ ] Add playback-rate support only after clock and resampling behavior is stable.
 
 ## Native viewer
 
 **Status:** JPEG/MJPEG, DV, MPEG-2 ES, MPEG-TS, and Y4M inspection/playback work, including
 synchronized TS/DV audio, plane and pixel inspection, JPEG markers, DV DIF maps, and MPEG-2
-macroblock/dependency information.
+macroblock/dependency information. MPEG-2 video uses background, on-demand decode and a 36-frame
+cache; other media and audio remain eager.
 
-- [ ] Move long-file operation from complete predecode to the playback engine's bounded queues.
+- [x] Move MPEG-2 video from complete predecode to indexed playback requests and a bounded cache.
+- [ ] Move TS demux, MP2 audio, DV, MJPEG, and Y4M long-file paths to incremental bounded queues.
 - [ ] Add timeline navigation by timestamp, keyframe, GOP, PES, error, and marker.
 - [ ] Add slice-boundary and motion-vector overlays.
 - [ ] Add audio waveform, meters, channel selection, and device selection where useful.

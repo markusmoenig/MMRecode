@@ -350,8 +350,8 @@ The first implemented command slice establishes this boundary in `mmrecode-edit`
 stores stable media definitions and timed placement links; `MediaPath` traverses placement context;
 and `EditorSession` applies typed navigation, add, trim, undo, and redo commands. Both
 `mmrecode edit` and `mmrecode edit <script>` call the same parser/session implementation. Project
-persistence, source import, graph-to-render compilation, and terminal preview remain explicit next
-slices rather than hidden behavior in this prototype.
+persistence, source import, graph-to-render compilation, and preview integration with the editor
+session remain explicit next slices rather than hidden behavior in this prototype.
 
 ### Preview and render transparency
 
@@ -360,6 +360,16 @@ available, native terminal image protocols can deliver full-color frames efficie
 preview window and simpler textual fallbacks keep the editor useful across terminals. Preview is a
 consumer of the same media graph, effects, clock, and color rules as final rendering, although it
 may deliberately select lower-resolution or proxy processing for responsiveness.
+
+The first preview proof is implemented independently as `mmrecode preview <media-file>`. It renders
+real MPEG-2 ES/TS frames using a capability-selected Kitty, Sixel, or iTerm2 image protocol and a
+24-bit Unicode half-block fallback. Direct Kitty playback switches between completely uploaded
+image slots instead of blanking the visible placement between frames. Decoding and fallback
+terminal image encoding are asynchronous and use a bounded look-ahead cache, so input
+stays responsive during playback and seeking. This deliberately tests whether a terminal can be a
+credible visual editor surface before command grammar grows. The next integration should place this
+same preview backend beside `mmrecode edit`; it should not create a second playback or rendering
+model.
 
 Codec-aware behavior should be visible during editing. Commands such as `explain` should report
 which areas will be copied, timestamp-rewritten, bridge-encoded, or fully rendered and why. This
@@ -459,8 +469,10 @@ The native `mmrecode-viewer` application provides direct visual inspection of de
 component planes, pixel samples, block boundaries, and JPEG structure. It remains above the codec
 and container libraries in the dependency graph so UI choices cannot shape normative media APIs.
 It now also provides fixed-rate animation and synchronized audio playback. A reusable playback
-crate maps exact rational frame rates to media time and accepts the rendered audio position as the
-master clock; device handling and temporary third-party MP2 sample decoding remain viewer-local.
+crate maps exact rational frame rates to media time, accepts the rendered audio position as the
+master clock, and provides indexed, background MPEG-2 picture reconstruction for both viewer and
+future editor preview. MPEG-2 pixels are decoded on demand into a bounded cache rather than all at
+open; device handling and temporary third-party MP2 sample decoding remain viewer-local.
 
 ### Subsequent vertical slices
 

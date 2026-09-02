@@ -1,5 +1,7 @@
 //! `MMRecode` command-line entry point.
 
+mod terminal_preview;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("mmrecode: {error}");
@@ -36,6 +38,7 @@ fn run() -> Result<(), String> {
         Some("mux-mpegts") => mux_mpegts_command(&mut arguments),
         Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
         Some("extract-mpegts-audio") => extract_mpegts_audio_command(&mut arguments),
+        Some("preview") => terminal_preview_command(&mut arguments),
         Some("edit") => editor_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
         Some("render-plan") => render_plan_command(&mut arguments),
@@ -111,6 +114,18 @@ fn run() -> Result<(), String> {
             "command '{other}' is not implemented; run 'mmrecode help' for available commands"
         )),
     }
+}
+
+fn terminal_preview_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let path = arguments
+        .next()
+        .ok_or_else(|| "usage: mmrecode preview <media-file>".to_owned())?;
+    if arguments.next().is_some() {
+        return Err("usage: mmrecode preview <media-file>".into());
+    }
+    terminal_preview::run(std::path::Path::new(&path))
 }
 
 fn editor_command(arguments: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
@@ -1803,6 +1818,7 @@ fn print_help() {
         "MMRecode media-codec tools\n\n\
          Usage: mmrecode <command> [arguments]\n\n\
          Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
+         preview <media-file>  Preview MPEG-2 Video or MPEG-TS inside this terminal\n  \
          inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
          decode <media-file> <y4m>  Decode JPEG, raw DV, MPEG-2 Video, or MPEG-TS to YUV4MPEG2\n  \

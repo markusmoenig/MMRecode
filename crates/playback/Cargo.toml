@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 mmrecode-core.workspace = true
+mmrecode-mpeg2.workspace = true
 
 [lints]
 workspace = true

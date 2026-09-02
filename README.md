@@ -22,7 +22,7 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-edit`: recursive linked-media authoring, typed editor commands, and flattened render intent
 - `mmrecode-render`: explicit render planning, minimal-recompression execution, and optional
   MPEG-TS delivery
-- `mmrecode-playback`: exact fixed-rate timelines and audio-clock synchronization
+- `mmrecode-playback`: exact timelines, audio-clock synchronization, and indexed MPEG-2 preview
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
 - `mmrecode-capi`: experimental C ABI with an owned-buffer boundary
@@ -58,8 +58,8 @@ uses an explicit exact/contained/cover complete-audio-frame policy; the resultin
 validated by native demux/decode and FFmpeg. Bridge encoding now preserves aspect, display/colour,
 profile/level, and all four quantizer matrices; recomputes closed-GOP timecode from the source
 origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Project persistence,
-graph-to-render compilation, terminal image preview, sample-level audio editing, multi-clip audio,
-transitions, and production VBV continuity remain
+graph-to-render compilation, editor-session preview integration, sample-level audio editing,
+multi-clip audio, transitions, and production VBV continuity remain
 subsequent slices. Existing long-form render commands are development harnesses; the intended
 editor surface is a shared typed command language for script and interactive terminal modes.
 
@@ -148,6 +148,25 @@ The C ABI has explicit version and structure-size checks, library-owned output b
 free functions, thread-local diagnostics, and panic containment. It is usable for integration
 experiments but is not yet a compatibility promise.
 
+## Terminal preview prototype
+
+The CLI now has a real terminal-graphics proof for MPEG-2 Video elementary streams and MPEG-TS:
+
+```sh
+cargo run --release -p mmrecode-cli -- preview projects/output.ts
+```
+
+It queries the active terminal and selects Kitty graphics, Sixel, iTerm2 images, or a portable
+24-bit Unicode half-block renderer. Kitty-compatible terminals include Kitty and Ghostty; the
+native Kitty path uses local RGB transfer and two client-switched image slots so playback does not
+erase the previous image while preparing the next one. The fallback still provides a recognizable
+full-colour moving preview in ordinary true-colour terminals. Space
+plays or pauses, Left/Right step, Home/End seek, `l` toggles looping, and `q` quits. MPEG-2 decoding
+and fallback terminal image resize/encoding run on separate workers, with bounded decoded-frame
+caching and buffering. The current prototype is video-only and intentionally accepts one path
+rather than exposing editor state as command-line arguments. Its backend is the experiment that
+will next be embedded into `mmrecode edit` beside the command prompt.
+
 ## Visual inspection
 
 Launch the native viewer with MPEG-TS, MPEG-2 Video, raw DV, JPEG/MJPEG, or Y4M:
@@ -184,7 +203,12 @@ skipped, B-picture, and field-predicted regions.
 For MPEG-TS, the same decoded picture and macroblock views are augmented with transport-packet,
 PAT/PMT, program, PID, stream-type, PES, PCR, and MPEG Layer II audio summaries. First video and
 audio PTS values establish the playback alignment. The viewer currently predecodes complete media,
-which is appropriate for codec vectors; bounded streaming queues are future work for long programs.
+except for MPEG-2 video: MPEG-2 ES/TS opening now builds a lightweight presentation/GOP index,
+decodes requested pictures on a worker from the closest clean random-access point, and retains at
+most 36 decoded pictures and macroblock maps. MPEG Layer II audio and the older DV/MJPEG/Y4M paths
+remain eager; incremental transport demux and audio queues are still future work for long programs.
+Starting playback waits for 12 contiguous preview frames; a file underflow pauses both clocks and
+resumes automatically after replenishing that buffer instead of repeatedly superseding decode work.
 
 The workspace minimum supported Rust version is 1.92. `mmrecode-viewer` pins `eframe` 0.35 because
 the following release raised its MSRV beyond 1.92. Viewer audio output uses Rodio, and temporary

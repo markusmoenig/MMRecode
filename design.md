@@ -490,16 +490,40 @@ a library crate only when the editor or another application actually needs it.
 
 The first reusable presentation boundary is now `mmrecode-playback`. It owns exact fixed-frame-rate
 timeline mapping and play/pause/seek/loop clock state, but it knows nothing about GUI frameworks,
-audio devices, codecs, or containers. The viewer supplies either a monotonic wall clock or rendered
-audio position. Audio is the master clock when present; video selects the corresponding display
-frame and may skip frames rather than allowing A/V drift.
+audio devices, or containers. The viewer supplies either a monotonic wall clock or rendered audio
+position. Audio is the master clock when present; video selects the corresponding display frame
+and may skip frames rather than allowing A/V drift.
+
+The first codec-specific orchestration in this layer is the indexed MPEG-2 playback source. It
+parses presentation/dependency metadata without reconstructing pixels, moves owned elementary bytes
+to a worker, begins each request at the closest preceding clean random-access picture, and emits a
+small requested presentation window. New seek generations supersede stale work between pictures.
+The codec exposes picture-at-a-time reconstruction state that retains only MPEG-2 reference frames;
+the viewer currently retains at most 36 decoded display frames and matching macroblock maps. This
+same source is intended for editor preview rather than being hidden in the GUI application.
+The viewer starts after 12 contiguous frames are ready. If it reaches an unavailable frame it
+freezes the media clock, pauses audio, requests the next non-overlapping window, and resumes from
+the underflow position after preroll. Automatic refills never replace an unfinished covered request;
+only an explicit seek creates a superseding generation.
+
+The first terminal frontend consumes that same playback source through
+`mmrecode preview <media-file>`. Terminal UI and graphics protocol dependencies belong only to the
+CLI crate. Capability probing selects Kitty, Sixel, iTerm2, or 24-bit Unicode half-block output;
+codec, container, playback, edit, and render crates remain terminal-agnostic. MPEG-2 reconstruction
+and fallback terminal-specific resize/encoding use separate workers. Direct Kitty output transfers
+local RGB frames through temporary files and alternates two image slots: it uploads and places the
+next frame before deleting the previous placement. This uses the widely implemented baseline Kitty
+graphics operations rather than optional terminal animation.
+The UI thread owns input, the playback clock, a bounded display cache, and protocol state. This is
+intentionally a reusable frontend boundary for later `mmrecode edit` integration, not another
+editor or render graph.
 
 Device output and temporary MP2-to-PCM decoding remain application-local. `mmrecode-viewer` uses
-Rodio with its pure-Rust Symphonia MP2 backend and predecodes short inspection media. This does not
+Rodio with its pure-Rust Symphonia MP2 backend and predecodes audio for short inspection media. This does not
 turn Symphonia into MMRecode's normative MPEG audio implementation: `mmrecode-mpegaudio` still owns
 validated Layer II framing, and a native sample decoder remains a separate codec milestone. Long
-programs will require bounded packet/frame/audio queues rather than the viewer's current whole-file
-model.
+programs will require incremental transport demux and bounded audio queues; MPEG-2 video no longer
+uses the viewer's former whole-file pixel model.
 
 ## Registration
 

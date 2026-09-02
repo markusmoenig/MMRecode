@@ -30,12 +30,22 @@ pub(crate) struct ViewerApp {
     audio_output: Option<AudioOutput>,
     audio_unavailable: bool,
     volume: f32,
+    buffering: BufferingState,
 }
+
+const PLAYBACK_PREROLL_FRAMES: usize = 12;
 
 enum Status {
     Ready,
     Info(String),
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BufferingState {
+    #[default]
+    Idle,
+    PlayWhenReady,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -71,6 +81,7 @@ impl ViewerApp {
             audio_output: None,
             audio_unavailable: false,
             volume: 0.8,
+            buffering: BufferingState::Idle,
         };
         if let Some(path) = initial_path {
             app.open_path(&context.egui_ctx, &path);
@@ -80,7 +91,7 @@ impl ViewerApp {
 
     fn open_path(&mut self, context: &egui::Context, path: &Path) {
         match Document::load(path) {
-            Ok(document) => {
+            Ok(mut document) => {
                 let frame_count = document.frames.len();
                 let kind = document.kind.label();
                 let timeline = match PlaybackTimeline::new(document.frame_rate, frame_count) {
@@ -93,13 +104,18 @@ impl ViewerApp {
                 self.path_input = document.path.display().to_string();
                 self.audio_output = None;
                 self.audio_unavailable = false;
+                self.buffering = BufferingState::Idle;
                 self.playback = Some(PlaybackController::new(timeline));
-                self.document = Some(document);
                 self.frame_index = 0;
                 self.display_mode = DisplayMode::Composite;
                 self.structure_view = StructureView::Image;
                 self.pixel_description = None;
-                self.status = Status::Info(format!("Loaded {frame_count} {kind} frame(s)"));
+                if let Err(error) = document.request_frame(0) {
+                    self.status = Status::Error(error);
+                    return;
+                }
+                self.document = Some(document);
+                self.status = Status::Info(format!("Indexed {frame_count} {kind} frame(s)"));
                 self.refresh_texture(context);
                 let title = path.file_name().map_or_else(
                     || "MMRecode Viewer".to_owned(),
@@ -114,15 +130,23 @@ impl ViewerApp {
     }
 
     fn refresh_texture(&mut self, context: &egui::Context) {
-        let Some(record) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.frames.get(self.frame_index))
-        else {
+        let Some(document) = self.document.as_mut() else {
             self.texture = None;
             return;
         };
-        let frame = display_frame(record, self.structure_view);
+        if let Err(error) = document.request_frame(self.frame_index) {
+            self.status = Status::Error(error);
+            return;
+        }
+        let Some(record) = document.frames.get(self.frame_index) else {
+            self.texture = None;
+            return;
+        };
+        let Some(frame) = display_frame(record, self.structure_view) else {
+            self.status = Status::Info(format!("Decoding frame {}…", self.frame_index + 1));
+            context.request_repaint_after(Duration::from_millis(10));
+            return;
+        };
         match display::color_image(frame, self.display_mode) {
             Ok(image) => {
                 self.texture_generation += 1;
@@ -134,6 +158,74 @@ impl ViewerApp {
                 self.status = Status::Error(error);
             }
         }
+    }
+
+    fn poll_streaming_decode(&mut self, context: &egui::Context) {
+        let current_frame = self.frame_index;
+        let result = self
+            .document
+            .as_mut()
+            .map(|document| document.poll_decoded_frames(current_frame));
+        match result {
+            Some(Ok(true)) => {
+                if let Some(document) = &self.document {
+                    self.status = Status::Info(format!(
+                        "Decoded frame {} of {}",
+                        self.frame_index + 1,
+                        document.frames.len()
+                    ));
+                }
+                self.refresh_texture(context);
+            }
+            Some(Ok(false)) => {
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| !document.frame_is_ready(self.frame_index))
+                {
+                    context.request_repaint_after(Duration::from_millis(10));
+                }
+            }
+            Some(Err(error)) => self.status = Status::Error(error),
+            None => {}
+        }
+        if self.buffering == BufferingState::PlayWhenReady {
+            if let Some(document) = &mut self.document
+                && let Err(error) = document.request_frame(self.frame_index)
+            {
+                self.status = Status::Error(error);
+                self.buffering = BufferingState::Idle;
+                return;
+            }
+            let (buffered, required) = self.playback_buffer();
+            if buffered >= required {
+                self.buffering = BufferingState::Idle;
+                self.start_playback(context);
+            } else {
+                self.status =
+                    Status::Info(format!("Buffering {buffered}/{required} preview frames…"));
+            }
+        }
+        if self.buffering == BufferingState::PlayWhenReady
+            || self.document.as_ref().is_some_and(Document::pending_decode)
+        {
+            context.request_repaint_after(Duration::from_millis(10));
+        }
+    }
+
+    fn playback_buffer(&self) -> (usize, usize) {
+        let Some(document) = &self.document else {
+            return (0, 0);
+        };
+        let required = document
+            .frames
+            .len()
+            .saturating_sub(self.frame_index)
+            .min(PLAYBACK_PREROLL_FRAMES);
+        (
+            document.buffered_frames(self.frame_index, required),
+            required,
+        )
     }
 
     fn move_frame(&mut self, delta: isize, context: &egui::Context) {
@@ -168,6 +260,7 @@ impl ViewerApp {
     }
 
     fn pause_playback(&mut self) {
+        self.buffering = BufferingState::Idle;
         if let Some(playback) = &mut self.playback {
             playback.pause(Instant::now());
         }
@@ -181,7 +274,7 @@ impl ViewerApp {
             .playback
             .as_ref()
             .is_some_and(PlaybackController::is_playing);
-        if playing {
+        if playing || self.buffering == BufferingState::PlayWhenReady {
             self.pause_playback();
             return;
         }
@@ -192,6 +285,23 @@ impl ViewerApp {
         if !has_animation {
             return;
         }
+        let (buffered, required) = self.playback_buffer();
+        if buffered < required {
+            if let Some(document) = &mut self.document
+                && let Err(error) = document.request_frame(self.frame_index)
+            {
+                self.status = Status::Error(error);
+                return;
+            }
+            self.buffering = BufferingState::PlayWhenReady;
+            self.status = Status::Info(format!("Buffering {buffered}/{required} preview frames…"));
+            context.request_repaint_after(Duration::from_millis(10));
+            return;
+        }
+        self.start_playback(context);
+    }
+
+    fn start_playback(&mut self, context: &egui::Context) {
         if self.audio_output.is_none() && !self.audio_unavailable {
             let track = self
                 .document
@@ -236,24 +346,33 @@ impl ViewerApp {
     }
 
     fn tick_playback(&mut self, context: &egui::Context) {
-        let Some(playback) = &mut self.playback else {
-            return;
-        };
-        if !playback.is_playing() {
-            return;
-        }
         let now = Instant::now();
-        let event = if let Some(audio) = &self.audio_output {
-            if audio.is_finished() {
-                playback.advance(now)
-            } else {
-                playback.synchronize(audio.position(), now)
+        let Some((event, next_frame)) = self.playback.as_mut().and_then(|playback| {
+            if !playback.is_playing() {
+                return None;
             }
-        } else {
-            playback.advance(now)
+            let event = if let Some(audio) = &self.audio_output {
+                if audio.is_finished() {
+                    playback.advance(now)
+                } else {
+                    playback.synchronize(audio.position(), now)
+                }
+            } else {
+                playback.advance(now)
+            };
+            Some((event, playback.frame_index()))
+        }) else {
+            return;
         };
-        let next_frame = playback.frame_index();
         if next_frame != self.frame_index {
+            let ready = self
+                .document
+                .as_ref()
+                .is_some_and(|document| document.frame_is_ready(next_frame));
+            if !ready {
+                self.buffer_at_frame(next_frame, now, context);
+                return;
+            }
             self.frame_index = next_frame;
             self.pixel_description = None;
             self.refresh_texture(context);
@@ -284,6 +403,30 @@ impl ViewerApp {
         }
     }
 
+    fn buffer_at_frame(&mut self, frame_index: usize, now: Instant, context: &egui::Context) {
+        if let Some(playback) = &mut self.playback {
+            let position = playback.timeline().position_of_frame(frame_index);
+            playback.seek(position, now);
+            playback.pause(now);
+        }
+        if let Some(audio) = &self.audio_output {
+            audio.pause();
+        }
+        self.frame_index = frame_index;
+        self.pixel_description = None;
+        if let Some(document) = &mut self.document
+            && let Err(error) = document.request_frame(frame_index)
+        {
+            self.status = Status::Error(error);
+            return;
+        }
+        self.buffering = BufferingState::PlayWhenReady;
+        let (buffered, required) = self.playback_buffer();
+        self.status = Status::Info(format!("Buffering {buffered}/{required} preview frames…"));
+        self.refresh_texture(context);
+        context.request_repaint_after(Duration::from_millis(10));
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("File");
@@ -311,8 +454,11 @@ impl ViewerApp {
                 .and_then(|document| document.frames.get(self.frame_index));
             let current_frame =
                 current_record.map(|record| display_frame(record, self.structure_view));
-            let plane_count = current_frame.map_or(0, |frame| frame.planes.len());
+            let plane_count = current_frame
+                .flatten()
+                .map_or(0, |frame| frame.planes.len());
             let packed_rgb = current_frame
+                .flatten()
                 .is_some_and(|frame| frame.format == mmrecode_core::PixelFormat::Rgb24);
             let has_dv = current_record.is_some_and(|record| record.dv.is_some());
             let has_mpeg2 = current_record.is_some_and(|record| record.mpeg2.is_some());
@@ -507,19 +653,23 @@ impl ViewerApp {
         ui.heading("Inspector");
         ui.monospace(document.path.display().to_string());
         ui.separator();
-        show_document_info(ui, document, record);
+        if let Some(frame) = &record.frame {
+            show_document_info(ui, document, frame);
 
-        ui.separator();
-        ui.label(RichText::new("Planes").strong());
-        for (index, plane) in record.frame.planes.iter().enumerate() {
-            let name = ["Y", "Cb", "Cr"].get(index).copied().unwrap_or("?");
-            ui.monospace(format!(
-                "{name}: {}×{}, stride {}, {} bytes",
-                plane.width,
-                plane.height,
-                plane.stride,
-                plane.data.len()
-            ));
+            ui.separator();
+            ui.label(RichText::new("Planes").strong());
+            for (index, plane) in frame.planes.iter().enumerate() {
+                let name = ["Y", "Cb", "Cr"].get(index).copied().unwrap_or("?");
+                ui.monospace(format!(
+                    "{name}: {}×{}, stride {}, {} bytes",
+                    plane.width,
+                    plane.height,
+                    plane.stride,
+                    plane.data.len()
+                ));
+            }
+        } else {
+            ui.label("Frame pixels are being decoded on demand…");
         }
 
         ui.separator();
@@ -551,7 +701,12 @@ impl ViewerApp {
             return;
         };
         let record = &document.frames[self.frame_index];
-        let frame = display_frame(record, self.structure_view);
+        let Some(frame) = display_frame(record, self.structure_view) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Decoding preview frame…").size(20.0));
+            });
+            return;
+        };
         let Some((width, height)) = display::dimensions(frame, self.display_mode) else {
             return;
         };
@@ -629,11 +784,11 @@ impl ViewerApp {
 fn display_frame(
     record: &crate::document::FrameRecord,
     structure_view: StructureView,
-) -> &mmrecode_core::VideoFrame {
+) -> Option<&mmrecode_core::VideoFrame> {
     match (structure_view, &record.dv, &record.mpeg2) {
-        (StructureView::DifMap, Some(dv), _) => &dv.dif_map,
-        (StructureView::MacroblockMap, _, Some(mpeg2)) => &mpeg2.macroblock_map,
-        _ => &record.frame,
+        (StructureView::DifMap, Some(dv), _) => Some(&dv.dif_map),
+        (StructureView::MacroblockMap, _, Some(mpeg2)) => mpeg2.macroblock_map.as_ref(),
+        _ => record.frame.as_ref(),
     }
 }
 
@@ -645,11 +800,7 @@ fn format_time(duration: Duration) -> String {
     format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-fn show_document_info(
-    ui: &mut egui::Ui,
-    document: &Document,
-    record: &crate::document::FrameRecord,
-) {
+fn show_document_info(ui: &mut egui::Ui, document: &Document, frame: &mmrecode_core::VideoFrame) {
     egui::Grid::new("document-info")
         .num_columns(2)
         .striped(true)
@@ -661,46 +812,25 @@ fn show_document_info(
             ui.monospace(document.byte_length.to_string());
             ui.end_row();
             ui.label("Dimensions");
-            ui.monospace(format!("{} × {}", record.frame.width, record.frame.height));
+            ui.monospace(format!("{} × {}", frame.width, frame.height));
             ui.end_row();
             ui.label("Format");
-            ui.monospace(format!("{:?}", record.frame.format));
+            ui.monospace(format!("{:?}", frame.format));
             ui.end_row();
             ui.label("Range");
-            ui.monospace(format!("{:?}", record.frame.color.range));
+            ui.monospace(format!("{:?}", frame.color.range));
             ui.end_row();
             ui.label("Primaries");
-            ui.monospace(
-                record
-                    .frame
-                    .color
-                    .primaries
-                    .as_deref()
-                    .unwrap_or("unspecified"),
-            );
+            ui.monospace(frame.color.primaries.as_deref().unwrap_or("unspecified"));
             ui.end_row();
             ui.label("Transfer");
-            ui.monospace(
-                record
-                    .frame
-                    .color
-                    .transfer
-                    .as_deref()
-                    .unwrap_or("unspecified"),
-            );
+            ui.monospace(frame.color.transfer.as_deref().unwrap_or("unspecified"));
             ui.end_row();
             ui.label("Matrix");
-            ui.monospace(
-                record
-                    .frame
-                    .color
-                    .matrix
-                    .as_deref()
-                    .unwrap_or("unspecified"),
-            );
+            ui.monospace(frame.color.matrix.as_deref().unwrap_or("unspecified"));
             ui.end_row();
             ui.label("Field order");
-            ui.monospace(format!("{:?}", record.frame.field_order));
+            ui.monospace(format!("{:?}", frame.field_order));
             ui.end_row();
             ui.label("Playback rate");
             let assumption = if document.frame_rate_assumed {
@@ -786,30 +916,31 @@ fn show_mpeg2_inspection(ui: &mut egui::Ui, mpeg2: &Mpeg2Inspection) {
         mpeg2.sequence.frame_rate.denominator(),
         mpeg2.sequence.profile_and_level_indication
     ));
+    let macroblock_count = mpeg2.macroblocks.as_ref().map_or(0, Vec::len);
     ui.monospace(format!(
-        "{} slice(s), {} macroblock(s), VBV {} bits",
-        mpeg2.slice_count,
-        mpeg2.macroblocks.len(),
-        mpeg2.sequence.vbv_buffer_size_bits
+        "{} slice(s), {} decoded macroblock(s), VBV {} bits",
+        mpeg2.slice_count, macroblock_count, mpeg2.sequence.vbv_buffer_size_bits
     ));
     ui.monospace(format!(
         "progressive {}, top first {}, repeat first {}",
         mpeg2.progressive_frame, mpeg2.top_field_first, mpeg2.repeat_first_field
     ));
-    let intra = mpeg2
-        .macroblocks
-        .iter()
-        .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Intra)
-        .count();
-    let predicted = mpeg2
-        .macroblocks
-        .iter()
-        .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Predicted)
-        .count();
-    let skipped = mpeg2.macroblocks.len().saturating_sub(intra + predicted);
-    ui.monospace(format!(
-        "macroblocks: {intra} intra, {predicted} predicted, {skipped} skipped"
-    ));
+    if let Some(macroblocks) = &mpeg2.macroblocks {
+        let intra = macroblocks
+            .iter()
+            .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Intra)
+            .count();
+        let predicted = macroblocks
+            .iter()
+            .filter(|macroblock| macroblock.coding == mmrecode_mpeg2::MacroblockCoding::Predicted)
+            .count();
+        let skipped = macroblocks.len().saturating_sub(intra + predicted);
+        ui.monospace(format!(
+            "macroblocks: {intra} intra, {predicted} predicted, {skipped} skipped"
+        ));
+    } else {
+        ui.monospace("macroblocks: decode pending");
+    }
     ui.small(
         "Macroblock map: intra green, P prediction amber, B prediction violet, skipped blue/dark violet, field prediction cyan/magenta.",
     );
@@ -861,6 +992,7 @@ fn show_dv_inspection(ui: &mut egui::Ui, dv: &DvInspection) {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_streaming_decode(ui.ctx());
         self.tick_playback(ui.ctx());
         self.handle_dropped_file(ui.ctx());
         self.handle_keyboard(ui.ctx());
