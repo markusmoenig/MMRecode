@@ -311,20 +311,23 @@ Its CAVLC P-slice path retains one list-0 reference and reconstructs skip, 16x16
 8x8 sub-macroblock partitions down to 4x4. Motion-vector prediction, quarter-sample luma and
 eighth-sample chroma interpolation, explicit weighted prediction, inter residuals, mixed intra
 macroblocks, and inter-picture boundary strengths are native. Baseline and High Profile streams
-using CAVLC, implicit flat scaling, and 4x4 transforms share this path. For unsupported
+using CAVLC and 4x4 transforms share this path. For unsupported
 reconstruction tools, playback constructs only the
 required Annex-B window and sends it to an optional installed FFmpeg fallback. FFmpeg does not
 demux the file, define timestamps, choose seek points, or perform edit planning.
 The CABAC layer supplies its own context-state initialization, binary arithmetic decision, bypass,
-termination, and restart processes. CABAC `I_PCM`, Intra16, and Intra4 IDRs use that path end to
+termination, and restart processes. CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDRs use that path end to
 end, including prediction syntax, coded-block-pattern and neighboring-block context derivation,
 luma/chroma DC and AC coefficients, quantization, inverse transforms, filtering, and exact
 x264/FFmpeg interoperability coverage. CABAC P slices additionally reconstruct skipped, 16x16,
 16x8, 8x16, and 8x8-partitioned inter macroblocks down to 4x4, plus mixed Intra4/Intra16/PCM
 macroblocks, with context-coded motion-vector differences, luma/chroma residuals, QP deltas, and
-inter-picture filtering. The High Profile QP-zero bypass path directly reconstructs lossless
-Intra4 and inter residual samples, including horizontal/vertical chroma residual DPCM. B slices and
-8x8 transform syntax still return `Unsupported` for fallback.
+inter-picture filtering. High Profile CABAC intra and inter macroblocks may use the native 8x8
+luma inverse transform; the deblocker suppresses the internal 4x4 edges inside those transform
+blocks. SPS/PPS scaling lists are resolved using AVC fallback rules and feed native 4x4 and 8x8
+inverse quantization. The High Profile QP-zero bypass path directly reconstructs lossless Intra4
+and inter residual samples, including horizontal/vertical chroma residual DPCM. B slices still
+return `Unsupported` for fallback.
 Complete decoded-reference-picture marking and reference-list modification remain necessary before
 the index is strong enough for arbitrary-boundary H.264 smart rendering. The first render adapter
 already uses the conservative graph for a stricter operation: it accepts only complete contiguous

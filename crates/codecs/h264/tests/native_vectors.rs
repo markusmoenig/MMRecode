@@ -338,6 +338,47 @@ fn native_decoder_reconstructs_cabac_intra4_texture() {
     assert_eq!((frame.width, frame.height), (32, 32));
 }
 
+#[test]
+fn native_decoder_reconstructs_cabac_intra8_texture() {
+    let Some(frame) = decode_x264_frame_with_profile(
+        "testsrc2=size=64x48:rate=1",
+        "cabac-intra8",
+        "cabac=1:qp=20:8x8dct=1:keyint=1",
+        "high",
+    ) else {
+        return;
+    };
+    assert_eq!((frame.width, frame.height), (64, 48));
+}
+
+#[test]
+fn native_decoder_reconstructs_a_cabac_8x8_gop() {
+    let Some(frames) = decode_x264_frames_with_profile(
+        "testsrc2=size=96x64:rate=12",
+        "cabac-8x8-gop",
+        "cabac=1:8x8dct=1:ref=1:subme=7",
+        "high",
+        12,
+    ) else {
+        return;
+    };
+    assert_eq!(frames.len(), 12);
+}
+
+#[test]
+fn native_decoder_reconstructs_a_cabac_jvt_scaling_gop() {
+    let Some(frames) = decode_x264_frames_with_profile(
+        "testsrc2=size=96x64:rate=12",
+        "cabac-jvt-scaling-gop",
+        "cabac=1:8x8dct=1:ref=1:subme=7:cqm=jvt:no-deblock=1",
+        "high",
+        12,
+    ) else {
+        return;
+    };
+    assert_eq!(frames.len(), 12);
+}
+
 fn decode_x264_two_frames(
     filter: &str,
     suffix: &str,

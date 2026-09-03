@@ -42,6 +42,7 @@ pub(crate) struct Picture<'a> {
     pub(crate) chroma_qp_offset_cb: i32,
     pub(crate) chroma_qp_offset_cr: i32,
     pub(crate) macroblock_intra: &'a [bool],
+    pub(crate) transform_8x8: &'a [bool],
     pub(crate) luma_nonzero: &'a [[u8; 16]],
     pub(crate) motion: &'a [[MotionInfo; 16]],
 }
@@ -61,6 +62,7 @@ pub(crate) fn filter_picture(picture: &mut Picture<'_>, params: Parameters) -> R
         .ok_or_else(|| Error::InvalidData("H.264 deblocking macroblock count overflows".into()))?;
     if picture.luma_qp.len() != expected_qps
         || picture.macroblock_intra.len() != expected_qps
+        || picture.transform_8x8.len() != expected_qps
         || picture.luma_nonzero.len() != expected_qps
         || picture.motion.len() != expected_qps
     {
@@ -112,6 +114,9 @@ fn filter_luma_macroblock(
         if edge == 0 && macroblock_x == 0 {
             continue;
         }
+        if picture.transform_8x8[address] && matches!(edge, 1 | 3) {
+            continue;
+        }
         let p_address = if edge == 0 { address - 1 } else { address };
         let qp = average_qp(picture.luma_qp[p_address], picture.luma_qp[address]);
         for segment in 0..4 {
@@ -142,6 +147,9 @@ fn filter_luma_macroblock(
     }
     for edge in 0..4 {
         if edge == 0 && macroblock_y == 0 {
+            continue;
+        }
+        if picture.transform_8x8[address] && matches!(edge, 1 | 3) {
             continue;
         }
         let p_address = if edge == 0 {
@@ -511,5 +519,66 @@ mod tests {
             },
         );
         assert_eq!(plane, original);
+    }
+
+    #[test]
+    fn eight_by_eight_transform_skips_internal_four_sample_edges() {
+        let original = (0..16)
+            .flat_map(|_| (0..16).map(|x| if x < 4 { 100 } else { 110 }))
+            .collect::<Vec<_>>();
+        let luma_qp = [40];
+        let macroblock_intra = [true];
+        let luma_nonzero = [[0; 16]];
+        let motion = [[MotionInfo::default(); 16]];
+        let params = Parameters {
+            offset_a: 0,
+            offset_b: 0,
+        };
+
+        let mut transformed = original.clone();
+        let mut transformed_blue = vec![128; 64];
+        let mut transformed_red = vec![128; 64];
+        filter_picture(
+            &mut Picture {
+                luma: &mut transformed,
+                cb: &mut transformed_blue,
+                cr: &mut transformed_red,
+                coded_width: 16,
+                coded_height: 16,
+                luma_qp: &luma_qp,
+                chroma_qp_offset_cb: 0,
+                chroma_qp_offset_cr: 0,
+                macroblock_intra: &macroblock_intra,
+                transform_8x8: &[true],
+                luma_nonzero: &luma_nonzero,
+                motion: &motion,
+            },
+            params,
+        )
+        .unwrap();
+        assert_eq!(transformed, original);
+
+        let mut four_by_four = original.clone();
+        let mut four_by_four_blue = vec![128; 64];
+        let mut four_by_four_red = vec![128; 64];
+        filter_picture(
+            &mut Picture {
+                luma: &mut four_by_four,
+                cb: &mut four_by_four_blue,
+                cr: &mut four_by_four_red,
+                coded_width: 16,
+                coded_height: 16,
+                luma_qp: &luma_qp,
+                chroma_qp_offset_cb: 0,
+                chroma_qp_offset_cr: 0,
+                macroblock_intra: &macroblock_intra,
+                transform_8x8: &[false],
+                luma_nonzero: &luma_nonzero,
+                motion: &motion,
+            },
+            params,
+        )
+        .unwrap();
+        assert_ne!(four_by_four, original);
     }
 }

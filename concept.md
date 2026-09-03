@@ -354,15 +354,17 @@ coefficient decoding, quantization, inverse transforms, and in-loop deblocking w
 The CAVLC P-slice path retains one list-0 reference and handles skip, 16x16, 16x8, 8x16, and
 sub-macroblock partitions down to 4x4, including fractional-sample motion compensation, inter
 residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture deblocking.
-This includes the High Profile subset that uses CAVLC, implicit flat scaling, and 4x4 transforms.
-The native CABAC arithmetic core and exact CABAC `I_PCM`, Intra16, and Intra4 IDR paths are also
+This includes the High Profile subset that uses CAVLC and 4x4 transforms.
+The native CABAC arithmetic core and exact CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDR paths are also
 present, including prediction syntax and luma/chroma DC and AC coefficient decoding with
 neighboring-block contexts. CABAC P pictures also reconstruct skip, 16x16, 16x8, 8x16, and 8x8
 partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion, residuals, QP changes, and
-filtering. QP-zero transform bypass is native for lossless Intra4 and inter residuals, including
-chroma residual DPCM. Unsupported `Intra_8x8`/8x8 transforms, custom matrices, B slices, multiple-reference tools, and
-multi-slice pictures still use an optional installed
-FFmpeg fallback behind the same request/event boundary. This does not make FFmpeg the demuxer,
+filtering. High Profile CABAC pictures can select 8x8 luma transforms for both intra and inter
+macroblocks, including the transform-aware deblocking edge geometry. SPS/PPS scaling lists are
+parsed with their normative fallback rules and applied to native 4x4 and 8x8 inverse quantization.
+QP-zero transform bypass is native for lossless Intra4 and inter residuals, including chroma
+residual DPCM. Unsupported B slices, multiple-reference tools, and multi-slice pictures still use
+an optional installed FFmpeg fallback behind the same request/event boundary. This does not make FFmpeg the demuxer,
 timing authority, or render planner, and it does not start H.264 encoding.
 
 The first lossless H.264 output operation is intentionally narrower than editor delivery:
@@ -581,7 +583,7 @@ crate maps exact rational frame rates to media time, accepts the rendered audio 
 master clock, and provides indexed, background MPEG-2 and H.264 picture reconstruction for editor
 preview. Pixels are decoded on demand into bounded caches rather than all at open. H.264 attempts
 native reconstruction first and uses an optional FFmpeg pixel-decoder process for tools beyond the
-current native intra slices, after native MP4 demuxing and access-unit selection; device handling
+current native I/P subset, after native MP4 demuxing and access-unit selection; device handling
 and temporary third-party audio decoding remain application-local.
 
 ### Subsequent vertical slices

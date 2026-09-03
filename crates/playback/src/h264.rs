@@ -177,7 +177,7 @@ struct DecodeRequest {
     look_ahead: usize,
 }
 
-/// Indexed H.264 MP4/MOV source decoded in bounded GOP windows by optional `ffmpeg`.
+/// Indexed H.264 MP4/MOV source decoded natively in bounded GOP windows when supported.
 ///
 /// `MMRecode` performs container parsing, timing, NAL conversion, parameter parsing, indexing, and
 /// seek-window selection itself. Its native decoder is attempted first. An optional external

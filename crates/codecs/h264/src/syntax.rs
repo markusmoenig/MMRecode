@@ -52,6 +52,24 @@ pub struct VuiParameters {
     pub fixed_frame_rate: Option<bool>,
 }
 
+/// Fully resolved inverse-quantization scaling matrices for 4:2:0 video.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalingMatrices {
+    /// Intra Y, intra Cb, intra Cr, inter Y, inter Cb, and inter Cr 4x4 lists.
+    pub four_by_four: [[u8; 16]; 6],
+    /// Intra Y and inter Y 8x8 lists.
+    pub eight_by_eight: [[u8; 64]; 2],
+}
+
+impl ScalingMatrices {
+    fn flat() -> Self {
+        Self {
+            four_by_four: [[16; 16]; 6],
+            eight_by_eight: [[16; 64]; 2],
+        }
+    }
+}
+
 /// Parsed H.264 sequence parameter set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -76,6 +94,8 @@ pub struct Sps {
     pub qpprime_y_zero_transform_bypass: bool,
     /// Whether the SPS carries sequence scaling-list syntax.
     pub scaling_matrix_present: bool,
+    /// Sequence-level scaling matrices after applying SPS fallback rules.
+    pub scaling_matrices: ScalingMatrices,
     /// Frame-number field width.
     pub log2_max_frame_num: u8,
     /// Picture-order-count mode.
@@ -126,6 +146,8 @@ pub struct Pps {
     pub pic_init_qp_minus26: i32,
     /// Chroma quantization offset for the Cb component.
     pub chroma_qp_index_offset: i32,
+    /// Chroma quantization offset for the Cr component.
+    pub second_chroma_qp_index_offset: i32,
     /// Whether redundant picture count is present.
     pub redundant_pic_cnt_present: bool,
     /// Whether slice headers carry deblocking-filter control syntax.
@@ -134,7 +156,67 @@ pub struct Pps {
     pub transform_8x8_mode: bool,
     /// Whether the PPS carries picture scaling-list syntax.
     pub scaling_matrix_present: bool,
+    /// Explicit PPS 4x4 lists; absent entries use the picture fallback rules.
+    pub scaling_lists_4x4: [Option<[u8; 16]>; 6],
+    /// Explicit PPS luma 8x8 lists; absent entries use the picture fallback rules.
+    pub scaling_lists_8x8: [Option<[u8; 64]>; 2],
 }
+
+impl Pps {
+    /// Resolves picture scaling-list syntax against the referenced SPS.
+    #[must_use]
+    pub fn resolve_scaling_matrices(&self, sps: &Sps) -> ScalingMatrices {
+        if !self.scaling_matrix_present {
+            return sps.scaling_matrices.clone();
+        }
+
+        let mut matrices = ScalingMatrices::flat();
+        for index in 0..6 {
+            let fallback = match index {
+                0 if sps.scaling_matrix_present => sps.scaling_matrices.four_by_four[0],
+                0 => DEFAULT_4X4_INTRA,
+                3 if sps.scaling_matrix_present => sps.scaling_matrices.four_by_four[3],
+                3 => DEFAULT_4X4_INTER,
+                _ => matrices.four_by_four[index - 1],
+            };
+            matrices.four_by_four[index] = self.scaling_lists_4x4[index].unwrap_or(fallback);
+        }
+        for index in 0..2 {
+            let fallback = if sps.scaling_matrix_present {
+                sps.scaling_matrices.eight_by_eight[index]
+            } else if index == 0 {
+                DEFAULT_8X8_INTRA
+            } else {
+                DEFAULT_8X8_INTER
+            };
+            matrices.eight_by_eight[index] = self.scaling_lists_8x8[index].unwrap_or(fallback);
+        }
+        matrices
+    }
+}
+
+const DEFAULT_4X4_INTRA: [u8; 16] = [
+    6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42,
+];
+const DEFAULT_4X4_INTER: [u8; 16] = [
+    10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34,
+];
+const DEFAULT_8X8_INTRA: [u8; 64] = [
+    6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29, 13, 16, 18, 23, 25, 27, 29, 31,
+    16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31, 33, 36, 38,
+    25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
+];
+const DEFAULT_8X8_INTER: [u8; 64] = [
+    9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25, 15, 17, 19, 21, 22, 24, 25, 27,
+    17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27, 28, 30, 32,
+    22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
+];
+const SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+const SCAN_8X8: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
 
 /// Broad picture role derived from `slice_type`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,6 +336,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     let mut bit_depth_chroma = 8;
     let mut qpprime_y_zero_transform_bypass = false;
     let mut scaling_matrix_present = false;
+    let mut scaling_matrices = ScalingMatrices::flat();
     if high_profile {
         chroma_format_idc = reader.ue()?;
         if chroma_format_idc > 3 {
@@ -271,8 +354,31 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         if scaling_matrix_present {
             let list_count = if chroma_format_idc == 3 { 12 } else { 8 };
             for index in 0..list_count {
-                if reader.bit()? {
-                    skip_scaling_list(&mut reader, if index < 6 { 16 } else { 64 })?;
+                let present = reader.bit()?;
+                if index < 6 {
+                    let fallback = match index {
+                        0 => DEFAULT_4X4_INTRA,
+                        3 => DEFAULT_4X4_INTER,
+                        _ => scaling_matrices.four_by_four[index - 1],
+                    };
+                    scaling_matrices.four_by_four[index] = if present {
+                        parse_scaling_list(&mut reader, &SCAN_4X4, fallback)?
+                    } else {
+                        fallback
+                    };
+                } else {
+                    let matrix_index = index - 6;
+                    let default = if matrix_index.is_multiple_of(2) {
+                        DEFAULT_8X8_INTRA
+                    } else {
+                        DEFAULT_8X8_INTER
+                    };
+                    let parsed = present
+                        .then(|| parse_scaling_list(&mut reader, &SCAN_8X8, default))
+                        .transpose()?;
+                    if matrix_index < 2 {
+                        scaling_matrices.eight_by_eight[matrix_index] = parsed.unwrap_or(default);
+                    }
                 }
             }
         }
@@ -373,6 +479,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         bit_depth_chroma,
         qpprime_y_zero_transform_bypass,
         scaling_matrix_present,
+        scaling_matrices,
         log2_max_frame_num,
         pic_order_cnt_type,
         max_num_ref_frames,
@@ -398,19 +505,37 @@ fn crop_units(chroma_array_type: u32, frame_mbs_only: bool) -> (u32, u32) {
     }
 }
 
-fn skip_scaling_list(reader: &mut SyntaxReader<'_>, size: usize) -> Result<()> {
+fn parse_scaling_list<const N: usize>(
+    reader: &mut SyntaxReader<'_>,
+    scan: &[usize; N],
+    default: [u8; N],
+) -> Result<[u8; N]> {
+    let mut values = [0_u8; N];
     let mut last_scale = 8_i32;
     let mut next_scale = 8_i32;
-    for _ in 0..size {
+    for (index, destination) in scan.iter().copied().enumerate() {
         if next_scale != 0 {
             let delta_scale = reader.se()?;
+            if !(-128..=127).contains(&delta_scale) {
+                return Err(Error::InvalidData(
+                    "H.264 scaling-list delta is outside -128..=127".into(),
+                ));
+            }
             next_scale = (last_scale + delta_scale + 256) % 256;
+            if index == 0 && next_scale == 0 {
+                return Ok(default);
+            }
         }
-        if next_scale != 0 {
-            last_scale = next_scale;
-        }
+        let value = if next_scale == 0 {
+            last_scale
+        } else {
+            next_scale
+        };
+        values[destination] = u8::try_from(value)
+            .map_err(|_| Error::InvalidData("H.264 scaling-list value overflows".into()))?;
+        last_scale = value;
     }
-    Ok(())
+    Ok(values)
 }
 
 fn parse_vui(reader: &mut SyntaxReader<'_>) -> Result<VuiParameters> {
@@ -504,6 +629,37 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
     } else {
         (false, false)
     };
+    let mut scaling_lists_4x4 = [None; 6];
+    let mut scaling_lists_8x8 = [None; 2];
+    if scaling_matrix_present {
+        for (index, list) in scaling_lists_4x4.iter_mut().enumerate() {
+            if reader.bit()? {
+                let default = if index < 3 {
+                    DEFAULT_4X4_INTRA
+                } else {
+                    DEFAULT_4X4_INTER
+                };
+                *list = Some(parse_scaling_list(&mut reader, &SCAN_4X4, default)?);
+            }
+        }
+        if transform_8x8_mode {
+            for (index, list) in scaling_lists_8x8.iter_mut().enumerate() {
+                if reader.bit()? {
+                    let default = if index == 0 {
+                        DEFAULT_8X8_INTRA
+                    } else {
+                        DEFAULT_8X8_INTER
+                    };
+                    *list = Some(parse_scaling_list(&mut reader, &SCAN_8X8, default)?);
+                }
+            }
+        }
+    }
+    let second_chroma_qp_index_offset = if more_rbsp_data(&reader)? {
+        reader.se()?
+    } else {
+        chroma_qp_index_offset
+    };
     Ok(Pps {
         id,
         sequence_parameter_set_id,
@@ -514,10 +670,13 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
         weighted_pred,
         pic_init_qp_minus26,
         chroma_qp_index_offset,
+        second_chroma_qp_index_offset,
         redundant_pic_cnt_present,
         deblocking_filter_control_present,
         transform_8x8_mode,
         scaling_matrix_present,
+        scaling_lists_4x4,
+        scaling_lists_8x8,
     })
 }
 
@@ -898,7 +1057,10 @@ fn peek_slice_pps_id(nal: &[u8]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PictureOrderCountType, PictureType, parse_pps, parse_slice_header, parse_sps};
+    use super::{
+        DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTRA, PictureOrderCountType,
+        PictureType, parse_pps, parse_slice_header, parse_sps,
+    };
 
     // Baseline 1280x720 SPS/PPS emitted by a conventional x264 stream.
     const SPS: &[u8] = &[
@@ -912,6 +1074,8 @@ mod tests {
         let sps = parse_sps(SPS).unwrap();
         assert_eq!(sps.profile_idc, 66);
         assert!(!sps.scaling_matrix_present);
+        assert_eq!(sps.scaling_matrices.four_by_four, [[16; 16]; 6]);
+        assert_eq!(sps.scaling_matrices.eight_by_eight, [[16; 64]; 2]);
         assert_eq!((sps.width, sps.height), (1280, 720));
         assert!(matches!(
             sps.pic_order_cnt_type,
@@ -923,6 +1087,28 @@ mod tests {
         assert_eq!(pps.sequence_parameter_set_id, sps.id);
         assert!(!pps.transform_8x8_mode);
         assert!(!pps.scaling_matrix_present);
+        assert_eq!(
+            pps.second_chroma_qp_index_offset,
+            pps.chroma_qp_index_offset
+        );
+    }
+
+    #[test]
+    fn resolves_picture_scaling_matrix_fallbacks() {
+        let sps = parse_sps(SPS).unwrap();
+        let mut pps = parse_pps(PPS).unwrap();
+        pps.scaling_matrix_present = true;
+        pps.transform_8x8_mode = true;
+        pps.scaling_lists_4x4[1] = Some([7; 16]);
+        pps.scaling_lists_8x8[1] = Some([9; 64]);
+
+        let matrices = pps.resolve_scaling_matrices(&sps);
+        assert_eq!(matrices.four_by_four[0], DEFAULT_4X4_INTRA);
+        assert_eq!(matrices.four_by_four[1], [7; 16]);
+        assert_eq!(matrices.four_by_four[2], [7; 16]);
+        assert_eq!(matrices.four_by_four[3], DEFAULT_4X4_INTER);
+        assert_eq!(matrices.eight_by_eight[0], DEFAULT_8X8_INTRA);
+        assert_eq!(matrices.eight_by_eight[1], [9; 64]);
     }
 
     #[test]

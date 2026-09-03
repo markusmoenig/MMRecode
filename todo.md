@@ -328,8 +328,8 @@ Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
 in-loop deblocking and single-reference CAVLC P slices are also implemented, including skip,
 16x16, 16x8, 8x16, and sub-macroblock partitions with fractional-sample motion compensation,
-explicit weighted prediction, and inter residuals. The same path accepts the High Profile subset using CAVLC, implicit flat
-scaling, and 4x4 transforms. MMRecode itself owns demuxing, timestamps, NAL conversion, SPS/PPS/VUI/slice
+explicit weighted prediction, and inter residuals. The same path accepts the High Profile subset using CAVLC and
+4x4 transforms. MMRecode itself owns demuxing, timestamps, NAL conversion, SPS/PPS/VUI/slice
 parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have not been started.
 
 - [x] **H.264/AVC foundation:** Annex-B and length-prefixed NAL handling, `avcC`, SPS/PPS/VUI and
@@ -363,7 +363,13 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Preserve and apply the High Profile QP-zero transform-bypass SPS flag for lossless Intra4 and
   inter luma/chroma residuals, including horizontal/vertical residual DPCM across chroma sub-blocks;
   verify mixed CABAC PCM/Intra4 pictures and a lossless P GOP byte-for-byte against FFmpeg.
-- [ ] Complete native H.264 reconstruction with `Intra_8x8`, scaling matrices, remaining CABAC tools,
+- [x] Add CABAC `Intra_8x8` prediction and 8x8 luma inverse transforms for intra and inter
+  macroblocks, including transform-size contexts, coefficient contexts, transform-aware deblocking,
+  and sustained High Profile I/P GOP comparison byte-for-byte against FFmpeg.
+- [x] Parse and resolve SPS/PPS scaling lists, apply them to native intra/inter 4x4 and luma 8x8
+  inverse quantization, and capture the second chroma QP offset for component-correct deblocking;
+  verify a sustained non-flat JVT-matrix CABAC I/P GOP byte-for-byte against FFmpeg.
+- [ ] Complete native H.264 reconstruction with remaining CABAC tools,
   B slices, multiple-reference decoded-picture-buffer/reference-list semantics, fields, multi-slice
   filtering rules, recovery points, and complete picture ordering; retain system acceleration only
   as an optional backend.

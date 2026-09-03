@@ -7,7 +7,8 @@ use mmrecode_core::{
 };
 
 use crate::{
-    AvcDecoderConfigurationRecord, NalUnit, NalUnitType, PictureOrderCountType, Pps, Sps,
+    AvcDecoderConfigurationRecord, NalUnit, NalUnitType, PictureOrderCountType, Pps,
+    ScalingMatrices, Sps,
     cabac::{CabacDecoder, ContextState, initial_contexts, initial_i_macroblock_contexts},
     cavlc::decode_residual_block,
     deblock::{
@@ -28,12 +29,12 @@ type ChromaAcLevels = [[Vec<i32>; 4]; 2];
 /// path retains one list-0 reference and supports skip, 16x16, 16x8, 8x16, and sub-macroblock
 /// partitions down to 4x4, quarter-sample luma/eighth-sample chroma motion compensation, inter
 /// residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture deblocking.
-/// Baseline and High Profile streams using CAVLC, implicit flat scaling, and 4x4 transforms share
-/// this path. CABAC context arithmetic, `I_PCM`, Intra16, and Intra4 macroblocks with luma/chroma
+/// Baseline and High Profile streams using CAVLC and 4x4 transforms share this path. CABAC context
+/// arithmetic, `I_PCM`, Intra16, and Intra4 macroblocks with luma/chroma
 /// DC and AC residuals are also native. CABAC P slices support skip, 16x16, 16x8, 8x16, and
 /// 8x8 partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion, residuals, and
-/// filtering. High Profile QP-zero transform bypass is native for lossless Intra4 and inter
-/// residuals.
+/// filtering. SPS/PPS scaling lists feed native 4x4 and luma 8x8 inverse quantization. High Profile
+/// QP-zero transform bypass is native for lossless Intra4 and inter residuals.
 /// This establishes native parameter activation, slice
 /// traversal, prediction, reference retention, macroblock placement, filtering, cropping, timing,
 /// and the shared [`Decoder`] contract without substituting another codec library. Other conforming
@@ -182,11 +183,6 @@ impl H264Decoder {
                 ))
             })?;
         validate_native_profile(sps, pps)?;
-        if pps.transform_8x8_mode {
-            return Err(Error::Unsupported(
-                "native H.264 8x8 transform reconstruction is not implemented yet".into(),
-            ));
-        }
         if sps.separate_colour_plane {
             let _colour_plane_id = reader.bits(2)?;
         }
@@ -224,20 +220,27 @@ impl H264Decoder {
             .filter(|value| (0..=51).contains(value))
             .ok_or_else(|| Error::InvalidData("invalid H.264 initial slice QP".into()))?;
         let deblocking = read_deblocking_parameters(&mut reader, pps)?;
-        let mut buffer = FrameBuffer::new(sps)?;
+        let mut buffer = FrameBuffer::new(sps, pps)?;
         if pps.entropy_coding_mode {
             decode_cabac_i_macroblocks(
                 &mut reader.bits,
                 &mut buffer,
                 &mut luma_qp,
                 pps.chroma_qp_index_offset,
+                pps.transform_8x8_mode,
             )?;
         } else {
-            decode_idr_macroblocks(&mut reader, &mut buffer, sps, pps, &mut luma_qp)?;
+            decode_idr_macroblocks(&mut reader, &mut buffer, pps, &mut luma_qp)?;
             reader.finish_rbsp()?;
         }
         if let Some(params) = deblocking {
-            buffer.deblock(pps.chroma_qp_index_offset, params)?;
+            buffer.deblock(
+                [
+                    pps.chroma_qp_index_offset,
+                    pps.second_chroma_qp_index_offset,
+                ],
+                params,
+            )?;
         }
         let frame = buffer.to_frame(sps, timing)?;
         self.reference = Some(buffer.into_reference(frame_num));
@@ -278,11 +281,6 @@ impl H264Decoder {
                 ))
             })?;
         validate_native_profile(sps, pps)?;
-        if pps.transform_8x8_mode {
-            return Err(Error::Unsupported(
-                "native H.264 8x8 transform reconstruction is not implemented yet".into(),
-            ));
-        }
         if sps.separate_colour_plane {
             let _colour_plane_id = reader.bits(2)?;
         }
@@ -339,7 +337,7 @@ impl H264Decoder {
         let reference = self.reference.as_ref().ok_or_else(|| {
             Error::InvalidData("H.264 P picture has no decoded reference picture".into())
         })?;
-        let mut buffer = FrameBuffer::from_reference(sps, reference, luma_qp)?;
+        let mut buffer = FrameBuffer::from_reference(sps, pps, reference, luma_qp)?;
         let mut current_qp = luma_qp;
         if let Some(cabac_init_idc) = cabac_init_idc {
             decode_cabac_p_macroblocks(
@@ -350,13 +348,13 @@ impl H264Decoder {
                 &mut current_qp,
                 cabac_init_idc,
                 pps.chroma_qp_index_offset,
+                pps.transform_8x8_mode,
             )?;
         } else {
             decode_p_macroblocks(
                 &mut reader,
                 &mut buffer,
                 reference,
-                sps,
                 pps,
                 prediction_weights,
                 &mut current_qp,
@@ -364,7 +362,13 @@ impl H264Decoder {
             reader.finish_rbsp()?;
         }
         if let Some(params) = deblocking {
-            buffer.deblock(pps.chroma_qp_index_offset, params)?;
+            buffer.deblock(
+                [
+                    pps.chroma_qp_index_offset,
+                    pps.second_chroma_qp_index_offset,
+                ],
+                params,
+            )?;
         }
         let frame = buffer.to_frame(sps, timing)?;
         if unit.header.reference_idc != 0 {
@@ -378,7 +382,6 @@ fn decode_p_macroblocks(
     reader: &mut SyntaxReader<'_>,
     buffer: &mut FrameBuffer,
     reference: &ReferenceFrame,
-    sps: &Sps,
     pps: &Pps,
     prediction_weights: PredictionWeights,
     luma_qp: &mut i32,
@@ -409,16 +412,8 @@ fn decode_p_macroblocks(
                 luma_qp,
                 pps.chroma_qp_index_offset,
                 prediction_weights,
-                uses_flat_4x4_scaling(sps, pps),
             )?,
-            5 => decode_intra4x4(
-                reader,
-                buffer,
-                address,
-                luma_qp,
-                pps.chroma_qp_index_offset,
-                uses_flat_4x4_scaling(sps, pps),
-            )?,
+            5 => decode_intra4x4(reader, buffer, address, luma_qp, pps.chroma_qp_index_offset)?,
             6..=29 => decode_intra16x16(
                 reader,
                 buffer,
@@ -426,7 +421,6 @@ fn decode_p_macroblocks(
                 macroblock_type - 5,
                 luma_qp,
                 pps.chroma_qp_index_offset,
-                uses_flat_4x4_scaling(sps, pps),
             )?,
             30 => {
                 reader.align_zero_to_byte()?;
@@ -1139,6 +1133,137 @@ const CABAC_P_LUMA_ABS_INIT: [[(i8, i8); 10]; 3] = [
         (-18, 108),
     ],
 ];
+const CABAC_P_TRANSFORM_SIZE_8X8_INIT: [[(i8, i8); 3]; 3] = [
+    [(12, 40), (11, 51), (14, 59)],
+    [(25, 32), (21, 49), (21, 54)],
+    [(21, 33), (19, 50), (17, 61)],
+];
+const CABAC_P_LUMA_8X8_SIG_INIT: [[(i8, i8); 15]; 3] = [
+    [
+        (-4, 79),
+        (-7, 71),
+        (-5, 69),
+        (-9, 70),
+        (-8, 66),
+        (-10, 68),
+        (-19, 73),
+        (-12, 69),
+        (-16, 70),
+        (-15, 67),
+        (-20, 62),
+        (-19, 70),
+        (-16, 66),
+        (-22, 65),
+        (-20, 63),
+    ],
+    [
+        (-5, 85),
+        (-6, 81),
+        (-10, 77),
+        (-7, 81),
+        (-17, 80),
+        (-18, 73),
+        (-4, 74),
+        (-10, 83),
+        (-9, 71),
+        (-9, 67),
+        (-1, 61),
+        (-8, 66),
+        (-14, 66),
+        (0, 59),
+        (2, 59),
+    ],
+    [
+        (-3, 78),
+        (-8, 74),
+        (-9, 72),
+        (-10, 72),
+        (-18, 75),
+        (-12, 71),
+        (-11, 63),
+        (-5, 70),
+        (-17, 75),
+        (-14, 72),
+        (-16, 67),
+        (-8, 53),
+        (-14, 59),
+        (-9, 52),
+        (-11, 68),
+    ],
+];
+const CABAC_P_LUMA_8X8_LAST_INIT: [[(i8, i8); 9]; 3] = [
+    [
+        (9, -2),
+        (26, -9),
+        (33, -9),
+        (39, -7),
+        (41, -2),
+        (45, 3),
+        (49, 9),
+        (45, 27),
+        (36, 59),
+    ],
+    [
+        (17, -10),
+        (32, -13),
+        (42, -9),
+        (49, -5),
+        (53, 0),
+        (64, 3),
+        (68, 10),
+        (66, 27),
+        (47, 57),
+    ],
+    [
+        (9, -2),
+        (30, -10),
+        (31, -4),
+        (33, -1),
+        (33, 7),
+        (31, 12),
+        (37, 23),
+        (31, 38),
+        (20, 64),
+    ],
+];
+const CABAC_P_LUMA_8X8_ABS_INIT: [[(i8, i8); 10]; 3] = [
+    [
+        (-6, 66),
+        (-7, 35),
+        (-7, 42),
+        (-8, 45),
+        (-5, 48),
+        (-12, 56),
+        (-6, 60),
+        (-5, 62),
+        (-8, 66),
+        (-8, 76),
+    ],
+    [
+        (-5, 71),
+        (0, 24),
+        (-1, 36),
+        (-2, 42),
+        (-2, 52),
+        (-9, 57),
+        (-6, 63),
+        (-4, 65),
+        (-4, 67),
+        (-7, 82),
+    ],
+    [
+        (-9, 71),
+        (-7, 37),
+        (-8, 44),
+        (-11, 49),
+        (-10, 56),
+        (-12, 59),
+        (-8, 63),
+        (-9, 67),
+        (-6, 68),
+        (-10, 79),
+    ],
+];
 const CABAC_P_CHROMA_DC_ABS_INIT: [[(i8, i8); 10]; 3] = [
     [
         (0, 70),
@@ -1247,6 +1372,10 @@ struct CabacPContexts {
     luma_ac_significant: [ContextState; 14],
     luma_ac_last: [ContextState; 14],
     luma_ac_abs_level: [ContextState; 10],
+    transform_size_8x8: [ContextState; 3],
+    luma_8x8_significant: [ContextState; 15],
+    luma_8x8_last: [ContextState; 9],
+    luma_8x8_abs_level: [ContextState; 10],
 }
 
 impl CabacPContexts {
@@ -1307,10 +1436,18 @@ impl CabacPContexts {
             luma_ac_significant: initial_contexts(&CABAC_P_LUMA_AC_SIG_INIT[index], slice_qp_y)?,
             luma_ac_last: initial_contexts(&CABAC_P_LUMA_AC_LAST_INIT[index], slice_qp_y)?,
             luma_ac_abs_level: initial_contexts(&CABAC_P_LUMA_AC_ABS_INIT[index], slice_qp_y)?,
+            transform_size_8x8: initial_contexts(
+                &CABAC_P_TRANSFORM_SIZE_8X8_INIT[index],
+                slice_qp_y,
+            )?,
+            luma_8x8_significant: initial_contexts(&CABAC_P_LUMA_8X8_SIG_INIT[index], slice_qp_y)?,
+            luma_8x8_last: initial_contexts(&CABAC_P_LUMA_8X8_LAST_INIT[index], slice_qp_y)?,
+            luma_8x8_abs_level: initial_contexts(&CABAC_P_LUMA_8X8_ABS_INIT[index], slice_qp_y)?,
         })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_cabac_p_macroblocks(
     bits: &mut BitReader<'_>,
     buffer: &mut FrameBuffer,
@@ -1319,6 +1456,7 @@ fn decode_cabac_p_macroblocks(
     luma_qp: &mut i32,
     cabac_init_idc: u32,
     chroma_qp_offset: i32,
+    transform_8x8_mode: bool,
 ) -> Result<()> {
     let mut contexts = CabacPContexts::new(*luma_qp, cabac_init_idc)?;
     let mut decoder = CabacDecoder::new(bits)?;
@@ -1327,6 +1465,7 @@ fn decode_cabac_p_macroblocks(
     let mut coded_blocks = CabacICodedBlocks::new(buffer.macroblock_count());
     let mut motion_differences = vec![[MotionVector::default(); 16]; buffer.macroblock_count()];
     let mut chroma_prediction_modes = vec![0_u32; buffer.macroblock_count()];
+    let mut transform_8x8 = vec![false; buffer.macroblock_count()];
     let mut previous_qp_delta = 0;
     for address in 0..buffer.macroblock_count() {
         let context_increment =
@@ -1351,6 +1490,8 @@ fn decode_cabac_p_macroblocks(
                 &mut motion_differences,
                 chroma_qp_offset,
                 &mut chroma_prediction_modes,
+                transform_8x8_mode,
+                &mut transform_8x8,
             )?;
         }
         if decoder.terminate()? {
@@ -1367,7 +1508,7 @@ fn decode_cabac_p_macroblocks(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_cabac_p_macroblock(
     decoder: &mut CabacDecoder<'_, '_>,
     contexts: &mut CabacPContexts,
@@ -1382,22 +1523,51 @@ fn decode_cabac_p_macroblock(
     motion_differences: &mut [[MotionVector; 16]],
     chroma_qp_offset: i32,
     chroma_prediction_modes: &mut [u32],
+    transform_8x8_mode: bool,
+    transform_8x8: &mut [bool],
 ) -> Result<()> {
     if decoder.decision(&mut contexts.macroblock_type[0])? {
         let macroblock_type = decode_cabac_p_intra_macroblock_type(decoder, contexts)?;
         return match macroblock_type {
-            0 => decode_cabac_p_intra4(
-                decoder,
-                contexts,
-                buffer,
-                address,
-                macroblocks_wide,
-                chroma_qp_offset,
-                previous_qp_delta,
-                luma_qp,
-                chroma_prediction_modes,
-                coded_blocks,
-            ),
+            0 => {
+                let use_8x8 = transform_8x8_mode
+                    && decode_cabac_transform_size_8x8(
+                        decoder,
+                        &mut contexts.transform_size_8x8,
+                        address,
+                        macroblocks_wide,
+                        transform_8x8,
+                    )?;
+                transform_8x8[address] = use_8x8;
+                buffer.transform_8x8[address] = use_8x8;
+                if use_8x8 {
+                    decode_cabac_p_intra8(
+                        decoder,
+                        contexts,
+                        buffer,
+                        address,
+                        macroblocks_wide,
+                        chroma_qp_offset,
+                        previous_qp_delta,
+                        luma_qp,
+                        chroma_prediction_modes,
+                        coded_blocks,
+                    )
+                } else {
+                    decode_cabac_p_intra4(
+                        decoder,
+                        contexts,
+                        buffer,
+                        address,
+                        macroblocks_wide,
+                        chroma_qp_offset,
+                        previous_qp_delta,
+                        luma_qp,
+                        chroma_prediction_modes,
+                        coded_blocks,
+                    )
+                }
+            }
             1..=24 => decode_cabac_p_intra16(
                 decoder,
                 contexts,
@@ -1447,6 +1617,10 @@ fn decode_cabac_p_macroblock(
             InterPartition::new(2, 0, 2, 4, MotionPredictionKind::Right8x16),
         ]
     };
+    let transform_allowed = transform_8x8_mode
+        && partitions
+            .iter()
+            .all(|partition| partition.block_width >= 2 && partition.block_height >= 2);
     for partition in partitions {
         decode_cabac_inter_partition(
             decoder,
@@ -1470,6 +1644,17 @@ fn decode_cabac_p_macroblock(
         &coded_blocks.patterns,
     )?;
     coded_blocks.patterns[address] = pattern;
+    let use_8x8 = transform_allowed
+        && pattern & 15 != 0
+        && decode_cabac_transform_size_8x8(
+            decoder,
+            &mut contexts.transform_size_8x8,
+            address,
+            macroblocks_wide,
+            transform_8x8,
+        )?;
+    transform_8x8[address] = use_8x8;
+    buffer.transform_8x8[address] = use_8x8;
     decode_cabac_p16_residuals(
         decoder,
         contexts,
@@ -1481,6 +1666,7 @@ fn decode_cabac_p_macroblock(
         previous_qp_delta,
         coded_blocks,
         chroma_qp_offset,
+        use_8x8,
     )?;
     Ok(())
 }
@@ -1601,6 +1787,114 @@ fn decode_cabac_p_intra4_luma(
                     nonzero_coefficient_count(&blocks[block_index]),
                 );
             }
+        }
+    }
+    Ok(blocks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_cabac_p_intra8(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut CabacPContexts,
+    buffer: &mut FrameBuffer,
+    address: usize,
+    macroblocks_wide: usize,
+    chroma_qp_offset: i32,
+    previous_qp_delta: &mut i32,
+    luma_qp: &mut i32,
+    chroma_prediction_modes: &mut [u32],
+    coded_blocks: &mut CabacICodedBlocks,
+) -> Result<()> {
+    buffer.mark_intra(address);
+    let modes = decode_cabac_intra8_prediction_modes_with_contexts(
+        decoder,
+        &mut contexts.intra4_prediction_mode,
+        buffer,
+        address,
+    )?;
+    let chroma_mode = decode_cabac_chroma_prediction_mode(
+        decoder,
+        &mut contexts.chroma_prediction_mode,
+        address,
+        macroblocks_wide,
+        chroma_prediction_modes,
+    )?;
+    chroma_prediction_modes[address] = chroma_mode;
+    let pattern = decode_cabac_coded_block_pattern(
+        decoder,
+        &mut contexts.coded_block_pattern_luma,
+        &mut contexts.coded_block_pattern_chroma,
+        address,
+        macroblocks_wide,
+        &coded_blocks.patterns,
+    )?;
+    coded_blocks.patterns[address] = pattern;
+    update_cabac_inter_qp(
+        decoder,
+        &mut contexts.macroblock_qp_delta,
+        pattern,
+        luma_qp,
+        previous_qp_delta,
+    )?;
+    let luma_blocks = decode_cabac_p_luma_8x8(
+        decoder,
+        contexts,
+        buffer,
+        address,
+        pattern & 15,
+        coded_blocks,
+    )?;
+    let (chroma_dc_levels, chroma_blocks) = decode_cabac_p_intra_chroma(
+        decoder,
+        contexts,
+        buffer,
+        address,
+        macroblocks_wide,
+        u32::from(pattern >> 4),
+        coded_blocks,
+    )?;
+    for group in 0..4 {
+        buffer.reconstruct_intra8_luma_block(
+            address,
+            group,
+            modes[group],
+            &luma_blocks[group],
+            *luma_qp,
+        )?;
+    }
+    buffer.predict_chroma_macroblock(address, chroma_mode)?;
+    buffer.add_chroma_residual(
+        address,
+        &chroma_dc_levels,
+        &chroma_blocks,
+        chroma_qp(*luma_qp, chroma_qp_offset),
+    )?;
+    buffer.set_luma_qp(address, *luma_qp);
+    Ok(())
+}
+
+fn decode_cabac_p_luma_8x8(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut CabacPContexts,
+    buffer: &mut FrameBuffer,
+    address: usize,
+    coded_block_pattern: u8,
+    coded_blocks: &mut CabacICodedBlocks,
+) -> Result<[Vec<i32>; 4]> {
+    let mut blocks: [Vec<i32>; 4] = std::array::from_fn(|_| vec![0; 64]);
+    for (group, levels) in blocks.iter_mut().enumerate() {
+        if coded_block_pattern & (1 << group) != 0 {
+            *levels = decode_cabac_residual_8x8(
+                decoder,
+                &mut contexts.luma_8x8_significant,
+                &mut contexts.luma_8x8_last,
+                &mut contexts.luma_8x8_abs_level,
+            )?;
+        }
+        let nonzero = nonzero_coefficient_count(levels);
+        for block in group * 4..group * 4 + 4 {
+            buffer.set_luma_nonzero(address, block, nonzero);
+            coded_blocks.luma_ac[address][block] = nonzero != 0;
         }
     }
     Ok(blocks)
@@ -1967,7 +2261,7 @@ fn decode_cabac_inter_partition(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_cabac_p16_residuals(
     decoder: &mut CabacDecoder<'_, '_>,
     contexts: &mut CabacPContexts,
@@ -1979,6 +2273,7 @@ fn decode_cabac_p16_residuals(
     previous_qp_delta: &mut i32,
     coded_blocks: &mut CabacICodedBlocks,
     chroma_qp_offset: i32,
+    transform_8x8: bool,
 ) -> Result<()> {
     update_cabac_inter_qp(
         decoder,
@@ -1988,15 +2283,32 @@ fn decode_cabac_p16_residuals(
         previous_qp_delta,
     )?;
 
-    let luma_blocks = decode_cabac_p_inter_luma(
-        decoder,
-        contexts,
-        buffer,
-        address,
-        macroblocks_wide,
-        pattern & 15,
-        coded_blocks,
-    )?;
+    let (luma_blocks, luma_8x8_blocks) = if transform_8x8 {
+        (
+            std::array::from_fn(|_| vec![0; 16]),
+            Some(decode_cabac_p_luma_8x8(
+                decoder,
+                contexts,
+                buffer,
+                address,
+                pattern & 15,
+                coded_blocks,
+            )?),
+        )
+    } else {
+        (
+            decode_cabac_p_inter_luma(
+                decoder,
+                contexts,
+                buffer,
+                address,
+                macroblocks_wide,
+                pattern & 15,
+                coded_blocks,
+            )?,
+            None,
+        )
+    };
 
     let chroma_pattern = pattern >> 4;
     let mut chroma_dc_levels: ChromaDcLevels = std::array::from_fn(|_| vec![0; 4]);
@@ -2053,15 +2365,25 @@ fn decode_cabac_p16_residuals(
     } else {
         buffer.mark_zero_chroma_ac(address);
     }
-    add_cabac_inter_residuals(
-        buffer,
-        address,
-        &luma_blocks,
-        &chroma_dc_levels,
-        &chroma_blocks,
-        *luma_qp,
-        chroma_qp_offset,
-    )?;
+    if let Some(luma_8x8_blocks) = luma_8x8_blocks {
+        buffer.add_luma_residual_8x8_blocks(address, &luma_8x8_blocks, *luma_qp)?;
+        buffer.add_chroma_residual(
+            address,
+            &chroma_dc_levels,
+            &chroma_blocks,
+            chroma_qp(*luma_qp, chroma_qp_offset),
+        )?;
+    } else {
+        add_cabac_inter_residuals(
+            buffer,
+            address,
+            &luma_blocks,
+            &chroma_dc_levels,
+            &chroma_blocks,
+            *luma_qp,
+            chroma_qp_offset,
+        )?;
+    }
     buffer.set_luma_qp(address, *luma_qp);
     Ok(())
 }
@@ -2273,6 +2595,47 @@ fn decode_cabac_motion_difference(
 const CABAC_I_MB_QP_DELTA_INIT: [(i8, i8); 4] = [(0, 41), (0, 63), (0, 63), (0, 63)];
 const CABAC_I_CHROMA_PRED_MODE_INIT: [(i8, i8); 4] = [(-9, 83), (4, 86), (0, 97), (-7, 72)];
 const CABAC_I_INTRA4_PRED_MODE_INIT: [(i8, i8); 2] = [(13, 41), (3, 62)];
+const CABAC_I_TRANSFORM_SIZE_8X8_INIT: [(i8, i8); 3] = [(31, 21), (31, 31), (25, 50)];
+const CABAC_I_LUMA_8X8_SIGNIFICANT_INIT: [(i8, i8); 15] = [
+    (-17, 120),
+    (-20, 112),
+    (-18, 114),
+    (-11, 85),
+    (-15, 92),
+    (-14, 89),
+    (-26, 71),
+    (-15, 81),
+    (-14, 80),
+    (0, 68),
+    (-14, 70),
+    (-24, 56),
+    (-23, 68),
+    (-24, 50),
+    (-11, 74),
+];
+const CABAC_I_LUMA_8X8_LAST_INIT: [(i8, i8); 9] = [
+    (23, -13),
+    (26, -13),
+    (40, -15),
+    (49, -14),
+    (44, 3),
+    (45, 6),
+    (44, 34),
+    (33, 54),
+    (19, 82),
+];
+const CABAC_I_LUMA_8X8_ABS_INIT: [(i8, i8); 10] = [
+    (-3, 75),
+    (-1, 23),
+    (1, 34),
+    (1, 43),
+    (0, 54),
+    (-2, 55),
+    (0, 61),
+    (1, 64),
+    (0, 68),
+    (-9, 92),
+];
 const CABAC_I_CODED_BLOCK_PATTERN_LUMA_INIT: [(i8, i8); 4] =
     [(-17, 127), (-13, 102), (0, 82), (-7, 74)];
 const CABAC_I_CODED_BLOCK_PATTERN_CHROMA_INIT: [(i8, i8); 8] = [
@@ -2496,6 +2859,7 @@ struct CabacIContexts {
     macroblock_qp_delta: [ContextState; 4],
     chroma_prediction_mode: [ContextState; 4],
     intra4_prediction_mode: [ContextState; 2],
+    transform_size_8x8: [ContextState; 3],
     coded_block_pattern_luma: [ContextState; 4],
     coded_block_pattern_chroma: [ContextState; 8],
     luma_dc_coded_block: [ContextState; 4],
@@ -2518,6 +2882,9 @@ struct CabacIContexts {
     luma_4x4_significant: [ContextState; 15],
     luma_4x4_last: [ContextState; 15],
     luma_4x4_abs_level: [ContextState; 10],
+    luma_8x8_significant: [ContextState; 15],
+    luma_8x8_last: [ContextState; 9],
+    luma_8x8_abs_level: [ContextState; 10],
 }
 
 impl CabacIContexts {
@@ -2527,6 +2894,7 @@ impl CabacIContexts {
             macroblock_qp_delta: initial_contexts(&CABAC_I_MB_QP_DELTA_INIT, slice_qp_y)?,
             chroma_prediction_mode: initial_contexts(&CABAC_I_CHROMA_PRED_MODE_INIT, slice_qp_y)?,
             intra4_prediction_mode: initial_contexts(&CABAC_I_INTRA4_PRED_MODE_INIT, slice_qp_y)?,
+            transform_size_8x8: initial_contexts(&CABAC_I_TRANSFORM_SIZE_8X8_INIT, slice_qp_y)?,
             coded_block_pattern_luma: initial_contexts(
                 &CABAC_I_CODED_BLOCK_PATTERN_LUMA_INIT,
                 slice_qp_y,
@@ -2567,6 +2935,9 @@ impl CabacIContexts {
             luma_4x4_significant: initial_contexts(&CABAC_I_LUMA_4X4_SIGNIFICANT_INIT, slice_qp_y)?,
             luma_4x4_last: initial_contexts(&CABAC_I_LUMA_4X4_LAST_INIT, slice_qp_y)?,
             luma_4x4_abs_level: initial_contexts(&CABAC_I_LUMA_4X4_ABS_LEVEL_INIT, slice_qp_y)?,
+            luma_8x8_significant: initial_contexts(&CABAC_I_LUMA_8X8_SIGNIFICANT_INIT, slice_qp_y)?,
+            luma_8x8_last: initial_contexts(&CABAC_I_LUMA_8X8_LAST_INIT, slice_qp_y)?,
+            luma_8x8_abs_level: initial_contexts(&CABAC_I_LUMA_8X8_ABS_INIT, slice_qp_y)?,
         })
     }
 }
@@ -2604,6 +2975,7 @@ fn decode_cabac_i_macroblocks(
     buffer: &mut FrameBuffer,
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
+    transform_8x8_mode: bool,
 ) -> Result<()> {
     let mut contexts = CabacIContexts::new(*luma_qp)?;
     let mut decoder = CabacDecoder::new(bits)?;
@@ -2612,6 +2984,7 @@ fn decode_cabac_i_macroblocks(
     let mut chroma_prediction_modes = vec![0_u32; buffer.macroblock_count()];
     let mut coded_blocks = CabacICodedBlocks::new(buffer.macroblock_count());
     let mut previous_qp_delta = 0;
+    let mut transform_8x8 = vec![false; buffer.macroblock_count()];
     for address in 0..buffer.macroblock_count() {
         let context_increment =
             usize::from(!address.is_multiple_of(macroblocks_wide) && intra16_or_pcm[address - 1])
@@ -2625,18 +2998,43 @@ fn decode_cabac_i_macroblocks(
         )?;
         match macroblock_type {
             0 => {
-                decode_cabac_intra4(
-                    &mut decoder,
-                    &mut contexts,
-                    buffer,
-                    address,
-                    macroblocks_wide,
-                    chroma_qp_offset,
-                    &mut previous_qp_delta,
-                    luma_qp,
-                    &mut chroma_prediction_modes,
-                    &mut coded_blocks,
-                )?;
+                let use_8x8 = transform_8x8_mode
+                    && decode_cabac_transform_size_8x8(
+                        &mut decoder,
+                        &mut contexts.transform_size_8x8,
+                        address,
+                        macroblocks_wide,
+                        &transform_8x8,
+                    )?;
+                transform_8x8[address] = use_8x8;
+                buffer.transform_8x8[address] = use_8x8;
+                if use_8x8 {
+                    decode_cabac_intra8(
+                        &mut decoder,
+                        &mut contexts,
+                        buffer,
+                        address,
+                        macroblocks_wide,
+                        chroma_qp_offset,
+                        &mut previous_qp_delta,
+                        luma_qp,
+                        &mut chroma_prediction_modes,
+                        &mut coded_blocks,
+                    )?;
+                } else {
+                    decode_cabac_intra4(
+                        &mut decoder,
+                        &mut contexts,
+                        buffer,
+                        address,
+                        macroblocks_wide,
+                        chroma_qp_offset,
+                        &mut previous_qp_delta,
+                        luma_qp,
+                        &mut chroma_prediction_modes,
+                        &mut coded_blocks,
+                    )?;
+                }
             }
             1..=24 => {
                 decode_cabac_intra16(
@@ -2699,6 +3097,18 @@ fn decode_cabac_i_macroblock_type(
     macroblock_type += 2 * u32::from(decoder.decision(&mut contexts[9])?);
     macroblock_type += u32::from(decoder.decision(&mut contexts[10])?);
     Ok(macroblock_type)
+}
+
+fn decode_cabac_transform_size_8x8(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut [ContextState; 3],
+    address: usize,
+    macroblocks_wide: usize,
+    transform_8x8: &[bool],
+) -> Result<bool> {
+    let left = !address.is_multiple_of(macroblocks_wide) && transform_8x8[address - 1];
+    let top = address >= macroblocks_wide && transform_8x8[address - macroblocks_wide];
+    decoder.decision(&mut contexts[usize::from(left) + usize::from(top)])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2848,6 +3258,141 @@ fn decode_cabac_intra4(
     )?;
     buffer.set_luma_qp(address, *luma_qp);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_cabac_intra8(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut CabacIContexts,
+    buffer: &mut FrameBuffer,
+    address: usize,
+    macroblocks_wide: usize,
+    chroma_qp_offset: i32,
+    previous_qp_delta: &mut i32,
+    luma_qp: &mut i32,
+    chroma_prediction_modes: &mut [u32],
+    coded_blocks: &mut CabacICodedBlocks,
+) -> Result<()> {
+    buffer.mark_intra(address);
+    let modes = decode_cabac_intra8_prediction_modes(decoder, contexts, buffer, address)?;
+    let chroma_mode = decode_cabac_chroma_prediction_mode(
+        decoder,
+        &mut contexts.chroma_prediction_mode,
+        address,
+        macroblocks_wide,
+        chroma_prediction_modes,
+    )?;
+    chroma_prediction_modes[address] = chroma_mode;
+    let pattern = decode_cabac_coded_block_pattern(
+        decoder,
+        &mut contexts.coded_block_pattern_luma,
+        &mut contexts.coded_block_pattern_chroma,
+        address,
+        macroblocks_wide,
+        &coded_blocks.patterns,
+    )?;
+    coded_blocks.patterns[address] = pattern;
+    update_cabac_inter_qp(
+        decoder,
+        &mut contexts.macroblock_qp_delta,
+        pattern,
+        luma_qp,
+        previous_qp_delta,
+    )?;
+
+    let mut luma_blocks: [Vec<i32>; 4] = std::array::from_fn(|_| vec![0; 64]);
+    for (group, levels) in luma_blocks.iter_mut().enumerate() {
+        if pattern & (1 << group) == 0 {
+            for block in group * 4..group * 4 + 4 {
+                buffer.set_luma_nonzero(address, block, 0);
+            }
+            continue;
+        }
+        *levels = decode_cabac_residual_8x8(
+            decoder,
+            &mut contexts.luma_8x8_significant,
+            &mut contexts.luma_8x8_last,
+            &mut contexts.luma_8x8_abs_level,
+        )?;
+        let nonzero = nonzero_coefficient_count(levels);
+        for block in group * 4..group * 4 + 4 {
+            buffer.set_luma_nonzero(address, block, nonzero);
+            coded_blocks.luma_ac[address][block] = nonzero != 0;
+        }
+    }
+    let (chroma_dc_levels, chroma_blocks) = decode_cabac_intra_chroma_residuals(
+        decoder,
+        contexts,
+        buffer,
+        address,
+        macroblocks_wide,
+        u32::from(pattern >> 4),
+        coded_blocks,
+    )?;
+    for group in 0..4 {
+        buffer.reconstruct_intra8_luma_block(
+            address,
+            group,
+            modes[group],
+            &luma_blocks[group],
+            *luma_qp,
+        )?;
+    }
+    buffer.predict_chroma_macroblock(address, chroma_mode)?;
+    buffer.add_chroma_residual(
+        address,
+        &chroma_dc_levels,
+        &chroma_blocks,
+        chroma_qp(*luma_qp, chroma_qp_offset),
+    )?;
+    buffer.set_luma_qp(address, *luma_qp);
+    Ok(())
+}
+
+fn decode_cabac_intra8_prediction_modes(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut CabacIContexts,
+    buffer: &mut FrameBuffer,
+    address: usize,
+) -> Result<[u8; 4]> {
+    decode_cabac_intra8_prediction_modes_with_contexts(
+        decoder,
+        &mut contexts.intra4_prediction_mode,
+        buffer,
+        address,
+    )
+}
+
+fn decode_cabac_intra8_prediction_modes_with_contexts(
+    decoder: &mut CabacDecoder<'_, '_>,
+    contexts: &mut [ContextState; 2],
+    buffer: &mut FrameBuffer,
+    address: usize,
+) -> Result<[u8; 4]> {
+    let mut modes = [0_u8; 4];
+    for (group, mode) in modes.iter_mut().enumerate() {
+        let base = group * 4;
+        let predicted = buffer.predicted_intra4_mode(address, base);
+        *mode = if decoder.decision(&mut contexts[0])? {
+            predicted
+        } else {
+            let mut remaining = 0_u8;
+            for bit in 0..3 {
+                remaining |= u8::from(decoder.decision(&mut contexts[1])?) << bit;
+            }
+            remaining + u8::from(remaining >= predicted)
+        };
+        if *mode > 8 {
+            return Err(Error::InvalidData(format!(
+                "invalid H.264 CABAC Intra8x8 prediction mode {}",
+                *mode
+            )));
+        }
+        for block in base..base + 4 {
+            buffer.set_intra4_mode(address, block, *mode);
+        }
+    }
+    Ok(modes)
 }
 
 fn decode_cabac_intra4_prediction_modes(
@@ -3225,6 +3770,88 @@ fn decode_cabac_residual_block(
     Ok(coefficients)
 }
 
+fn decode_cabac_residual_8x8(
+    decoder: &mut CabacDecoder<'_, '_>,
+    significant_contexts: &mut [ContextState; 15],
+    last_contexts: &mut [ContextState; 9],
+    absolute_level_contexts: &mut [ContextState; 10],
+) -> Result<Vec<i32>> {
+    const SIGNIFICANT_CONTEXT: [usize; 63] = [
+        0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9,
+        8, 7, 7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9,
+        11, 12, 13, 11, 14, 10, 12,
+    ];
+    const LAST_CONTEXT: [usize; 63] = [
+        0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+        8, 8, 8,
+    ];
+    const LEVEL_ONE_CONTEXT: [usize; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+    const LEVEL_GT_ONE_CONTEXT: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
+    const AFTER_LEVEL_ONE: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
+    const AFTER_LEVEL_GT_ONE: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
+
+    let mut significant_positions = Vec::with_capacity(64);
+    let mut explicit_last = false;
+    for position in 0..63 {
+        if decoder.decision(&mut significant_contexts[SIGNIFICANT_CONTEXT[position]])? {
+            significant_positions.push(position);
+            if decoder.decision(&mut last_contexts[LAST_CONTEXT[position]])? {
+                explicit_last = true;
+                break;
+            }
+        }
+    }
+    if !explicit_last {
+        significant_positions.push(63);
+    }
+
+    let mut coefficients = vec![0_i32; 64];
+    let mut node_context = 0;
+    for &position in significant_positions.iter().rev() {
+        let absolute_level = if decoder
+            .decision(&mut absolute_level_contexts[LEVEL_ONE_CONTEXT[node_context]])?
+        {
+            let context_index = LEVEL_GT_ONE_CONTEXT[node_context];
+            node_context = AFTER_LEVEL_GT_ONE[node_context];
+            let mut absolute_level = 2_u32;
+            while absolute_level < 15
+                && decoder.decision(&mut absolute_level_contexts[context_index])?
+            {
+                absolute_level += 1;
+            }
+            if absolute_level >= 15 {
+                let mut prefix = 0_u8;
+                while decoder.bypass()? {
+                    prefix = prefix
+                        .checked_add(1)
+                        .filter(|&value| value <= 23)
+                        .ok_or_else(|| {
+                            Error::InvalidData("H.264 CABAC coefficient prefix is too long".into())
+                        })?;
+                }
+                let mut suffix = 0_u32;
+                for _ in 0..prefix {
+                    suffix = (suffix << 1) | u32::from(decoder.bypass()?);
+                }
+                absolute_level = 14 + (1_u32 << prefix) + suffix;
+            }
+            absolute_level
+        } else {
+            node_context = AFTER_LEVEL_ONE[node_context];
+            1
+        };
+        let absolute_level = i32::try_from(absolute_level)
+            .map_err(|_| Error::InvalidData("H.264 CABAC coefficient level overflows".into()))?;
+        coefficients[position] = if decoder.bypass()? {
+            -absolute_level
+        } else {
+            absolute_level
+        };
+    }
+    Ok(coefficients)
+}
+
 fn decode_cabac_chroma_prediction_mode(
     decoder: &mut CabacDecoder<'_, '_>,
     contexts: &mut [ContextState; 4],
@@ -3283,7 +3910,6 @@ fn decode_p_l0_macroblock(
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
     prediction_weights: PredictionWeights,
-    flat_scaling_only: bool,
 ) -> Result<()> {
     let partitions = read_inter_partitions(reader, macroblock_type)?;
     for partition in partitions {
@@ -3333,14 +3959,12 @@ fn decode_p_l0_macroblock(
         *luma_qp = (*luma_qp + reader.se()?).rem_euclid(52);
     }
     let mut luma_blocks: [Vec<i32>; 16] = std::array::from_fn(|_| vec![0; 16]);
-    let mut has_nonzero_residual = false;
     for group in 0..4 {
         for within_group in 0..4 {
             let block_index = group * 4 + within_group;
             if luma_pattern & (1 << group) != 0 {
                 let n_c = buffer.luma_nc(macroblock_address, block_index);
                 let decoded = decode_residual_block(&mut reader.bits, n_c, 16)?;
-                has_nonzero_residual |= decoded.total_coeff != 0;
                 luma_blocks[block_index] = decoded.coefficients;
                 buffer.set_luma_nonzero(macroblock_address, block_index, decoded.total_coeff);
             } else {
@@ -3350,17 +3974,6 @@ fn decode_p_l0_macroblock(
     }
     let (chroma_dc, chroma_blocks) =
         decode_chroma_blocks(reader, buffer, macroblock_address, chroma_pattern)?;
-    has_nonzero_residual |= chroma_dc
-        .iter()
-        .flatten()
-        .chain(chroma_blocks.iter().flatten().flatten())
-        .any(|&level| level != 0);
-    if has_nonzero_residual && !flat_scaling_only {
-        return Err(Error::Unsupported(
-            "native H.264 residual reconstruction currently requires implicit flat scaling matrices"
-                .into(),
-        ));
-    }
     buffer.add_luma_residual_blocks(macroblock_address, &luma_blocks, *luma_qp)?;
     buffer.add_chroma_residual(
         macroblock_address,
@@ -3670,7 +4283,6 @@ fn read_deblocking_parameters(
 fn decode_idr_macroblocks(
     reader: &mut SyntaxReader<'_>,
     buffer: &mut FrameBuffer,
-    sps: &Sps,
     pps: &Pps,
     luma_qp: &mut i32,
 ) -> Result<()> {
@@ -3683,7 +4295,6 @@ fn decode_idr_macroblocks(
                 macroblock_address,
                 luma_qp,
                 pps.chroma_qp_index_offset,
-                uses_flat_4x4_scaling(sps, pps),
             )?,
             25 => {
                 reader.align_zero_to_byte()?;
@@ -3697,7 +4308,6 @@ fn decode_idr_macroblocks(
                 macroblock_type,
                 luma_qp,
                 pps.chroma_qp_index_offset,
-                uses_flat_4x4_scaling(sps, pps),
             )?,
             _ => {
                 return Err(Error::Unsupported(format!(
@@ -3734,15 +4344,8 @@ fn decode_intra4x4(
     macroblock_address: usize,
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
-    flat_scaling_only: bool,
 ) -> Result<()> {
     buffer.mark_intra(macroblock_address);
-    if !flat_scaling_only {
-        return Err(Error::Unsupported(
-            "native H.264 I_NxN reconstruction currently requires 4x4 transforms and implicit flat scaling matrices"
-                .into(),
-        ));
-    }
     let mut modes = [0_u8; 16];
     for (block_index, mode) in modes.iter_mut().enumerate() {
         let predicted = buffer.predicted_intra4_mode(macroblock_address, block_index);
@@ -3855,7 +4458,6 @@ fn decode_intra16x16(
     macroblock_type: u32,
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
-    flat_scaling_only: bool,
 ) -> Result<()> {
     buffer.mark_intra(macroblock_address);
     let intra16x16_pred_mode = (macroblock_type - 1) % 4;
@@ -3871,14 +4473,12 @@ fn decode_intra16x16(
     *luma_qp = (*luma_qp + mb_qp_delta).rem_euclid(52);
     let n_c = buffer.intra16_dc_nc(macroblock_address);
     let dc_levels = decode_residual_block(&mut reader.bits, n_c, 16)?;
-    let mut has_nonzero_residual = dc_levels.total_coeff != 0;
     let mut ac_levels: [Vec<i32>; 16] = std::array::from_fn(|_| vec![0; 15]);
     if coded_block_pattern_luma != 0 {
         for (block_index, levels) in ac_levels.iter_mut().enumerate() {
             let n_c = buffer.luma_nc(macroblock_address, block_index);
             let decoded = decode_residual_block(&mut reader.bits, n_c, 15)?;
             *levels = decoded.coefficients;
-            has_nonzero_residual |= decoded.total_coeff != 0;
             buffer.set_luma_nonzero(macroblock_address, block_index, decoded.total_coeff);
         }
     } else {
@@ -3889,7 +4489,6 @@ fn decode_intra16x16(
         for levels in &mut chroma_dc {
             let decoded = decode_residual_block(&mut reader.bits, -1, 4)?;
             *levels = decoded.coefficients;
-            has_nonzero_residual |= decoded.total_coeff != 0;
         }
     }
     let mut chroma_blocks: ChromaAcLevels =
@@ -3900,7 +4499,6 @@ fn decode_intra16x16(
                 let n_c = buffer.chroma_nc(macroblock_address, component, block_index);
                 let decoded = decode_residual_block(&mut reader.bits, n_c, 15)?;
                 *levels = decoded.coefficients;
-                has_nonzero_residual |= decoded.total_coeff != 0;
                 buffer.set_chroma_nonzero(
                     macroblock_address,
                     component,
@@ -3911,12 +4509,6 @@ fn decode_intra16x16(
         }
     } else {
         buffer.mark_zero_chroma_ac(macroblock_address);
-    }
-    if has_nonzero_residual && !flat_scaling_only {
-        return Err(Error::Unsupported(
-            "native H.264 residual reconstruction currently requires a profile with implicit flat scaling matrices"
-                .into(),
-        ));
     }
     buffer.predict_intra16_macroblock(
         macroblock_address,
@@ -3962,10 +4554,6 @@ fn validate_native_profile(sps: &Sps, pps: &Pps) -> Result<()> {
     Ok(())
 }
 
-const fn uses_flat_4x4_scaling(sps: &Sps, pps: &Pps) -> bool {
-    !sps.scaling_matrix_present && !pps.scaling_matrix_present && !pps.transform_8x8_mode
-}
-
 struct FrameBuffer {
     coded_width: usize,
     coded_height: usize,
@@ -3979,12 +4567,14 @@ struct FrameBuffer {
     motion: Vec<[MotionInfo; 16]>,
     motion_available: Vec<[bool; 16]>,
     macroblock_intra: Vec<bool>,
+    transform_8x8: Vec<bool>,
     transform_bypass_at_qp_zero: bool,
     chroma_intra_modes: Vec<Option<u8>>,
+    scaling_matrices: ScalingMatrices,
 }
 
 impl FrameBuffer {
-    fn new(sps: &Sps) -> Result<Self> {
+    fn new(sps: &Sps, pps: &Pps) -> Result<Self> {
         let coded_width = usize::try_from(sps.coded_width)
             .map_err(|_| Error::InvalidData("H.264 coded width overflows".into()))?;
         let coded_height = usize::try_from(sps.coded_height)
@@ -4011,13 +4601,20 @@ impl FrameBuffer {
             motion: vec![[MotionInfo::default(); 16]; macroblock_count],
             motion_available: vec![[false; 16]; macroblock_count],
             macroblock_intra: vec![false; macroblock_count],
+            transform_8x8: vec![false; macroblock_count],
             transform_bypass_at_qp_zero: sps.qpprime_y_zero_transform_bypass,
             chroma_intra_modes: vec![None; macroblock_count],
+            scaling_matrices: pps.resolve_scaling_matrices(sps),
         })
     }
 
-    fn from_reference(sps: &Sps, reference: &ReferenceFrame, luma_qp: i32) -> Result<Self> {
-        let mut buffer = Self::new(sps)?;
+    fn from_reference(
+        sps: &Sps,
+        pps: &Pps,
+        reference: &ReferenceFrame,
+        luma_qp: i32,
+    ) -> Result<Self> {
+        let mut buffer = Self::new(sps, pps)?;
         if reference.coded_width != buffer.coded_width
             || reference.coded_height != buffer.coded_height
             || reference.luma.len() != buffer.luma.len()
@@ -4475,9 +5072,53 @@ impl FrameBuffer {
         let residual = if self.transform_bypass_at_qp_zero && qp == 0 {
             transform_bypass_residual_4x4(levels, mode)?
         } else {
-            transform_residual_4x4(levels, qp, false)?
+            transform_residual_4x4(levels, qp, false, &self.scaling_matrices.four_by_four[0])?
         };
         add_residual_block(
+            &mut self.luma,
+            self.coded_width,
+            origin_x,
+            origin_y,
+            &residual,
+        );
+        Ok(())
+    }
+
+    fn reconstruct_intra8_luma_block(
+        &mut self,
+        address: usize,
+        group: usize,
+        mode: u8,
+        levels: &[i32],
+        qp: i32,
+    ) -> Result<()> {
+        let macroblocks_wide = self.coded_width / 16;
+        let macroblock_x = address % macroblocks_wide;
+        let macroblock_y = address / macroblocks_wide;
+        let origin_x = macroblock_x * 16 + (group % 2) * 8;
+        let origin_y = macroblock_y * 16 + (group / 2) * 8;
+        let prediction = predict_intra8_block(
+            &self.luma,
+            self.coded_width,
+            origin_x,
+            origin_y,
+            group,
+            mode,
+        )?;
+        place_block(
+            &mut self.luma,
+            self.coded_width,
+            origin_x,
+            origin_y,
+            8,
+            &prediction,
+        );
+        let levels: &[i32; 64] = levels
+            .try_into()
+            .map_err(|_| Error::InvalidData("invalid H.264 Intra8x8 coefficient count".into()))?;
+        let residual =
+            transform_residual_8x8(levels, qp, &self.scaling_matrices.eight_by_eight[0])?;
+        add_residual_block_8x8(
             &mut self.luma,
             self.coded_width,
             origin_x,
@@ -4494,7 +5135,8 @@ impl FrameBuffer {
         ac_levels: &[Vec<i32>; 16],
         luma_qp: i32,
     ) -> Result<()> {
-        let dc_values = transform_intra16_luma_dc(dc_levels, luma_qp)?;
+        let scaling_list = &self.scaling_matrices.four_by_four[0];
+        let dc_values = transform_intra16_luma_dc(dc_levels, luma_qp, scaling_list)?;
         let macroblocks_wide = self.coded_width / 16;
         let macroblock_x = address % macroblocks_wide;
         let macroblock_y = address / macroblocks_wide;
@@ -4504,7 +5146,7 @@ impl FrameBuffer {
                 coefficients[0] = dc_values[block_y * 4 + block_x];
                 let block_index = luma_block_index(block_x, block_y);
                 coefficients[1..].copy_from_slice(&ac_levels[block_index]);
-                let residual = transform_residual_4x4(&coefficients, luma_qp, true)?;
+                let residual = transform_residual_4x4(&coefficients, luma_qp, true, scaling_list)?;
                 let origin_x = macroblock_x * 16 + block_x * 4;
                 let origin_y = macroblock_y * 16 + block_y * 4;
                 add_residual_block(
@@ -4536,7 +5178,12 @@ impl FrameBuffer {
             let residual = if self.transform_bypass_at_qp_zero && qp == 0 {
                 transform_bypass_residual_4x4(coefficients, 2)?
             } else {
-                transform_residual_4x4(coefficients, qp, false)?
+                transform_residual_4x4(
+                    coefficients,
+                    qp,
+                    false,
+                    &self.scaling_matrices.four_by_four[3],
+                )?
             };
             let (block_x, block_y) = luma_block_position(block_index);
             add_residual_block(
@@ -4544,6 +5191,33 @@ impl FrameBuffer {
                 self.coded_width,
                 macroblock_x * 16 + block_x * 4,
                 macroblock_y * 16 + block_y * 4,
+                &residual,
+            );
+        }
+        Ok(())
+    }
+
+    fn add_luma_residual_8x8_blocks(
+        &mut self,
+        address: usize,
+        levels: &[Vec<i32>; 4],
+        qp: i32,
+    ) -> Result<()> {
+        let macroblocks_wide = self.coded_width / 16;
+        let macroblock_x = address % macroblocks_wide;
+        let macroblock_y = address / macroblocks_wide;
+        for (group, block_levels) in levels.iter().enumerate() {
+            let coefficients: &[i32; 64] = block_levels
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidData("invalid H.264 8x8 coefficient count".into()))?;
+            let residual =
+                transform_residual_8x8(coefficients, qp, &self.scaling_matrices.eight_by_eight[1])?;
+            add_residual_block_8x8(
+                &mut self.luma,
+                self.coded_width,
+                macroblock_x * 16 + (group % 2) * 8,
+                macroblock_y * 16 + (group / 2) * 8,
                 &residual,
             );
         }
@@ -4567,14 +5241,16 @@ impl FrameBuffer {
             _ => 2,
         });
         let bypass = self.transform_bypass_at_qp_zero && qp == 0;
+        let matrix_base = if self.macroblock_intra[address] { 0 } else { 3 };
         for (component, plane) in [&mut self.cb, &mut self.cr].into_iter().enumerate() {
+            let scaling_list = &self.scaling_matrices.four_by_four[matrix_base + component + 1];
             let dc_values = if bypass {
                 dc_levels[component]
                     .as_slice()
                     .try_into()
                     .map_err(|_| Error::InvalidData("invalid H.264 chroma DC count".into()))?
             } else {
-                transform_chroma_dc(&dc_levels[component], qp)?
+                transform_chroma_dc(&dc_levels[component], qp, scaling_list)?
             };
             let mut residuals = [[0_i32; 16]; 4];
             for block_index in 0..4 {
@@ -4584,7 +5260,7 @@ impl FrameBuffer {
                 residuals[block_index] = if bypass {
                     transform_bypass_residual_4x4(&coefficients, bypass_mode)?
                 } else {
-                    transform_residual_4x4(&coefficients, qp, true)?
+                    transform_residual_4x4(&coefficients, qp, true, scaling_list)?
                 };
             }
             if bypass {
@@ -4605,7 +5281,7 @@ impl FrameBuffer {
         Ok(())
     }
 
-    fn deblock(&mut self, chroma_qp_offset: i32, params: DeblockingParameters) -> Result<()> {
+    fn deblock(&mut self, chroma_qp_offsets: [i32; 2], params: DeblockingParameters) -> Result<()> {
         filter_picture(
             &mut DeblockingPicture {
                 luma: &mut self.luma,
@@ -4614,9 +5290,10 @@ impl FrameBuffer {
                 coded_width: self.coded_width,
                 coded_height: self.coded_height,
                 luma_qp: &self.luma_qp,
-                chroma_qp_offset_cb: chroma_qp_offset,
-                chroma_qp_offset_cr: chroma_qp_offset,
+                chroma_qp_offset_cb: chroma_qp_offsets[0],
+                chroma_qp_offset_cr: chroma_qp_offsets[1],
                 macroblock_intra: &self.macroblock_intra,
+                transform_8x8: &self.transform_8x8,
                 luma_nonzero: &self.luma_nonzero,
                 motion: &self.motion,
             },
@@ -4695,6 +5372,285 @@ const fn luma_block_position(index: usize) -> (usize, usize) {
 
 const fn luma_block_index(x: usize, y: usize) -> usize {
     (y / 2) * 8 + (x / 2) * 4 + (y % 2) * 2 + x % 2
+}
+
+#[allow(clippy::too_many_lines)]
+fn predict_intra8_block(
+    plane: &[u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    group: usize,
+    mode: u8,
+) -> Result<Vec<u8>> {
+    let top = (origin_y > 0).then(|| {
+        let mut samples = [0_u8; 16];
+        for x in 0..8 {
+            samples[x] = plane[(origin_y - 1) * stride + origin_x + x];
+        }
+        for x in 8..16 {
+            samples[x] = if group % 2 == 1 || origin_x + x >= stride {
+                samples[7]
+            } else {
+                plane[(origin_y - 1) * stride + origin_x + x]
+            };
+        }
+        samples
+    });
+    let left = (origin_x > 0).then(|| {
+        let mut samples = [0_u8; 8];
+        for y in 0..8 {
+            samples[y] = plane[(origin_y + y) * stride + origin_x - 1];
+        }
+        samples
+    });
+    let corner =
+        (origin_x > 0 && origin_y > 0).then(|| plane[(origin_y - 1) * stride + origin_x - 1]);
+    let (top, left, corner) = filter_intra8_neighbors(top, left, corner);
+    let mut output = vec![0_u8; 64];
+    match mode {
+        0 => {
+            let top = top.ok_or_else(|| {
+                Error::InvalidData("H.264 Intra8x8 vertical top samples are unavailable".into())
+            })?;
+            for row in output.as_chunks_mut::<8>().0 {
+                row.copy_from_slice(&top[..8]);
+            }
+        }
+        1 => {
+            let left = left.ok_or_else(|| {
+                Error::InvalidData("H.264 Intra8x8 horizontal left samples are unavailable".into())
+            })?;
+            for (row, sample) in output.as_chunks_mut::<8>().0.iter_mut().zip(left) {
+                row.fill(sample);
+            }
+        }
+        2 => output.copy_from_slice(&dc_prediction(
+            top.as_ref().map(|value| &value[..8]),
+            left.as_ref().map(<[u8; 8]>::as_slice),
+            8,
+        )),
+        3 => {
+            let top = top.ok_or_else(|| {
+                Error::InvalidData(
+                    "H.264 Intra8x8 diagonal-down-left samples are unavailable".into(),
+                )
+            })?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    output[y * 8 + x] = if x == 7 && y == 7 {
+                        average_1_3(top[14], top[15])
+                    } else {
+                        filter_1_2_1(top[x + y], top[x + y + 1], top[x + y + 2])
+                    };
+                }
+            }
+        }
+        4 => {
+            let top = require_intra8(top, "diagonal-down-right top")?;
+            let left = require_intra8(left, "diagonal-down-right left")?;
+            let corner = corner.ok_or_else(|| {
+                Error::InvalidData("H.264 Intra8x8 diagonal-down-right corner unavailable".into())
+            })?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    output[usize::try_from(y * 8 + x).expect("Intra8 index fits")] = match x.cmp(&y)
+                    {
+                        std::cmp::Ordering::Greater => filter_1_2_1(
+                            top_or_corner_8(top, corner, x - y - 2),
+                            top_or_corner_8(top, corner, x - y - 1),
+                            top_or_corner_8(top, corner, x - y),
+                        ),
+                        std::cmp::Ordering::Less => filter_1_2_1(
+                            left_or_corner_8(left, corner, y - x - 2),
+                            left_or_corner_8(left, corner, y - x - 1),
+                            left_or_corner_8(left, corner, y - x),
+                        ),
+                        std::cmp::Ordering::Equal => filter_1_2_1(top[0], corner, left[0]),
+                    };
+                }
+            }
+        }
+        5 => predict_vertical_right_8(&mut output, top, left, corner)?,
+        6 => predict_horizontal_down_8(&mut output, top, left, corner)?,
+        7 => {
+            let top = require_intra8(top, "vertical-left top")?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let start = x + y / 2;
+                    output[y * 8 + x] = if y.is_multiple_of(2) {
+                        average(top[start], top[start + 1])
+                    } else {
+                        filter_1_2_1(top[start], top[start + 1], top[start + 2])
+                    };
+                }
+            }
+        }
+        8 => {
+            let left = require_intra8(left, "horizontal-up left")?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let z = x + 2 * y;
+                    output[y * 8 + x] = match z.cmp(&13) {
+                        std::cmp::Ordering::Less if z.is_multiple_of(2) => {
+                            average(left[z / 2], left[z / 2 + 1])
+                        }
+                        std::cmp::Ordering::Less => {
+                            filter_1_2_1(left[z / 2], left[z / 2 + 1], left[z / 2 + 2])
+                        }
+                        std::cmp::Ordering::Equal => filter_1_2_1(left[6], left[7], left[7]),
+                        std::cmp::Ordering::Greater => left[7],
+                    };
+                }
+            }
+        }
+        _ => {
+            return Err(Error::InvalidData(format!(
+                "invalid H.264 Intra8x8 prediction mode {mode}"
+            )));
+        }
+    }
+    Ok(output)
+}
+
+fn filter_intra8_neighbors(
+    top: Option<[u8; 16]>,
+    left: Option<[u8; 8]>,
+    corner: Option<u8>,
+) -> (Option<[u8; 16]>, Option<[u8; 8]>, Option<u8>) {
+    let filtered_corner = match (top, left, corner) {
+        (Some(top), Some(left), Some(corner)) => Some(filter_1_2_1(left[0], corner, top[0])),
+        (_, _, value) => value,
+    };
+    let filtered_top = top.map(|samples| {
+        let mut filtered = [0_u8; 16];
+        filtered[0] = corner.map_or_else(
+            || average_1_3(samples[1], samples[0]),
+            |corner| filter_1_2_1(corner, samples[0], samples[1]),
+        );
+        for index in 1..15 {
+            filtered[index] = filter_1_2_1(samples[index - 1], samples[index], samples[index + 1]);
+        }
+        filtered[15] = average_1_3(samples[14], samples[15]);
+        filtered
+    });
+    let filtered_left = left.map(|samples| {
+        let mut filtered = [0_u8; 8];
+        filtered[0] = corner.map_or_else(
+            || average_1_3(samples[1], samples[0]),
+            |corner| filter_1_2_1(corner, samples[0], samples[1]),
+        );
+        for index in 1..7 {
+            filtered[index] = filter_1_2_1(samples[index - 1], samples[index], samples[index + 1]);
+        }
+        filtered[7] = average_1_3(samples[6], samples[7]);
+        filtered
+    });
+    (filtered_top, filtered_left, filtered_corner)
+}
+
+fn require_intra8<const N: usize>(samples: Option<[u8; N]>, name: &str) -> Result<[u8; N]> {
+    samples.ok_or_else(|| Error::InvalidData(format!("H.264 Intra8x8 {name} unavailable")))
+}
+
+fn top_or_corner_8(top: [u8; 16], corner: u8, index: i32) -> u8 {
+    if index < 0 {
+        corner
+    } else {
+        top[usize::try_from(index).expect("bounded Intra8 top index")]
+    }
+}
+
+fn left_or_corner_8(left: [u8; 8], corner: u8, index: i32) -> u8 {
+    if index < 0 {
+        corner
+    } else {
+        left[usize::try_from(index).expect("bounded Intra8 left index")]
+    }
+}
+
+fn predict_vertical_right_8(
+    output: &mut [u8],
+    top: Option<[u8; 16]>,
+    left: Option<[u8; 8]>,
+    corner: Option<u8>,
+) -> Result<()> {
+    let top = require_intra8(top, "vertical-right top")?;
+    let left = require_intra8(left, "vertical-right left")?;
+    let corner = corner.ok_or_else(|| {
+        Error::InvalidData("H.264 Intra8x8 vertical-right corner unavailable".into())
+    })?;
+    for y in 0..8_i32 {
+        for x in 0..8_i32 {
+            let z = 2 * x - y;
+            let value = if z >= 0 {
+                if z % 2 == 0 {
+                    average(
+                        top_or_corner_8(top, corner, x - y / 2 - 1),
+                        top_or_corner_8(top, corner, x - y / 2),
+                    )
+                } else {
+                    filter_1_2_1(
+                        top_or_corner_8(top, corner, x - y / 2 - 2),
+                        top_or_corner_8(top, corner, x - y / 2 - 1),
+                        top_or_corner_8(top, corner, x - y / 2),
+                    )
+                }
+            } else if z == -1 {
+                filter_1_2_1(left[0], corner, top[0])
+            } else {
+                filter_1_2_1(
+                    left_or_corner_8(left, corner, y - 2 * x - 1),
+                    left_or_corner_8(left, corner, y - 2 * x - 2),
+                    left_or_corner_8(left, corner, y - 2 * x - 3),
+                )
+            };
+            output[usize::try_from(y * 8 + x).expect("Intra8 index fits")] = value;
+        }
+    }
+    Ok(())
+}
+
+fn predict_horizontal_down_8(
+    output: &mut [u8],
+    top: Option<[u8; 16]>,
+    left: Option<[u8; 8]>,
+    corner: Option<u8>,
+) -> Result<()> {
+    let top = require_intra8(top, "horizontal-down top")?;
+    let left = require_intra8(left, "horizontal-down left")?;
+    let corner = corner.ok_or_else(|| {
+        Error::InvalidData("H.264 Intra8x8 horizontal-down corner unavailable".into())
+    })?;
+    for y in 0..8_i32 {
+        for x in 0..8_i32 {
+            let z = 2 * y - x;
+            let value = if z >= 0 {
+                if z % 2 == 0 {
+                    average(
+                        left_or_corner_8(left, corner, y - x / 2 - 1),
+                        left_or_corner_8(left, corner, y - x / 2),
+                    )
+                } else {
+                    filter_1_2_1(
+                        left_or_corner_8(left, corner, y - x / 2 - 2),
+                        left_or_corner_8(left, corner, y - x / 2 - 1),
+                        left_or_corner_8(left, corner, y - x / 2),
+                    )
+                }
+            } else if z == -1 {
+                filter_1_2_1(top[0], corner, left[0])
+            } else {
+                filter_1_2_1(
+                    top_or_corner_8(top, corner, x - 2 * y - 1),
+                    top_or_corner_8(top, corner, x - 2 * y - 2),
+                    top_or_corner_8(top, corner, x - 2 * y - 3),
+                )
+            };
+            output[usize::try_from(y * 8 + x).expect("Intra8 index fits")] = value;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5125,6 +6081,73 @@ const ZIG_ZAG_4X4: [(usize, usize); 16] = [
     (3, 3),
 ];
 
+const ZIG_ZAG_8X8: [(usize, usize); 64] = [
+    (0, 0),
+    (0, 1),
+    (1, 0),
+    (2, 0),
+    (1, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (2, 1),
+    (3, 0),
+    (4, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 4),
+    (0, 5),
+    (1, 4),
+    (2, 3),
+    (3, 2),
+    (4, 1),
+    (5, 0),
+    (6, 0),
+    (5, 1),
+    (4, 2),
+    (3, 3),
+    (2, 4),
+    (1, 5),
+    (0, 6),
+    (0, 7),
+    (1, 6),
+    (2, 5),
+    (3, 4),
+    (4, 3),
+    (5, 2),
+    (6, 1),
+    (7, 0),
+    (7, 1),
+    (6, 2),
+    (5, 3),
+    (4, 4),
+    (3, 5),
+    (2, 6),
+    (1, 7),
+    (2, 7),
+    (3, 6),
+    (4, 5),
+    (5, 4),
+    (6, 3),
+    (7, 2),
+    (7, 3),
+    (6, 4),
+    (5, 5),
+    (4, 6),
+    (3, 7),
+    (4, 7),
+    (5, 6),
+    (6, 5),
+    (7, 4),
+    (7, 5),
+    (6, 6),
+    (5, 7),
+    (6, 7),
+    (7, 6),
+    (7, 7),
+];
+
 const HADAMARD_4X4: [[i64; 4]; 4] = [[1, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
 
 fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
@@ -5139,7 +6162,7 @@ fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
     }
 }
 
-fn transform_chroma_dc(levels: &[i32], qp: i32) -> Result<[i32; 4]> {
+fn transform_chroma_dc(levels: &[i32], qp: i32, scaling_list: &[u8; 16]) -> Result<[i32; 4]> {
     if levels.len() != 4 || !(0..=39).contains(&qp) {
         return Err(Error::InvalidData(
             "invalid H.264 4:2:0 chroma DC transform input".into(),
@@ -5157,7 +6180,7 @@ fn transform_chroma_dc(levels: &[i32], qp: i32) -> Result<[i32; 4]> {
         c[0] + c[1] - c[2] - c[3],
         c[0] - c[1] - c[2] + c[3],
     ];
-    let scale = i64::from(level_scale_4x4(qp, 0, 0));
+    let scale = i64::from(level_scale_4x4(qp, 0, 0, scaling_list));
     let mut output = [0_i32; 4];
     for (destination, value) in output.iter_mut().zip(f) {
         let scaled = ((value * scale) << (qp / 6)) >> 5;
@@ -5167,7 +6190,11 @@ fn transform_chroma_dc(levels: &[i32], qp: i32) -> Result<[i32; 4]> {
     Ok(output)
 }
 
-fn transform_intra16_luma_dc(levels: &[i32], qp: i32) -> Result<[i32; 16]> {
+fn transform_intra16_luma_dc(
+    levels: &[i32],
+    qp: i32,
+    scaling_list: &[u8; 16],
+) -> Result<[i32; 16]> {
     if levels.len() != 16 || !(0..=51).contains(&qp) {
         return Err(Error::InvalidData(
             "invalid H.264 Intra16 luma DC transform input".into(),
@@ -5186,7 +6213,7 @@ fn transform_intra16_luma_dc(levels: &[i32], qp: i32) -> Result<[i32; 16]> {
         }
     }
     let mut output = [0_i32; 16];
-    let scale = i64::from(level_scale_4x4(qp, 0, 0));
+    let scale = i64::from(level_scale_4x4(qp, 0, 0, scaling_list));
     for row in 0..4 {
         for column in 0..4 {
             let transformed: i64 = (0..4)
@@ -5209,6 +6236,7 @@ fn transform_residual_4x4(
     levels: &[i32; 16],
     qp: i32,
     dc_already_scaled: bool,
+    scaling_list: &[u8; 16],
 ) -> Result<[i32; 16]> {
     if !(0..=51).contains(&qp) {
         return Err(Error::InvalidData("invalid H.264 luma QP".into()));
@@ -5219,7 +6247,7 @@ fn transform_residual_4x4(
         scaled[row * 4 + column] = if index == 0 && dc_already_scaled {
             value
         } else {
-            let scale = i64::from(level_scale_4x4(qp, row, column));
+            let scale = i64::from(level_scale_4x4(qp, row, column, scaling_list));
             if qp >= 24 {
                 (value * scale) << (qp / 6 - 4)
             } else {
@@ -5251,6 +6279,109 @@ fn transform_residual_4x4(
         }
     }
     Ok(output)
+}
+
+fn transform_residual_8x8(
+    levels: &[i32; 64],
+    qp: i32,
+    scaling_list: &[u8; 64],
+) -> Result<[i32; 64]> {
+    if !(0..=51).contains(&qp) {
+        return Err(Error::InvalidData("invalid H.264 luma QP".into()));
+    }
+    let mut scaled = [0_i64; 64];
+    for (index, &(row, column)) in ZIG_ZAG_8X8.iter().enumerate() {
+        let scale = i64::from(level_scale_8x8(qp, row, column, scaling_list));
+        let value = i64::from(levels[index]) * scale;
+        let shift = qp / 6;
+        scaled[row * 8 + column] = if shift >= 6 {
+            value << (shift - 6)
+        } else {
+            (value + (1_i64 << (5 - shift))) >> (6 - shift)
+        };
+    }
+    scaled[0] += 32;
+    let mut horizontal = [0_i64; 64];
+    for row in 0..8 {
+        inverse_transform_8(
+            &scaled[row * 8..row * 8 + 8],
+            &mut horizontal[row * 8..row * 8 + 8],
+        );
+    }
+    let mut transformed = [0_i64; 64];
+    for column in 0..8 {
+        let input: [i64; 8] = std::array::from_fn(|row| horizontal[row * 8 + column]);
+        let mut output = [0_i64; 8];
+        inverse_transform_8(&input, &mut output);
+        for row in 0..8 {
+            transformed[row * 8 + column] = output[row];
+        }
+    }
+    let mut residual = [0_i32; 64];
+    for (destination, value) in residual.iter_mut().zip(transformed) {
+        *destination = i32::try_from(value >> 6)
+            .map_err(|_| Error::InvalidData("H.264 8x8 residual sample overflows".into()))?;
+    }
+    Ok(residual)
+}
+
+fn inverse_transform_8(input: &[i64], output: &mut [i64]) {
+    let a0 = input[0] + input[4];
+    let a2 = input[0] - input[4];
+    let a4 = (input[2] >> 1) - input[6];
+    let a6 = input[2] + (input[6] >> 1);
+    let b0 = a0 + a6;
+    let b2 = a2 + a4;
+    let b4 = a2 - a4;
+    let b6 = a0 - a6;
+    let a1 = -input[3] + input[5] - input[7] - (input[7] >> 1);
+    let a3 = input[1] + input[7] - input[3] - (input[3] >> 1);
+    let a5 = -input[1] + input[7] + input[5] + (input[5] >> 1);
+    let a7 = input[3] + input[5] + input[1] + (input[1] >> 1);
+    let b1 = a1 + (a7 >> 2);
+    let b7 = a7 - (a1 >> 2);
+    let b3 = a3 + (a5 >> 2);
+    let b5 = (a3 >> 2) - a5;
+    output.copy_from_slice(&[
+        b0 + b7,
+        b2 + b5,
+        b4 + b3,
+        b6 + b1,
+        b6 - b1,
+        b4 - b3,
+        b2 - b5,
+        b0 - b7,
+    ]);
+}
+
+fn level_scale_8x8(qp: i32, row: usize, column: usize, scaling_list: &[u8; 64]) -> i32 {
+    const NORM_ADJUST: [[i32; 6]; 6] = [
+        [20, 18, 32, 19, 25, 24],
+        [22, 19, 35, 21, 28, 26],
+        [26, 23, 42, 24, 33, 31],
+        [28, 25, 45, 26, 35, 33],
+        [32, 28, 51, 30, 40, 38],
+        [36, 32, 58, 34, 46, 43],
+    ];
+    let row_mod = row % 4;
+    let column_mod = column % 4;
+    let category = match (row_mod.is_multiple_of(2), column_mod.is_multiple_of(2)) {
+        (false, false) => 1,
+        (false, true) | (true, false) => {
+            if row_mod == 2 || column_mod == 2 {
+                5
+            } else {
+                3
+            }
+        }
+        (true, true) => match (row_mod, column_mod) {
+            (0, 0) => 0,
+            (2, 2) => 2,
+            _ => 4,
+        },
+    };
+    NORM_ADJUST[usize::try_from(qp % 6).expect("non-negative QP")][category]
+        * i32::from(scaling_list[row * 8 + column])
 }
 
 fn transform_bypass_residual_4x4(levels: &[i32; 16], intra_mode: u8) -> Result<[i32; 16]> {
@@ -5334,7 +6465,7 @@ fn continue_transform_bypass_chroma(residuals: &mut [[i32; 16]; 4], intra_mode: 
     Ok(())
 }
 
-fn level_scale_4x4(qp: i32, row: usize, column: usize) -> i32 {
+fn level_scale_4x4(qp: i32, row: usize, column: usize, scaling_list: &[u8; 16]) -> i32 {
     const NORM_ADJUST: [[i32; 3]; 6] = [
         [10, 16, 13],
         [11, 18, 14],
@@ -5350,7 +6481,8 @@ fn level_scale_4x4(qp: i32, row: usize, column: usize) -> i32 {
     } else {
         2
     };
-    NORM_ADJUST[usize::try_from(qp % 6).expect("non-negative QP")][category] * 16
+    NORM_ADJUST[usize::try_from(qp % 6).expect("non-negative QP")][category]
+        * i32::from(scaling_list[row * 4 + column])
 }
 
 fn add_residual_block(
@@ -5364,6 +6496,22 @@ fn add_residual_block(
         for x in 0..4 {
             let index = (origin_y + y) * stride + origin_x + x;
             let value = i32::from(plane[index]) + residual[y * 4 + x];
+            plane[index] = u8::try_from(value.clamp(0, 255)).expect("clamped luma sample fits u8");
+        }
+    }
+}
+
+fn add_residual_block_8x8(
+    plane: &mut [u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    residual: &[i32; 64],
+) {
+    for y in 0..8 {
+        for x in 0..8 {
+            let index = (origin_y + y) * stride + origin_x + x;
+            let value = i32::from(plane[index]) + residual[y * 8 + x];
             plane[index] = u8::try_from(value.clamp(0, 255)).expect("clamped luma sample fits u8");
         }
     }
