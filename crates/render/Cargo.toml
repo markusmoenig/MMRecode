@@ -14,6 +14,7 @@ mpeg2 = ["dep:mmrecode-mpeg2"]
 mpegts = ["mpeg2", "dep:mmrecode-mpegaudio", "dep:mmrecode-mpegts"]
 
 [dependencies]
+image.workspace = true
 mmrecode-core.workspace = true
 mmrecode-edit.workspace = true
 mmrecode-mpegaudio = { workspace = true, optional = true }

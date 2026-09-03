@@ -27,7 +27,7 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-testkit`: reusable verification support for codec crates
 - `mmrecode-capi`: experimental C ABI with an owned-buffer boundary
 - `mmrecode-viewer`: native visual inspection and synchronized playback tool
-- `mmrecode-cli`: the `mmrecode` command-line application
+- `mmrecode`: the main terminal editor and codec-tool application
 
 ## Status
 
@@ -40,7 +40,8 @@ The first codec-independent editing slice is implemented in `mmrecode-edit` and
 `mmrecode-render`. The project and every media node now expose an ordered local timeline of linked
 child media without artificial track/folder levels. Stable media and placement identities support
 recursive paths, aliases, reuse, cycle rejection, exact local source/timeline ranges, and typed
-`cd`/`ls`/`add`/`in`/`out` commands with undo/redo. `mmrecode edit` and `mmrecode edit <script>`
+project lifecycle, `import`/`cd`/`ls`/`add`/`in`/`out` commands with undo/redo. `mmrecode edit` and
+`mmrecode edit <script>`
 share one parser and session. The existing flattened intent validates sources, streams, tracks,
 clips, time ranges, effects, transitions, and output intent, then plans and executes packet-aligned
 cuts and concatenation for independently coded video. The executor preserves encoded payloads and side data while rebasing PTS/DTS and
@@ -57,11 +58,12 @@ path for those packets plus optional MPEG-1 Layer II audio. It reports copied/re
 uses an explicit exact/contained/cover complete-audio-frame policy; the resulting A/V transport is
 validated by native demux/decode and FFmpeg. Bridge encoding now preserves aspect, display/colour,
 profile/level, and all four quantizer matrices; recomputes closed-GOP timecode from the source
-origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Project persistence,
-graph-to-render compilation, editor-session preview integration, sample-level audio editing,
-multi-clip audio, transitions, and production VBV continuity remain
-subsequent slices. Existing long-form render commands are development harnesses; the intended
-editor surface is a shared typed command language for script and interactive terminal modes.
+origin; and reports deliberate bitrate, VBV-buffer, and picture-delay rewrites. Versioned project
+persistence and the first one-root-placement graph-to-render compiler are implemented; recursive
+composition compilation, sample-level audio editing, multi-clip audio, transitions, and production
+VBV continuity remain subsequent slices. Existing long-form render commands are development
+harnesses; the intended editor surface is a shared typed command language for script and
+interactive terminal modes.
 
 The second codec slice is implemented in `mmrecode-dv`. It recognizes
 525/60 and 625/50 DV25, indexes and validates every 80-byte DIF block, retains subcode/VAUX/AAUX
@@ -98,40 +100,40 @@ licensing, sizes, and SHA-256 digests recorded in corpus manifests.
 ## Try it
 
 ```sh
-cargo run -p mmrecode-cli -- inspect testdata/jpeg/valid/baseline-420.jpg
-cargo run -p mmrecode-cli -- inspect testdata/dv/valid/dv25-525-60-one-frame.dv
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- inspect testdata/jpeg/valid/baseline-420.jpg
+cargo run -p mmrecode -- inspect testdata/dv/valid/dv25-525-60-one-frame.dv
+cargo run -p mmrecode -- \
   inspect testdata/mpeg2/valid/main-ml-progressive-ibp.m2v
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   plan-mpeg2 testdata/mpeg2/valid/main-ml-progressive-open-gop.m2v 9 10
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   decode testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode-mpeg2.y4m
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   render-plan testdata/mpeg2/valid/main-ml-progressive-ibp.m2v \
   --replace 3 /tmp/replacement.y4m \
   --audio testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2 --audio-end exact
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   render testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode-render.ts \
   --replace 3 /tmp/replacement.y4m \
   --audio testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2 --audio-end exact
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   encode-mpeg2 /tmp/mmrecode-mpeg2.y4m /tmp/mmrecode-roundtrip.m2v 8
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   mux-mpegts testdata/mpeg2/valid/main-ml-progressive-ibp.m2v /tmp/mmrecode.ts \
   testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2
-cargo run -p mmrecode-cli -- inspect /tmp/mmrecode.ts
-cargo run -p mmrecode-cli -- demux-mpegts /tmp/mmrecode.ts /tmp/mmrecode-extracted.m2v
-cargo run -p mmrecode-cli -- extract-mpegts-audio /tmp/mmrecode.ts /tmp/mmrecode-audio.mp2
-cargo run -p mmrecode-cli -- extract-dv-audio \
+cargo run -p mmrecode -- inspect /tmp/mmrecode.ts
+cargo run -p mmrecode -- demux-mpegts /tmp/mmrecode.ts /tmp/mmrecode-extracted.m2v
+cargo run -p mmrecode -- extract-mpegts-audio /tmp/mmrecode.ts /tmp/mmrecode-audio.mp2
+cargo run -p mmrecode -- extract-dv-audio \
   testdata/dv/valid/dv25-525-60-one-frame.dv /tmp/mmrecode-dv.s16le
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   decode testdata/dv/valid/dv25-525-60-one-frame.dv /tmp/mmrecode-dv.y4m
-cargo run -p mmrecode-cli -- encode-dv /tmp/mmrecode-dv.y4m /tmp/mmrecode-roundtrip.dv
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- encode-dv /tmp/mmrecode-dv.y4m /tmp/mmrecode-roundtrip.dv
+cargo run -p mmrecode -- \
   decode testdata/jpeg/valid/baseline-420.jpg /tmp/mmrecode-frame.y4m
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   encode testdata/y4m/valid/two-frame-420.y4m /tmp/mmrecode.mjpg 85
-cargo run -p mmrecode-cli -- \
+cargo run -p mmrecode -- \
   verify /tmp/mmrecode.mjpg testdata/y4m/valid/two-frame-420.y4m
 ```
 
@@ -148,12 +150,12 @@ The C ABI has explicit version and structure-size checks, library-owned output b
 free functions, thread-local diagnostics, and panic containment. It is usable for integration
 experiments but is not yet a compatibility promise.
 
-## Terminal preview prototype
+## Terminal preview and first editor loop
 
-The CLI now has a real terminal-graphics proof for MPEG-2 Video elementary streams and MPEG-TS:
+The CLI has a real terminal-graphics preview for MPEG-2 Video elementary streams and MPEG-TS:
 
 ```sh
-cargo run --release -p mmrecode-cli -- preview projects/output.ts
+cargo run --release -p mmrecode -- preview projects/output.ts
 ```
 
 It queries the active terminal and selects Kitty graphics, Sixel, iTerm2 images, or a portable
@@ -163,9 +165,80 @@ erase the previous image while preparing the next one. The fallback still provid
 full-colour moving preview in ordinary true-colour terminals. Space
 plays or pauses, Left/Right step, Home/End seek, `l` toggles looping, and `q` quits. MPEG-2 decoding
 and fallback terminal image resize/encoding run on separate workers, with bounded decoded-frame
-caching and buffering. The current prototype is video-only and intentionally accepts one path
-rather than exposing editor state as command-line arguments. Its backend is the experiment that
-will next be embedded into `mmrecode edit` beside the command prompt.
+caching and buffering.
+
+The same backend now powers the first real interactive editor shell. Start it without a long
+argument list (or spell out `edit`); the complete full-screen workspace appears even before media
+is loaded:
+
+```text
+$ cargo run --release -p mmrecode
+# then type in the full-screen prompt:
+Untitled > import projects/output.ts as Clip0
+Untitled > save as MyFilm
+```
+
+The empty workspace already contains the monitor, contextual help/inspector, graphical timeline,
+result area, and prompt. `import` probes the MPEG-2 ES/TS source, adds a real external media node,
+enters its placement, and fills that workspace in place. The compact monitor sits beside a
+hierarchy-aware inspector: at the root it shows project metadata; inside video it shows placement
+timing, source origin, dimensions, chroma, scan mode, frame rate, bit rate, profile, and current
+picture type. `help` restores the quick command overview, `man <command>` shows detailed help, and
+`info`, `info project`, `info video`, `info audio`, or `info source` select contextual metadata.
+A successful `in` or `out` temporarily focuses the panel on that boundary and exposes `left
+<time>` / `right <time>` follow-ups. The lower timeline now includes a time ruler, retained and
+trimmed regions, I-picture landmarks, and the playhead. Type canonical editor commands directly
+below it; for example, `in +0:10`, `out -0:10`, `undo`, and `redo`. Time is compact frame
+timecode counted from the right: `1:15` means one second and fifteen frames, `2:01:15` means two
+minutes, one second, and fifteen frames, and leading zero fields are omitted. A successful `in` or `out`
+immediately changes the playable range without unexpectedly moving an already valid playhead.
+Up/Down recalls command history and restores an unfinished draft after the newest entry. History
+is persisted across interactive MMRecode launches in the operating system's conventional
+application-state directory. Tab completes command names, `man`/`info` topics, project settings,
+project/export presets, hierarchy aliases after `cd`, and filesystem paths after `open`, `import`,
+`save as`, or `export`; paths containing spaces are quoted automatically.
+Click or drag anywhere in the timeline to scrub, or use Left/Right for one frame,
+Shift-Left/Right for ten frames, and Page Up/Page Down for roughly one second. Ctrl-Space toggles
+playback; playing while parked at the out-point restarts from the in-point. Home/End seeks to the
+edit boundaries, and Ctrl-Z/Ctrl-Y undo or redo. Ctrl-Q leaves a clean editor; unsaved projects
+must first be saved or explicitly closed with `quit --discard`.
+
+`mmrecode edit <script>` uses the same typed commands; relative media paths resolve from the script
+directory and it does not launch a terminal UI. `new`, project `open`, `save`/`save as`, media
+`import`, project presets/settings, `export plan`, and `export` share the same host requests as the
+interactive UI. Project files are readable, versioned JSON with project-relative managed origins
+and explicit external links. `save as MyFilm` writes `MyFilm.mmrecode`; the extension is always
+appended when omitted, and the initial Untitled project adopts `MyFilm` as its name. Export always
+renders the complete project-root timeline regardless of the current `cd` context. The MPEG-2/TS
+slice renders all root MPEG-2 placements, trims, positions, gaps, rate differences, and scale
+modes. A single fully compatible placement may use packet-preserving smart rendering internally;
+other supported timelines are decoded, composited in project order, re-encoded, and muxed.
+Relinking/collection, nested generated/effect composition, alpha, audio, and dedicated one-key
+adjustment modes remain subsequent slices.
+
+Project frame rate remains editable after media is placed:
+
+```text
+project match
+project set rate 25
+project set rate 30000/1001 conform time
+project set rate 24 conform frames
+```
+
+After import, `project match` adopts the focused media's video canvas, exact frame rate, pixel
+aspect, scan mode, and working color in one undoable operation. Supported container audio also
+supplies sample rate and channel count; media without supported audio leaves project audio settings
+unchanged. Root placement times are conformed to preserve presentation time.
+
+`conform time` is the default and preserves presentation time by rescaling direct root placement
+boundaries to the nearest frame at the new rate. `conform frames` preserves their integer frame
+numbers, intentionally changing presentation time. Both are undoable; source in/out ranges and
+nested media time bases remain untouched. The `mpeg2-ts` exporter packet-copies compatible input
+and automatically switches to full rendering for a source-rate or canvas mismatch. `scale fit`
+(the default), `scale fill`, `scale stretch`, and `scale native` define placement sizing. The
+current CPU render path is progressive YUV 4:2:0, supports MPEG frame rates through 60 fps and even
+canvases through 1920x1152, and does not yet mix audio. `man project`, `man scale`, and `man export`
+document the complete behavior and current boundaries.
 
 ## Visual inspection
 

@@ -115,7 +115,7 @@ fn generate_y4m(path: &Path) -> io::Result<()> {
 fn generate_with_mmrecode(input: &Path, output: &Path) -> io::Result<()> {
     command_result(
         Command::new("cargo")
-            .args(["run", "--quiet", "-p", "mmrecode-cli", "--", "encode"])
+            .args(["run", "--quiet", "-p", "mmrecode", "--", "encode"])
             .arg(input)
             .arg(output)
             .arg("85"),

@@ -16,6 +16,9 @@ use mmrecode_core::{
 };
 use mmrecode_edit::{Clip, ClipId, EditSequence, SourceId, TimeRange, Track, TrackId};
 
+mod compositor;
+pub use compositor::scale_yuv420_to_canvas;
+
 #[cfg(feature = "mpeg2")]
 mod mpeg2;
 #[cfg(feature = "mpeg2")]

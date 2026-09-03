@@ -11,10 +11,10 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 ## Suggested next milestones
 
-1. Persist the recursive media project, add managed/external media import, and compile the first
-   source-media placement into existing render intent.
-2. Integrate the capability-selected terminal preview backend into the shared command session and
-   add interactive `in`/`out` adjustment modes.
+1. Add media fingerprints, relinking, and collect/portable-copy behavior to the new versioned
+   project document, then extend timeline export recursively into nested media/effect content.
+2. Add dedicated interactive `in`/`out` adjustment modes while retaining canonical typed commands
+   underneath them.
 3. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
 4. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
    third-party plugins.
@@ -169,16 +169,54 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
   source/timeline ranges, ordered children, contextual paths, and cycle rejection.
 - [x] Add the first shared typed command/session layer and `mmrecode edit [script]` frontend with
   `pwd`, `ls`, `info`, `cd`, `add`, `in`, `out`, undo, and redo.
-- [ ] Persist a versioned project snapshot with project-relative managed media and explicit external
-  links, fingerprints, relinking, and collect/portable-copy behavior.
-- [ ] Compile recursive source-media placements into the existing flattened `EditSequence` render
-  intent.
+- [x] Add a host-resolved typed `import` request and probe real MPEG-2 ES/TS sources into an
+  undoable external media placement with its native frame time base.
+- [x] Persist a readable versioned project snapshot with resolved authoring settings, stable IDs,
+  project-relative managed media, explicit external links, atomic save, and validated load.
+- [x] Add `new`, project `open`, `save`/`save as`, `import`, project presets/settings, dirty-state
+  protection, and contextual project inspection to the shared command/host lifecycle.
+- [x] Start with a usable default Untitled project; append `.mmrecode` on save and derive its name
+  from the first Save As target without requiring a preliminary `new` command.
+- [x] Allow undoable project-rate changes after media placement with explicit time-preserving and
+  frame-number-preserving root-timeline conformance; report nearest-frame rounding without
+  rewriting source ranges.
+- [x] Add `project match` to atomically adopt the focused media's probed video and available audio
+  format, with completion, contextual discovery, persistent settings, undo, and canonical help.
+- [ ] Add media fingerprints, relinking, and collect/portable-copy behavior.
+- [x] Compile one root MPEG-2 source placement into `EditSequence`, expose a dry-run export plan,
+  and execute the existing smart-renderer plus MPEG-TS delivery through `export`.
+- [x] Automatically full-render a mismatched progressive MPEG-2 placement: timestamp-based frame
+  rate conformance, persisted fit/fill/stretch/native sizing, CPU Lanczos YUV 4:2:0 scaling,
+  bounded Main@Main/Main@High encoding, MPEG-TS delivery, and explainable `export plan` output.
+- [x] Render every root MPEG-2 placement independently of the current navigation context,
+  including sequential cuts, trims, project positions, black gaps, and opaque composition order.
+- [ ] Compile nested media/effect content recursively into the flattened render intent, including
+  alpha-aware composition rather than the current opaque-video ordering.
 - [x] Prove capability-selected Kitty, Sixel, iTerm2, and 24-bit half-block terminal preview with
   real asynchronous MPEG-2 ES/TS playback, stepping, seeking, looping, and bounded buffering.
 - [x] Add a double-buffered direct Kitty playback path for flicker-free local terminal
   video in Kitty-compatible terminals such as Ghostty.
-- [ ] Embed terminal preview in `mmrecode edit` and add interactive adjustment keymaps that emit
-  the same canonical typed trim commands.
+- [x] Make `mmrecode` / `mmrecode edit` a full-screen editor shell even with no source loaded, then
+  populate its monitor in place when `import` resolves media.
+- [x] Add a compact monitor/context/timeline layout with a time ruler, visible trim range,
+  playhead, MPEG-2 I-picture landmarks, and bounded mouse/keyboard scrubbing.
+- [x] Use compact frame timecode consistently in editor commands, listings, information, scrub
+  feedback, and the terminal timeline while retaining legacy raw-frame script input.
+- [x] Add full-screen prompt history with Up/Down navigation, duplicate suppression, and
+  restoration of an unsubmitted draft.
+- [x] Persist interactive history in the platform application-state directory and add contextual
+  Tab completion for commands, help/info topics, hierarchy aliases, and quoted project/media paths.
+- [x] Replace the fixed selection/transport panel with a hierarchy-aware inspector for project,
+  placement, video settings, and focused in/out command context.
+- [x] Turn the inspector into contextual discovery with startup/general `help`, detailed
+  `man <command>`, explicit project/video/audio/source `info`, and focused left/right trim aliases.
+- [x] Share canonical command/setting/preset vocabulary with prompt completion and add regression
+  tests that require every command and setting to remain covered by interactive documentation.
+- [ ] Add dedicated interactive adjustment keymaps/modes that emit the same canonical typed trim
+  commands, with visible mode, boundary, delta, and commit/cancel state.
+- [ ] Add an edit/full-screen-monitor view toggle over the same playback state and frame cache.
+- [ ] Evaluate a pixel-rendered 24-bit timeline layer for thumbnails, waveforms, curves, and dense
+  colored media regions while retaining terminal-native text and controls.
 - [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
 - [x] Implement the first independent-frame cut/concatenate path with DV.
@@ -305,12 +343,12 @@ test. ABI stability is not yet promised.
 ## CLI and high-level Rust API
 
 **Status:** Inspection, decode/encode, verification/comparison, DV audio extraction, MPEG-2
-planning, MPEG-TS mux/demux, and bounded one-frame `render-plan`/`render` commands exist. `edit` and
-`benchmark` remain planned.
+planning, MPEG-TS mux/demux, bounded one-frame `render-plan`/`render`, and the interactive/scripted
+terminal editor exist. `benchmark` remains planned.
 
 - [x] Add bounded MPEG-2/Layer II `render-plan` and `render` commands with replacement-frame input,
   dry-run explanation, and explicit audio-end policy.
-- [ ] Add the interactive/scripted `edit` command over a shared typed command model.
+- [x] Add the interactive/scripted `edit` command over a shared typed command model.
 - [ ] Add corpus benchmark commands and machine-readable results.
 - [ ] Add optional structured JSON output for inspection, verification, and render plans.
 - [ ] Add stdin/stdout and incremental operation where formats permit it.

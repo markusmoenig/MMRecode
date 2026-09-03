@@ -97,6 +97,15 @@ impl Encoder for Mpeg2Encoder {
             frame_rate: frame_rate_from_time_base(settings.time_base)?,
             ..Mpeg2EncodeOptions::default()
         };
+        if settings.width > 720
+            || settings.height > 576
+            || matches!(
+                options.frame_rate,
+                FrameRate::Fps50 | FrameRate::Fps59_94 | FrameRate::Fps60
+            )
+        {
+            options.sequence.profile_and_level_indication = 0x44;
+        }
         if let Some(value) = settings.options.get("gop_size") {
             options.gop_size = parse_option(value, "gop_size")?;
         }
@@ -291,5 +300,28 @@ mod tests {
             reconstruction_count += 1;
         }
         assert_eq!(reconstruction_count, 4);
+    }
+
+    #[test]
+    fn streaming_encoder_selects_high_level_for_hd_canvas() {
+        let mut encoder = Mpeg2Encoder::default();
+        encoder
+            .configure(&VideoEncoderSettings {
+                width: 1_920,
+                height: 1_080,
+                pixel_format: PixelFormat::Yuv420p8,
+                time_base: Rational::new(1, 30).unwrap(),
+                bitrate: None,
+                options: BTreeMap::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            encoder
+                .options
+                .expect("configured encoder options")
+                .sequence
+                .profile_and_level_indication,
+            0x44
+        );
     }
 }

@@ -1,6 +1,11 @@
 //! `MMRecode` command-line entry point.
 
+mod command_history;
+mod editor_export;
+mod prompt_completion;
 mod terminal_preview;
+
+use command_history::CommandHistory;
 
 fn main() {
     if let Err(error) = run() {
@@ -15,7 +20,7 @@ fn run() -> Result<(), String> {
     let _program = arguments.next();
     let command = arguments.next();
     match command.as_deref().and_then(std::ffi::OsStr::to_str) {
-        None | Some("help" | "--help" | "-h") => {
+        Some("help" | "--help" | "-h") => {
             print_help();
             Ok(())
         }
@@ -39,7 +44,7 @@ fn run() -> Result<(), String> {
         Some("demux-mpegts") => demux_mpegts_command(&mut arguments),
         Some("extract-mpegts-audio") => extract_mpegts_audio_command(&mut arguments),
         Some("preview") => terminal_preview_command(&mut arguments),
-        Some("edit") => editor_command(&mut arguments),
+        None | Some("edit") => editor_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
         Some("render-plan") => render_plan_command(&mut arguments),
         Some("render") => render_command(&mut arguments),
@@ -140,8 +145,7 @@ fn editor_command(arguments: &mut impl Iterator<Item = std::ffi::OsString>) -> R
         .and_then(std::ffi::OsStr::to_str)
         .filter(|name| !name.is_empty())
         .unwrap_or("Untitled");
-    let time_base = mmrecode_core::Rational::new(1, 25).map_err(|error| error.to_string())?;
-    let project = mmrecode_edit::MediaProject::new(project_name, time_base)
+    let project = mmrecode_edit::MediaProject::from_preset(project_name, "web-1080p30")
         .map_err(|error| error.to_string())?;
     let mut session = mmrecode_edit::EditorSession::new(project);
     if let Some(script) = script {
@@ -167,8 +171,12 @@ fn run_editor_script(
                 index + 1
             )
         })?;
-        if execute_editor_line(session, &line)
-            .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))?
+        if execute_editor_line(
+            session,
+            &line,
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))?
         {
             break;
         }
@@ -177,11 +185,19 @@ fn run_editor_script(
 }
 
 fn run_editor_interactive(session: &mut mmrecode_edit::EditorSession) -> Result<(), String> {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::{IsTerminal as _, Write as _};
 
-    println!("MMRecode linked-media editor prototype. Type 'help' for commands.");
+    let base_directory = std::env::current_dir()
+        .map_err(|error| format!("cannot read editor working directory: {error}"))?;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let mut history = CommandHistory::load_default()?;
+        let result = terminal_preview::run_editor(session, &mut history, &base_directory);
+        return result.and(history.save_default());
+    }
+
+    let mut history = CommandHistory::default();
+    println!("MMRecode linked-media editor. Type 'help' for commands.");
     let stdin = std::io::stdin();
-    let mut input = stdin.lock();
     loop {
         let prompt = session.prompt().map_err(|error| error.to_string())?;
         print!("{prompt} > ");
@@ -189,14 +205,15 @@ fn run_editor_interactive(session: &mut mmrecode_edit::EditorSession) -> Result<
             .flush()
             .map_err(|error| format!("cannot flush editor prompt: {error}"))?;
         let mut line = String::new();
-        if input
+        if stdin
             .read_line(&mut line)
             .map_err(|error| format!("cannot read editor command: {error}"))?
             == 0
         {
             break;
         }
-        match execute_editor_line(session, &line) {
+        history.record(&line);
+        match execute_editor_line(session, &line, &base_directory) {
             Ok(true) => break,
             Ok(false) => {}
             Err(error) => eprintln!("mmrecode edit: {error}"),
@@ -208,17 +225,319 @@ fn run_editor_interactive(session: &mut mmrecode_edit::EditorSession) -> Result<
 fn execute_editor_line(
     session: &mut mmrecode_edit::EditorSession,
     line: &str,
+    base_directory: &std::path::Path,
 ) -> Result<bool, String> {
     let Some(command) = mmrecode_edit::parse_command(line).map_err(|error| error.to_string())?
     else {
         return Ok(false);
     };
     let output = session.apply(command).map_err(|error| error.to_string())?;
-    if output == mmrecode_edit::CommandOutput::Quit {
-        return Ok(true);
+    match output {
+        mmrecode_edit::CommandOutput::ImportRequested { locator, alias } => {
+            return import_editor_media(session, base_directory, &locator, alias);
+        }
+        mmrecode_edit::CommandOutput::ProjectMatchRequested => {
+            let matched = match_project_to_focused_media(session)?;
+            print_editor_output(matched);
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::NewProjectRequested {
+            name,
+            preset,
+            discard,
+        } => {
+            protect_unsaved(session, discard)?;
+            let project = mmrecode_edit::MediaProject::from_preset(name, &preset)
+                .map_err(|error| error.to_string())?;
+            session.replace_new_project(project);
+            println!("ok: new project using {preset}");
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::OpenProjectRequested { locator, discard } => {
+            protect_unsaved(session, discard)?;
+            let path = resolve_existing_path(base_directory, &locator, "project")?;
+            let project =
+                mmrecode_edit::load_project_file(&path).map_err(|error| error.to_string())?;
+            session.replace_loaded_project(project, path.clone());
+            println!("ok: opened {}", path.display());
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::SaveProjectRequested { locator } => {
+            let save_as = locator.is_some();
+            let path = locator.map_or_else(
+                || {
+                    session
+                        .project_file()
+                        .map(std::path::Path::to_path_buf)
+                        .ok_or_else(|| "project has no file yet; use save as <project>".to_owned())
+                },
+                |locator| Ok(resolve_output_path(base_directory, &locator)),
+            )?;
+            let path = save_editor_project(session, &path, save_as)?;
+            println!("ok: saved {}", path.display());
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::ExportRequested { locator, preset } => {
+            let output = locator
+                .as_deref()
+                .map(|locator| resolve_output_path(base_directory, locator));
+            let report =
+                editor_export::export_project(session, output.as_deref(), preset.as_deref())?;
+            println!("{report}");
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::QuitRequested { discard } => {
+            protect_unsaved(session, discard)?;
+            return Ok(true);
+        }
+        output => print_editor_output(output),
     }
-    print_editor_output(output);
     Ok(false)
+}
+
+pub(crate) fn protect_unsaved(
+    session: &mmrecode_edit::EditorSession,
+    discard: bool,
+) -> Result<(), String> {
+    if session.is_dirty() && !discard {
+        return Err("project has unsaved changes; save it first or repeat with --discard".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_output_path(
+    base_directory: &std::path::Path,
+    locator: &str,
+) -> std::path::PathBuf {
+    let requested = std::path::Path::new(locator);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        base_directory.join(requested)
+    }
+}
+
+pub(crate) fn ensure_project_extension(path: &std::path::Path) -> std::path::PathBuf {
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mmrecode"))
+    {
+        return path.to_owned();
+    }
+    let mut suffixed = path.as_os_str().to_owned();
+    suffixed.push(".mmrecode");
+    suffixed.into()
+}
+
+pub(crate) fn save_editor_project(
+    session: &mut mmrecode_edit::EditorSession,
+    requested_path: &std::path::Path,
+    rename_untitled: bool,
+) -> Result<std::path::PathBuf, String> {
+    let path = ensure_project_extension(requested_path);
+    let mut snapshot = session.project().clone();
+    if rename_untitled && snapshot.name == "Untitled" {
+        let name = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "project save path must have a non-empty UTF-8 file name".to_owned())?;
+        snapshot.set_name(name).map_err(|error| error.to_string())?;
+    }
+    mmrecode_edit::save_project_file_from(&snapshot, &path, session.project_file())
+        .map_err(|error| error.to_string())?;
+    session
+        .mark_saved_snapshot(snapshot, path.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+pub(crate) fn resolve_existing_path(
+    base_directory: &std::path::Path,
+    locator: &str,
+    label: &str,
+) -> Result<std::path::PathBuf, String> {
+    let candidate = resolve_output_path(base_directory, locator);
+    std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("cannot open {label} '{}': {error}", candidate.display()))
+}
+
+fn import_editor_media(
+    session: &mut mmrecode_edit::EditorSession,
+    base_directory: &std::path::Path,
+    locator: &str,
+    alias: Option<String>,
+) -> Result<bool, String> {
+    let path = resolve_existing_path(base_directory, locator, "media")?;
+    let source = terminal_preview::open_source(&path)?;
+    let rate = source.index().frame_rate();
+    let time_base = mmrecode_core::Rational::new(rate.denominator(), rate.numerator())
+        .map_err(|error| error.to_string())?;
+    let duration = i64::try_from(source.index().frame_count())
+        .map_err(|_| "media frame count exceeds editor limits".to_owned())?;
+    let derived_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Media")
+        .to_owned();
+    let alias = alias.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Media")
+            .to_owned()
+    });
+    let changed = session
+        .add_imported_media(&mmrecode_edit::ImportedMedia {
+            name: derived_name,
+            alias: alias.clone(),
+            kind: mmrecode_edit::MediaKind::new("video/mpeg2")
+                .map_err(|error| error.to_string())?,
+            time_base,
+            duration,
+            origin: mmrecode_edit::MediaOrigin::External { path: path.clone() },
+        })
+        .map_err(|error| error.to_string())?;
+    print_editor_output(changed);
+    let entered = session
+        .apply(mmrecode_edit::EditCommand::Cd {
+            path: alias.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    print_editor_output(entered);
+    drop(source);
+    Ok(false)
+}
+
+pub(crate) fn match_project_to_focused_media(
+    session: &mut mmrecode_edit::EditorSession,
+) -> Result<mmrecode_edit::CommandOutput, String> {
+    if session.path().current_link().is_none() {
+        return Err(
+            "project match requires focused media; import media or cd into a placement first"
+                .into(),
+        );
+    }
+    let media_id = session
+        .project()
+        .resolve_path(session.path())
+        .map_err(|error| error.to_string())?;
+    let media = session
+        .project()
+        .media(media_id)
+        .ok_or_else(|| "focused media disappeared".to_owned())?;
+    let source_path = match &media.origin {
+        mmrecode_edit::MediaOrigin::External { path } => path.clone(),
+        mmrecode_edit::MediaOrigin::Managed { path } => session
+            .project_file()
+            .and_then(std::path::Path::parent)
+            .map(|directory| directory.join(path))
+            .ok_or_else(|| {
+                "managed focused media requires the project to be saved first".to_owned()
+            })?,
+        mmrecode_edit::MediaOrigin::Generated => {
+            return Err("generated focused media has no probed source format to match".into());
+        }
+        _ => return Err("the focused media origin cannot be probed for project matching".into()),
+    };
+    let bytes = std::fs::read(&source_path)
+        .map_err(|error| format!("cannot read '{}': {error}", source_path.display()))?;
+    let (elementary, audio_format) =
+        if bytes.len() >= mmrecode_mpegts::TS_PACKET_SIZE && bytes.first() == Some(&0x47) {
+            let transport = mmrecode_mpegts::demux_transport_stream(&bytes)
+                .map_err(|error| error.to_string())?;
+            let audio_format = match transport.mpeg1_audio_bytes() {
+                Ok(audio) => {
+                    let frames = mmrecode_mpegaudio::parse_layer2_stream(&audio)
+                        .map_err(|error| error.to_string())?;
+                    frames
+                        .first()
+                        .map(|frame| (frame.header.sample_rate, u16::from(frame.header.channels)))
+                }
+                Err(_) => None,
+            };
+            (
+                transport
+                    .mpeg2_video_bytes()
+                    .map_err(|error| error.to_string())?,
+                audio_format,
+            )
+        } else {
+            (bytes, None)
+        };
+    let stream = mmrecode_mpeg2::parse_stream(&elementary).map_err(|error| error.to_string())?;
+    let sequence = &stream
+        .pictures()
+        .first()
+        .ok_or_else(|| "focused MPEG-2 media contains no pictures".to_owned())?
+        .sequence;
+    let mut settings = session.project().settings().clone();
+    settings.width = u32::try_from(sequence.width)
+        .map_err(|_| "focused video width exceeds project limits".to_owned())?;
+    settings.height = u32::try_from(sequence.height)
+        .map_err(|_| "focused video height exceeds project limits".to_owned())?;
+    settings.frame_rate = sequence.frame_rate;
+    let aspect_ratio_information = stream
+        .sequence_headers()
+        .first()
+        .map_or(1, |header| header.aspect_ratio_information);
+    settings.pixel_aspect = mpeg2_pixel_aspect(sequence, aspect_ratio_information)?;
+    settings.scan_mode = if sequence.progressive_sequence {
+        mmrecode_edit::ProjectScanMode::Progressive
+    } else {
+        mmrecode_edit::ProjectScanMode::Interlaced
+    };
+    settings.color_space = if sequence
+        .display
+        .and_then(|display| display.colour_description)
+        .is_some_and(|colour| colour.colour_primaries == 9)
+    {
+        mmrecode_edit::ProjectColorSpace::Rec2020
+    } else {
+        mmrecode_edit::ProjectColorSpace::Rec709
+    };
+    if let Some((sample_rate, channels)) = audio_format {
+        settings.audio_sample_rate = sample_rate;
+        settings.audio_channels = channels;
+    }
+    session
+        .match_project_settings(settings, audio_format.is_some())
+        .map_err(|error| error.to_string())
+}
+
+fn mpeg2_pixel_aspect(
+    sequence: &mmrecode_mpeg2::SequenceParameters,
+    aspect_ratio_information: u8,
+) -> Result<mmrecode_core::Rational, String> {
+    let width = i64::try_from(sequence.width)
+        .map_err(|_| "focused video width exceeds rational limits".to_owned())?;
+    let height = i64::try_from(sequence.height)
+        .map_err(|_| "focused video height exceeds rational limits".to_owned())?;
+    let (display_width, display_height) = match aspect_ratio_information {
+        1 => return mmrecode_core::Rational::new(1, 1).map_err(|error| error.to_string()),
+        2 => (4_i64, 3_i64),
+        3 => (16_i64, 9_i64),
+        4 => (221_i64, 100_i64),
+        _ => return mmrecode_core::Rational::new(1, 1).map_err(|error| error.to_string()),
+    };
+    let numerator = display_width
+        .checked_mul(height)
+        .ok_or_else(|| "focused video pixel aspect overflows".to_owned())?;
+    let denominator = display_height
+        .checked_mul(width)
+        .ok_or_else(|| "focused video pixel aspect overflows".to_owned())?;
+    let divisor = greatest_common_divisor(numerator, denominator);
+    mmrecode_core::Rational::new(numerator / divisor, denominator / divisor)
+        .map_err(|error| error.to_string())
+}
+
+fn greatest_common_divisor(mut left: i64, mut right: i64) -> i64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left.abs().max(1)
 }
 
 fn print_editor_output(output: mmrecode_edit::CommandOutput) {
@@ -229,12 +548,22 @@ fn print_editor_output(output: mmrecode_edit::CommandOutput) {
                 println!("(empty local timeline)");
             }
             for entry in entries {
+                let start = mmrecode_edit::format_compact_timecode(
+                    entry.timeline_range.start.value,
+                    entry.timeline_range.start.time_base,
+                )
+                .unwrap_or_else(|_| "?:??".into());
+                let end = mmrecode_edit::format_compact_timecode(
+                    entry.timeline_range.end.value,
+                    entry.timeline_range.end.time_base,
+                )
+                .unwrap_or_else(|_| "?:??".into());
                 println!(
-                    "{:<16} [{:<10}] |{}f-----{}f|",
+                    "{:<16} [{:<10}] |{}-----{}|",
                     entry.alias,
                     entry.kind.as_str(),
-                    entry.timeline_range.start.value,
-                    entry.timeline_range.end.value
+                    start,
+                    end,
                 );
             }
         }
@@ -1815,8 +2144,9 @@ fn append_segment(report: &mut String, segment: &mmrecode_mjpeg::JpegSegment) {
 
 fn print_help() {
     println!(
-        "MMRecode media-codec tools\n\n\
-         Usage: mmrecode <command> [arguments]\n\n\
+        "MMRecode terminal media editor and codec tools\n\n\
+         Usage: mmrecode [command] [arguments]\n\
+         With no command, MMRecode starts the interactive editor.\n\n\
          Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
          preview <media-file>  Preview MPEG-2 Video or MPEG-TS inside this terminal\n  \
          inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
@@ -1844,7 +2174,7 @@ fn print_help() {
 mod tests {
     use mmrecode_mjpeg::parse_jpeg;
 
-    use super::inspection_report;
+    use super::{ensure_project_extension, inspection_report};
 
     #[test]
     fn report_includes_frame_and_marker_offsets() {
@@ -1853,5 +2183,21 @@ mod tests {
         let report = inspection_report(std::path::Path::new("sample.jpg"), bytes.len(), &image);
         assert!(report.contains("Frame: 16x16, 8-bit baseline sequential DCT"));
         assert!(report.contains("SOF0"));
+    }
+
+    #[test]
+    fn project_extension_is_appended_only_when_missing() {
+        assert_eq!(
+            ensure_project_extension(std::path::Path::new("Film")),
+            std::path::Path::new("Film.mmrecode")
+        );
+        assert_eq!(
+            ensure_project_extension(std::path::Path::new("Film.json")),
+            std::path::Path::new("Film.json.mmrecode")
+        );
+        assert_eq!(
+            ensure_project_extension(std::path::Path::new("Film.MMRECODE")),
+            std::path::Path::new("Film.MMRECODE")
+        );
     }
 }

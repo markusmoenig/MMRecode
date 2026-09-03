@@ -34,7 +34,7 @@ containers and editing operations exercise the boundaries.
 Dependencies flow downward only:
 
 ```text
-                          mmrecode-cli
+                            mmrecode
                                │
                     ┌──────────┴──────────┐
                     │                     │
@@ -86,10 +86,12 @@ crates/
 │   ├── mpegts/              mmrecode-mpegts; H.222.0 transport slice
 │   └── y4m/                 mmrecode-y4m
 ├── playback/                mmrecode-playback; timeline/clock policy
+├── render/                  mmrecode-render; dependency-aware render planning/execution
+├── edit/                    mmrecode-edit; authoring graph, commands, and project documents
 ├── quality/                 mmrecode-quality
 ├── testkit/                 mmrecode-testkit
 ├── capi/                    mmrecode-capi; experimental C boundary
-└── cli/                     mmrecode-cli; binary: mmrecode
+└── cli/                     mmrecode; main terminal application
 ```
 
 Planned crates are added only when implementation begins:
@@ -106,9 +108,7 @@ crates/
 │   ├── avi/                 mmrecode-avi
 │   ├── isobmff/             mmrecode-isobmff
 │   └── mxf/                 mmrecode-mxf
-├── render/                  mmrecode-render
-├── edit/                    mmrecode-edit
-└── facade/                  package: mmrecode
+└── facade/                  optional future package: mmrecode-sdk
 ```
 
 An empty crate is not created merely to reserve a name. Planned boundaries live in this document
@@ -452,7 +452,8 @@ into their dependency graph.
 
 ## CLI and facade
 
-The `mmrecode-cli` package produces one `mmrecode` binary with subcommands:
+The `mmrecode` package produces the main `mmrecode` application. With no arguments it enters the
+interactive editor; explicit subcommands expose development and codec tooling:
 
 ```text
 encode
@@ -467,7 +468,7 @@ edit
 The CLI is an integration client, not the owner of media logic. A behavior useful to another
 application belongs in a library crate.
 
-A future top-level `mmrecode` facade crate may re-export implementations behind opt-in features.
+A future `mmrecode-sdk` facade crate may re-export implementations behind opt-in features.
 Direct dependencies remain supported so users can select only one codec or container.
 
 No feature should enable every codec and container by default.
@@ -506,17 +507,88 @@ freezes the media clock, pauses audio, requests the next non-overlapping window,
 the underflow position after preroll. Automatic refills never replace an unfinished covered request;
 only an explicit seek creates a superseding generation.
 
-The first terminal frontend consumes that same playback source through
-`mmrecode preview <media-file>`. Terminal UI and graphics protocol dependencies belong only to the
-CLI crate. Capability probing selects Kitty, Sixel, iTerm2, or 24-bit Unicode half-block output;
+The first terminal frontend consumes that same playback source through both
+`mmrecode preview <media-file>` and the full-screen loop entered by `mmrecode edit`. Terminal UI
+and graphics protocol dependencies belong only to the CLI crate. Capability probing selects Kitty,
+Sixel, iTerm2, or 24-bit Unicode half-block output;
 codec, container, playback, edit, and render crates remain terminal-agnostic. MPEG-2 reconstruction
 and fallback terminal-specific resize/encoding use separate workers. Direct Kitty output transfers
 local RGB frames through temporary files and alternates two image slots: it uploads and places the
 next frame before deleting the previous placement. This uses the widely implemented baseline Kitty
 graphics operations rather than optional terminal animation.
-The UI thread owns input, the playback clock, a bounded display cache, and protocol state. This is
-intentionally a reusable frontend boundary for later `mmrecode edit` integration, not another
-editor or render graph.
+The UI thread owns input, the playback clock, a bounded display cache, and protocol state. In edit
+mode it creates the full-screen shell even with no playback source, parses commands through
+`mmrecode-edit`, and applies them to one `EditorSession`. Filesystem resolution and MPEG-2 probing
+stay in the CLI host:
+the library command produces an `ImportRequested` value, and the host returns typed `ImportedMedia`
+metadata. Project authoring settings remain authoritative; imported durations are conformed to the
+nearest parent frame rather than changing the project rate. Placement source ranges then bound
+playback and are refreshed after trims or undo/redo. The terminal frontend maps
+keyboard and mouse timeline scrubbing to the same bounded playback controller; canonical trims
+preserve the playhead when it remains valid, while transport started at the out-point restarts at
+the in-point. This is a reusable frontend boundary, not another editor or render graph.
+
+The editor formats native positions as compact non-drop frame timecode and uses the same parser in
+scripts and interactive input. Fields are interpreted from the right (`S:FF`, `M:SS:FF`, then
+`H:MM:SS:FF`) and leading unused fields are omitted. The selected media time base supplies the
+nominal frame-field width and limit, while the resolved edit remains an exact integer native-frame
+position. Fractional rates therefore do not pass through floating-point seconds.
+
+One command history serves the full-screen prompt and persists through the platform-specific
+application state directory. Up/Down navigate entries, consecutive duplicates are collapsed, and
+moving past the newest entry restores the user's unsubmitted draft. The prompt handles Tab itself
+because a standalone readline implementation cannot also own the terminal event loop: completion
+currently covers commands, manual/info topics, project settings, project/export presets, local
+hierarchy aliases, and quoted filesystem paths. Canonical vocabulary is exported by `mmrecode-edit`
+instead of duplicated in the frontend; tests require commands to keep manual entries and settings
+and presets to appear in their manuals. Page Up/Page Down retain one-second timeline scrubbing so
+history navigation has conventional shell semantics. Non-terminal stdin retains a line-oriented
+adapter for scripts and integration pipelines; it is not the primary interactive UI.
+
+`mmrecode-edit` also owns the versioned project-document schema and resolved authoring settings,
+but not filesystem policy or codec probing. The JSON document carries a format marker and version,
+stable media/link identifiers, project settings, relative managed origins, explicit external
+origins, and placement ranges. Saves use a same-directory temporary file and rename. CLI host
+requests distinguish `new`, project `open`, `save`, media `import`, and `export`; replacement and
+quit operations protect dirty sessions unless `--discard` is explicit. Export compilation always
+starts at the project root, independently of the current navigation path. The initial MPEG-2 slice
+walks every root placement in composition order and renders its trim and project position, filling
+gaps with project black. A single placement covering the timeline with matching rate, canvas, and
+scan settings lowers to `EditSequence` and can use the GOP-aware packet path. Other progressive
+root timelines decode required pictures and reference dependencies, conform by project-frame
+timestamps, map YUV 4:2:0 planes into the project canvas with CPU Lanczos scaling, encode bounded
+closed-GOP chunks, and mux the regenerated MPEG-2 stream as MPEG-TS. Nested generated/effect media
+and alpha-aware composition remain the next compiler layer.
+Unsupported delivery presets report
+their missing codec/container slice instead of invoking an opaque external transcoder.
+
+`project match` is also an explicit host request because the terminal-independent edit crate does
+not probe codecs or containers. The host resolves the focused media origin, derives MPEG-2 canvas,
+exact rate, pixel aspect, scan, and color, optionally reads MPEG audio rate/channel layout, then
+submits the complete settings snapshot to `EditorSession` as one undoable time-preserving mutation.
+
+The host normalizes every save target to the `.mmrecode` extension. Save As prepares a snapshot
+before writing; if the current project still has the default `Untitled` name, the snapshot adopts
+the normalized file stem. Only after the atomic write succeeds does the session adopt that name and
+path. Undo/redo snapshots receive the same canonical project name so a later content undo cannot
+unexpectedly revert the prompt to `Untitled`.
+
+Project-rate changes are explicit root-timeline conformance operations. The default policy rescales
+direct root placement boundaries to the new time base with nearest-ties-away rounding and returns a
+report of affected placements and rounded boundaries. The alternate policy retains integer frame
+numbers, intentionally changing presentation time. Both policies leave source ranges and nested
+media time bases unchanged, recompute root duration, participate in session undo/redo, and persist
+as ordinary exact placement ranges in the project document.
+
+The panel beside the monitor is a derived context inspector. It resolves the current `MediaPath`
+on every draw and presents the project root or selected media/placement without storing a second
+selection model. It also owns presentation of contextual help: `Help` and `Man` outputs replace the
+panel body, explicit `InfoTopic` commands select metadata sections, and successful trim commands
+select an in-point or out-point focus with temporary left/right adjustment aliases. Kind-specific
+sections are appended by the frontend from available typed media metadata; the first video section
+reads the bounded MPEG-2 playback index rather than decoding an extra frame. The timeline is a
+derived terminal visualization of the same playback range and index, with a ruler, edit boundaries,
+playhead, and I-picture landmarks; clicking it maps back to a bounded source-frame seek.
 
 Device output and temporary MP2-to-PCM decoding remain application-local. `mmrecode-viewer` uses
 Rodio with its pure-Rust Symphonia MP2 backend and predecodes audio for short inspection media. This does not

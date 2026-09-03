@@ -39,6 +39,34 @@ impl MediaKind {
     }
 }
 
+/// How visual media is mapped into its parent canvas.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum VisualScaleMode {
+    /// Preserve aspect ratio and show the complete image, adding background bars when necessary.
+    #[default]
+    Fit,
+    /// Preserve aspect ratio and fill the canvas, cropping centered excess pixels.
+    Fill,
+    /// Ignore aspect ratio and resize directly to the complete canvas.
+    Stretch,
+    /// Keep native pixel size, centered, cropping or padding at the canvas edges.
+    Native,
+}
+
+impl VisualScaleMode {
+    /// Returns the stable editor/project-file spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fit => "fit",
+            Self::Fill => "fill",
+            Self::Stretch => "stretch",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// Where the content represented by a media node originates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -98,6 +126,8 @@ pub struct MediaLink {
     pub source_range: TimeRange,
     /// Placement interval in the parent's local time base.
     pub timeline_range: TimeRange,
+    /// Visual mapping into the parent canvas; ignored by non-visual media.
+    pub scale_mode: VisualScaleMode,
 }
 
 /// Contextual path through placement links from the project root.
@@ -151,11 +181,169 @@ pub struct MediaListing {
     pub timeline_range: TimeRange,
 }
 
+/// Scan organization of the project canvas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectScanMode {
+    /// Every project frame contains a complete progressive image.
+    Progressive,
+    /// Every project frame is presented as two interlaced fields.
+    Interlaced,
+}
+
+/// Working color description used by generated and composited project pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectColorSpace {
+    /// ITU-R BT.709 working color for conventional HD video.
+    Rec709,
+    /// sRGB working color for graphics-oriented projects.
+    Srgb,
+    /// ITU-R BT.2020 working color for wide-gamut UHD projects.
+    Rec2020,
+}
+
+/// How root-timeline positions behave when the project frame rate changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectRateConformPolicy {
+    /// Preserve presentation time and round root placement boundaries to the nearest new frame.
+    PreserveTime,
+    /// Preserve integer frame numbers, intentionally changing their presentation time.
+    PreserveFrames,
+}
+
+/// Accounting returned after a project frame-rate change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProjectRateConformReport {
+    /// Number of direct root placements whose timeline time base changed.
+    pub conformed_placements: usize,
+    /// Number of start/end boundaries that required nearest-frame rounding.
+    pub rounded_boundaries: usize,
+}
+
+/// Authoring properties of the project root, independent of delivery codecs and containers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSettings {
+    /// Root canvas width in pixels.
+    pub width: u32,
+    /// Root canvas height in pixels.
+    pub height: u32,
+    /// Exact project frame rate in frames per second.
+    pub frame_rate: Rational,
+    /// Horizontal-to-vertical pixel aspect ratio.
+    pub pixel_aspect: Rational,
+    /// Progressive or interlaced project organization.
+    pub scan_mode: ProjectScanMode,
+    /// Working color description for compositing and generated content.
+    pub color_space: ProjectColorSpace,
+    /// Project audio sample rate in hertz.
+    pub audio_sample_rate: u32,
+    /// Project output channel count.
+    pub audio_channels: u16,
+    /// Preset from which these resolved values originated, when known.
+    pub base_preset: Option<String>,
+}
+
+impl ProjectSettings {
+    /// Returns resolved settings for a built-in authoring preset.
+    ///
+    /// Presets establish authoring geometry and timing only. Delivery codecs remain export
+    /// settings and may differ between several exports of the same project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `name` is not a known built-in preset.
+    pub fn from_preset(name: &str) -> Result<Self> {
+        let (width, height, rate_numerator, rate_denominator, scan_mode) = match name {
+            "web-1080p30" | "youtube-1080p30" => {
+                (1_920, 1_080, 30, 1, ProjectScanMode::Progressive)
+            }
+            "youtube-2160p30" => (3_840, 2_160, 30, 1, ProjectScanMode::Progressive),
+            "pal-576i25" => (720, 576, 25, 1, ProjectScanMode::Interlaced),
+            _ => {
+                return Err(Error::InvalidData(format!(
+                    "unknown project preset '{name}'; available: {}",
+                    Self::preset_names().join(", ")
+                )));
+            }
+        };
+        Ok(Self {
+            width,
+            height,
+            frame_rate: Rational::new(rate_numerator, rate_denominator)?,
+            pixel_aspect: Rational::new(1, 1)?,
+            scan_mode,
+            color_space: ProjectColorSpace::Rec709,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            base_preset: Some(name.into()),
+        })
+    }
+
+    /// Returns the stable names of all built-in authoring presets.
+    #[must_use]
+    pub const fn preset_names() -> &'static [&'static str] {
+        &[
+            "web-1080p30",
+            "youtube-1080p30",
+            "youtube-2160p30",
+            "pal-576i25",
+        ]
+    }
+
+    /// Returns the exact duration of one project frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored frame rate is invalid.
+    pub fn time_base(&self) -> Result<Rational> {
+        Rational::new(self.frame_rate.denominator(), self.frame_rate.numerator())
+    }
+
+    /// Validates project dimensions, timing, pixel geometry, and audio defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero or unreasonable dimension, non-positive rational, unsupported
+    /// channel count, or audio rate outside the authoring range.
+    pub fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 || self.width > 32_768 || self.height > 32_768 {
+            return Err(Error::InvalidData(
+                "project dimensions must be from 1 through 32768 pixels".into(),
+            ));
+        }
+        if self.frame_rate.numerator() <= 0 || self.pixel_aspect.numerator() <= 0 {
+            return Err(Error::InvalidData(
+                "project frame rate and pixel aspect must be positive".into(),
+            ));
+        }
+        if !(8_000..=384_000).contains(&self.audio_sample_rate) {
+            return Err(Error::InvalidData(
+                "project audio rate must be from 8000 through 384000 Hz".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.audio_channels) {
+            return Err(Error::InvalidData(
+                "project audio channels must be from 1 through 64".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self::from_preset("web-1080p30").expect("built-in project preset must remain valid")
+    }
+}
+
 /// Recursive authoring project whose root and media nodes own local linked timelines.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaProject {
     /// Human-facing project name.
     pub name: String,
+    settings: ProjectSettings,
     root_id: MediaId,
     media: BTreeMap<MediaId, MediaNode>,
     links: BTreeMap<MediaLinkId, MediaLink>,
@@ -170,15 +358,26 @@ impl MediaProject {
     ///
     /// Returns an error for an empty project name or non-positive time base.
     pub fn new(name: impl Into<String>, time_base: Rational) -> Result<Self> {
+        let settings = ProjectSettings {
+            frame_rate: Rational::new(time_base.denominator(), time_base.numerator())?,
+            base_preset: None,
+            ..ProjectSettings::default()
+        };
+        Self::with_settings(name, settings)
+    }
+
+    /// Creates an empty project root with fully resolved authoring settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty name or invalid project settings.
+    pub fn with_settings(name: impl Into<String>, settings: ProjectSettings) -> Result<Self> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(Error::InvalidData("project name cannot be empty".into()));
         }
-        if time_base.numerator() <= 0 {
-            return Err(Error::InvalidData(
-                "project time base must be positive".into(),
-            ));
-        }
+        settings.validate()?;
+        let time_base = settings.time_base()?;
         let root_id = MediaId(1);
         let root = MediaNode {
             id: root_id,
@@ -194,12 +393,162 @@ impl MediaProject {
         };
         Ok(Self {
             name,
+            settings,
             root_id,
             media: BTreeMap::from([(root_id, root)]),
             links: BTreeMap::new(),
             next_media_id: 2,
             next_link_id: 1,
         })
+    }
+
+    /// Creates an empty project from a built-in authoring preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown preset or invalid project name.
+    pub fn from_preset(name: impl Into<String>, preset: &str) -> Result<Self> {
+        Self::with_settings(name, ProjectSettings::from_preset(preset)?)
+    }
+
+    /// Renames the project and its generated root media node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `name` is empty after trimming or the project root is missing.
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(Error::InvalidData("project name cannot be empty".into()));
+        }
+        self.media
+            .get_mut(&self.root_id)
+            .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+            .name
+            .clone_from(&name);
+        self.name = name;
+        Ok(())
+    }
+
+    /// Returns resolved authoring settings for the project root.
+    #[must_use]
+    pub const fn settings(&self) -> &ProjectSettings {
+        &self.settings
+    }
+
+    /// Replaces resolved authoring settings, preserving root-timeline presentation time when the
+    /// frame rate changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid settings, arithmetic overflow, or a placement that would
+    /// collapse below one frame after conformance.
+    pub fn set_settings(&mut self, settings: ProjectSettings) -> Result<()> {
+        self.set_settings_with_rate_conform(settings, ProjectRateConformPolicy::PreserveTime)
+            .map(|_| ())
+    }
+
+    /// Replaces settings with an explicit root-timeline frame-rate conformance policy.
+    ///
+    /// Source ranges and nested media time bases remain untouched. Only direct placements in the
+    /// project root use the project time base and therefore require conformance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid settings, arithmetic overflow, or a placement that would
+    /// collapse below one frame after time-preserving conformance.
+    pub fn set_settings_with_rate_conform(
+        &mut self,
+        settings: ProjectSettings,
+        policy: ProjectRateConformPolicy,
+    ) -> Result<ProjectRateConformReport> {
+        settings.validate()?;
+        let old_time_base = self.settings.time_base()?;
+        let new_time_base = settings.time_base()?;
+        let mut report = ProjectRateConformReport::default();
+        if old_time_base != new_time_base {
+            let child_ids = self
+                .media
+                .get(&self.root_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+                .children
+                .clone();
+            let conformed = child_ids
+                .iter()
+                .map(|link_id| {
+                    let link = self.links.get(link_id).ok_or_else(|| {
+                        Error::InvalidState("project root child link disappeared".into())
+                    })?;
+                    let (start, end, rounded) = match policy {
+                        ProjectRateConformPolicy::PreserveTime => {
+                            let start = link.timeline_range.start;
+                            let end = link.timeline_range.end;
+                            let rounded = usize::from(
+                                start.rescale(new_time_base, TimestampRounding::Exact).is_err(),
+                            ) + usize::from(
+                                end.rescale(new_time_base, TimestampRounding::Exact).is_err(),
+                            );
+                            (
+                                start.rescale(new_time_base, TimestampRounding::NearestTiesAway)?,
+                                end.rescale(new_time_base, TimestampRounding::NearestTiesAway)?,
+                                rounded,
+                            )
+                        }
+                        ProjectRateConformPolicy::PreserveFrames => (
+                            Timestamp {
+                                value: link.timeline_range.start.value,
+                                time_base: new_time_base,
+                            },
+                            Timestamp {
+                                value: link.timeline_range.end.value,
+                                time_base: new_time_base,
+                            },
+                            0,
+                        ),
+                    };
+                    if start.value >= end.value {
+                        return Err(Error::Unsupported(format!(
+                            "project rate conformance would collapse placement '{}' below one frame",
+                            link.alias
+                        )));
+                    }
+                    Ok((*link_id, TimeRange::new(start, end)?, rounded))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (link_id, timeline_range, rounded) in conformed {
+                let link = self.links.get_mut(&link_id).ok_or_else(|| {
+                    Error::InvalidState("project root child link disappeared".into())
+                })?;
+                link.timeline_range = timeline_range;
+                report.conformed_placements += 1;
+                report.rounded_boundaries += rounded;
+            }
+            let root_duration = child_ids
+                .iter()
+                .filter_map(|link_id| self.links.get(link_id))
+                .map(|link| link.timeline_range.end.value)
+                .max()
+                .unwrap_or(0);
+            let root = self
+                .media
+                .get_mut(&self.root_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?;
+            root.time_base = new_time_base;
+            root.duration.time_base = new_time_base;
+            root.duration.value = root_duration;
+        }
+        self.settings = settings;
+        Ok(report)
+    }
+
+    /// Returns media definitions in stable identifier order.
+    pub fn media_nodes(&self) -> impl Iterator<Item = &MediaNode> {
+        self.media.values()
+    }
+
+    /// Returns placement links in stable identifier order.
+    pub fn placement_links(&self) -> impl Iterator<Item = &MediaLink> {
+        self.links.values()
     }
 
     /// Returns the stable project-root media identity.
@@ -292,7 +641,8 @@ impl MediaProject {
     /// # Errors
     ///
     /// Returns an error for missing nodes, duplicate/invalid aliases, inconsistent time bases,
-    /// unequal source/timeline durations, invalid ranges, or a composition cycle.
+    /// unequal source/timeline durations after nearest-frame conformance, invalid ranges, or a
+    /// composition cycle.
     pub fn link_media(
         &mut self,
         parent_id: MediaId,
@@ -327,7 +677,7 @@ impl MediaProject {
         }
         let source_duration = source_range
             .duration()?
-            .rescale(parent.time_base, TimestampRounding::Exact)?;
+            .rescale(parent.time_base, TimestampRounding::NearestTiesAway)?;
         if source_duration.value != timeline_range.duration()?.value {
             return Err(Error::Unsupported(
                 "initial media links cannot change playback speed".into(),
@@ -361,6 +711,7 @@ impl MediaProject {
                 alias,
                 source_range,
                 timeline_range,
+                scale_mode: VisualScaleMode::default(),
             },
         );
         let parent = self
@@ -372,6 +723,35 @@ impl MediaProject {
             parent.duration.value = timeline_range.end.value;
         }
         Ok(id)
+    }
+
+    /// Changes the visual scaling policy of one placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `link_id` does not identify a placement.
+    pub fn set_link_scale_mode(
+        &mut self,
+        link_id: MediaLinkId,
+        mode: VisualScaleMode,
+    ) -> Result<()> {
+        self.links
+            .get_mut(&link_id)
+            .ok_or_else(|| Error::InvalidData(format!("missing media link {link_id:?}")))?
+            .scale_mode = mode;
+        Ok(())
+    }
+
+    /// Changes the visual scaling policy of the placement selected by `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error at the project root or for an invalid placement path.
+    pub fn set_scale_mode(&mut self, path: &MediaPath, mode: VisualScaleMode) -> Result<()> {
+        let link_id = path.current_link().ok_or_else(|| {
+            Error::Unsupported("the project root has no placement scale mode".into())
+        })?;
+        self.set_link_scale_mode(link_id, mode)
     }
 
     /// Creates generated media and immediately links it into `parent_id`.
@@ -506,7 +886,7 @@ impl MediaProject {
     ///
     /// # Errors
     ///
-    /// Returns an error for the root, invalid ranges, negative time, or inexact time-base mapping.
+    /// Returns an error for the root, invalid ranges, or negative time.
     pub fn trim_in(&mut self, path: &MediaPath, value: i64, relative: bool) -> Result<()> {
         let link_id = path.current_link().ok_or_else(|| {
             Error::Unsupported("the project root has no placement in-point".into())
@@ -536,7 +916,7 @@ impl MediaProject {
         )
         .rescale(
             link.timeline_range.start.time_base,
-            TimestampRounding::Exact,
+            TimestampRounding::NearestTiesAway,
         )?;
         let timeline_start = link
             .timeline_range
@@ -564,7 +944,7 @@ impl MediaProject {
     ///
     /// # Errors
     ///
-    /// Returns an error for the root, invalid ranges, or inexact time-base mapping.
+    /// Returns an error for the root or invalid ranges.
     pub fn trim_out(&mut self, path: &MediaPath, value: i64, relative: bool) -> Result<()> {
         let link_id = path.current_link().ok_or_else(|| {
             Error::Unsupported("the project root has no placement out-point".into())
@@ -597,7 +977,10 @@ impl MediaProject {
             source_end - link.source_range.end.value,
             link.source_range.end.time_base,
         )
-        .rescale(link.timeline_range.end.time_base, TimestampRounding::Exact)?;
+        .rescale(
+            link.timeline_range.end.time_base,
+            TimestampRounding::NearestTiesAway,
+        )?;
         let timeline_end = link
             .timeline_range
             .end
@@ -615,6 +998,24 @@ impl MediaProject {
             .ok_or_else(|| Error::InvalidState("current media link disappeared".into()))?;
         link.source_range.end.value = source_end;
         link.timeline_range.end.value = timeline_end;
+        let parent_id = link.parent_id;
+        if parent_id == self.root_id {
+            let duration = self
+                .media
+                .get(&parent_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+                .children
+                .iter()
+                .filter_map(|child_id| self.links.get(child_id))
+                .map(|child| child.timeline_range.end.value)
+                .max()
+                .unwrap_or(0);
+            self.media
+                .get_mut(&parent_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+                .duration
+                .value = duration;
+        }
         Ok(())
     }
 
@@ -696,6 +1097,15 @@ mod tests {
     }
 
     #[test]
+    fn renaming_a_project_keeps_its_root_name_in_sync() {
+        let mut project = project();
+        project.set_name("MyFilm").unwrap();
+        assert_eq!(project.name, "MyFilm");
+        assert_eq!(project.media(project.root_id()).unwrap().name, "MyFilm");
+        assert!(project.set_name("  ").is_err());
+    }
+
+    #[test]
     fn rejects_composition_cycles() {
         let mut project = project();
         let time_base = Rational::new(1, 25).unwrap();
@@ -769,5 +1179,130 @@ mod tests {
             (15, 100)
         );
         assert_eq!(project.media(link.media_id).unwrap().duration.value, 100);
+    }
+
+    #[test]
+    fn rate_change_preserves_root_presentation_time_and_source_ranges() {
+        let mut project = MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap();
+        let link_id = project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("video").unwrap(),
+                "Clip0",
+                30,
+                30,
+            )
+            .unwrap();
+        let media_id = project.link(link_id).unwrap().media_id;
+        let nested_link_id = project
+            .add_generated(media_id, MediaKind::new("text").unwrap(), "Title", 5, 10)
+            .unwrap();
+        let source_range = project.link(link_id).unwrap().source_range;
+        let mut settings = project.settings().clone();
+        settings.frame_rate = Rational::new(25, 1).unwrap();
+
+        let report = project
+            .set_settings_with_rate_conform(settings, ProjectRateConformPolicy::PreserveTime)
+            .unwrap();
+        let link = project.link(link_id).unwrap();
+        assert_eq!(link.timeline_range.start.value, 25);
+        assert_eq!(link.timeline_range.end.value, 50);
+        assert_eq!(
+            link.timeline_range.start.time_base,
+            Rational::new(1, 25).unwrap()
+        );
+        assert_eq!(link.source_range, source_range);
+        assert_eq!(
+            project
+                .link(nested_link_id)
+                .unwrap()
+                .timeline_range
+                .start
+                .time_base,
+            Rational::new(1, 30).unwrap()
+        );
+        assert_eq!(report.conformed_placements, 1);
+        assert_eq!(report.rounded_boundaries, 0);
+        let root = project.media(project.root_id()).unwrap();
+        assert_eq!(root.time_base, Rational::new(1, 25).unwrap());
+        assert_eq!(root.duration.value, 50);
+    }
+
+    #[test]
+    fn rate_change_can_preserve_root_frame_numbers() {
+        let mut project = MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap();
+        let link_id = project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("video").unwrap(),
+                "Clip0",
+                10,
+                10,
+            )
+            .unwrap();
+        let mut settings = project.settings().clone();
+        settings.frame_rate = Rational::new(25, 1).unwrap();
+
+        let report = project
+            .set_settings_with_rate_conform(settings, ProjectRateConformPolicy::PreserveFrames)
+            .unwrap();
+        let link = project.link(link_id).unwrap();
+        assert_eq!(link.timeline_range.start.value, 10);
+        assert_eq!(link.timeline_range.end.value, 20);
+        assert_eq!(
+            link.timeline_range.start.time_base,
+            Rational::new(1, 25).unwrap()
+        );
+        assert_eq!(report.conformed_placements, 1);
+        assert_eq!(report.rounded_boundaries, 0);
+    }
+
+    #[test]
+    fn time_conformance_reports_rounded_boundaries() {
+        let mut project = MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap();
+        project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("video").unwrap(),
+                "Clip0",
+                10,
+                10,
+            )
+            .unwrap();
+        let mut settings = project.settings().clone();
+        settings.frame_rate = Rational::new(25, 1).unwrap();
+
+        let report = project
+            .set_settings_with_rate_conform(settings, ProjectRateConformPolicy::PreserveTime)
+            .unwrap();
+        assert_eq!(report.conformed_placements, 1);
+        assert_eq!(report.rounded_boundaries, 2);
+        let link = project.link(MediaLinkId(1)).unwrap();
+        assert_eq!(link.timeline_range.start.value, 8);
+        assert_eq!(link.timeline_range.end.value, 17);
+    }
+
+    #[test]
+    fn collapsing_rate_conformance_is_atomic() {
+        let mut project = MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap();
+        project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("video").unwrap(),
+                "Clip0",
+                1,
+                1,
+            )
+            .unwrap();
+        let before = project.clone();
+        let mut settings = project.settings().clone();
+        settings.frame_rate = Rational::new(1, 1).unwrap();
+
+        assert!(
+            project
+                .set_settings_with_rate_conform(settings, ProjectRateConformPolicy::PreserveTime)
+                .is_err()
+        );
+        assert_eq!(project, before);
     }
 }

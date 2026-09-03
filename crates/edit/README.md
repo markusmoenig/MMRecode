@@ -10,10 +10,34 @@ identity, a human alias, child source range, and parent-local timeline range. Co
 as `/Clip0/Title` traverse those links; cycles are rejected, while reusable media definitions may
 have multiple acyclic placements.
 
-The first typed command/session slice implements `pwd`, `ls`, `info`, `cd`, `add`, `in`, `out`,
-`undo`, and `redo`. `mmrecode edit` and `mmrecode edit <script>` use the same parser and
-`EditorSession`. Mutations return an explicit changed event so an interactive frontend can refresh
-preview without making preview a script-side edit semantic.
+The typed command/session slice implements `new`, project `open`, `save`, media `import`, project
+settings/presets, placement `scale`, export requests, `pwd`, `ls`, contextual and focused `info`, `cd`, `add`, `in`,
+`out`, `undo`, `redo`, `help`, and `man`. `import` is deliberately a typed host request: the CLI
+resolves and probes the locator, then supplies validated `ImportedMedia` metadata to the
+terminal-agnostic session. Project settings remain authoritative when source rates differ.
+Changing the project frame rate is an undoable root-timeline operation: presentation time is
+preserved by default with explicit nearest-frame accounting, while a frame-number-preserving policy
+is available when that is the intended edit. Neither policy rewrites source ranges or nested media
+time bases. `project match` is a typed host request: the frontend probes the focused source and
+returns a complete video/audio settings snapshot, which the session applies atomically with the
+same time-preserving conformance and undo semantics.
+`mmrecode edit` and `mmrecode edit <script>` use the same parser and `EditorSession`. Mutations
+return an explicit changed event so an interactive frontend can refresh preview without making
+preview a script-side edit semantic. The CLI's first MPEG-2 ES/TS integration uses that event to
+update the full-screen terminal preview range immediately after trims and undo/redo. Interactive
+frontends may expose contextual aliases such as `left <time>` after an in/out operation, but expand
+them into canonical typed trim commands before applying them.
+
+The editor exports canonical command, manual-topic, project-setting, and delivery-preset
+vocabularies for frontends. The full-screen completion system consumes those lists, and regression
+tests require every command to retain a manual entry and every setting/preset to remain present in
+interactive help.
+
+Editor positions use compact non-drop timecode with the frame field on the right. For example,
+`out 1:15` selects one second and fifteen frames, `out -0:10` removes ten frames relative to the
+current out-point, and `2:01:15` includes minutes. Leading unused fields are omitted in command
+output, listings, and the terminal UI. Values resolve against the current media's native frame rate;
+the early raw-frame spelling remains accepted only for script compatibility.
 
 The initial slice provides:
 
@@ -28,9 +52,17 @@ The initial slice provides:
 The crate deliberately does not decide which packets can be copied or which frames must be
 decoded. Those decisions belong to `mmrecode-render` and codec dependency analyzers.
 
-The older `EditSequence` structures remain the flattened renderer-facing target. Compiling the
-recursive graph into that target is subsequent work.
+The older `EditSequence` structures remain the flattened renderer-facing target. The CLI export
+host always starts from the project root rather than the current `MediaPath`. Its MPEG-2 slice
+renders every root placement, trim, position, and gap; a single compatible placement can still use
+the packet path as an internal optimization. Progressive multi-placement, source-rate, or canvas
+work selects a full-render path with persisted fit/fill/stretch/native sizing. Recursive nested
+generated/effect content and alpha-aware composition remain subsequent work.
 
-Current limits are intentional: there is not yet a persisted project format, media import/relink,
-graph-to-render compiler, terminal image preview, speed mapping, automation curve, or detailed
-effect schema.
+Project files are readable versioned JSON with resolved authoring settings, stable identifiers,
+placement ranges, project-relative managed paths, and explicit external paths. Saves are atomic and
+sessions track clean/modified state. The CLI host appends `.mmrecode` to save targets and makes the
+first Save As file stem the initial Untitled project's name; the session adopts this canonicalized
+snapshot only after the write succeeds. Current limits remain intentional: the host importer accepts
+MPEG-2 ES/TS video, while fingerprints, relinking/collection, recursive composition preview and
+export, speed mapping, automation curves, and detailed effect schemas are not implemented yet.

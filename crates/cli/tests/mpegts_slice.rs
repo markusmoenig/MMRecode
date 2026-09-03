@@ -10,7 +10,7 @@ fn transport_inspect_mux_demux_and_decode_round_trip() {
     let elementary = root.join("testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
     let audio = root.join("testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2");
     let independent = root.join("testdata/mpegts/valid/single-program-mpeg2-mp2.ts");
-    let stem = format!("mmrecode-cli-mpegts-slice-{}", std::process::id());
+    let stem = format!("mmrecode-mpegts-slice-{}", std::process::id());
     let transport = std::env::temp_dir().join(format!("{stem}.ts"));
     let extracted = std::env::temp_dir().join(format!("{stem}.m2v"));
     let extracted_audio = std::env::temp_dir().join(format!("{stem}.mp2"));

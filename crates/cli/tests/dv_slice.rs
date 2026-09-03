@@ -7,7 +7,7 @@ fn dv_inspect_decode_encode_and_decode_round_trip() {
     let binary = env!("CARGO_BIN_EXE_mmrecode");
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repository.join("testdata/dv/valid/dv25-525-60-one-frame.dv");
-    let stem = format!("mmrecode-cli-dv-slice-{}", std::process::id());
+    let stem = format!("mmrecode-dv-slice-{}", std::process::id());
     let y4m = std::env::temp_dir().join(format!("{stem}-source.y4m"));
     let encoded = std::env::temp_dir().join(format!("{stem}.dv"));
     let reconstructed = std::env::temp_dir().join(format!("{stem}-reconstructed.y4m"));

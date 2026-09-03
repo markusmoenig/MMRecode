@@ -9,7 +9,7 @@ fn plans_and_executes_one_frame_mpeg2_replacement() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let video = root.join("testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
     let audio = root.join("testdata/mpegaudio/valid/sine-48k-stereo-192k.mp2");
-    let stem = format!("mmrecode-cli-render-slice-{}", std::process::id());
+    let stem = format!("mmrecode-render-slice-{}", std::process::id());
     let replacement_path = std::env::temp_dir().join(format!("{stem}-replacement.y4m"));
     let output_path = std::env::temp_dir().join(format!("{stem}.ts"));
 

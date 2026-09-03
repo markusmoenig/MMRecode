@@ -7,7 +7,7 @@ fn y4m_encode_verify_decode_compare_round_trip() {
     let binary = env!("CARGO_BIN_EXE_mmrecode");
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repository.join("testdata/y4m/valid/two-frame-420.y4m");
-    let stem = format!("mmrecode-cli-slice-{}", std::process::id());
+    let stem = format!("mmrecode-slice-{}", std::process::id());
     let encoded = std::env::temp_dir().join(format!("{stem}.mjpg"));
     let decoded = std::env::temp_dir().join(format!("{stem}.y4m"));
 

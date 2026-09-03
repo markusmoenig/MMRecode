@@ -136,7 +136,7 @@ pub struct EncodedMpeg2 {
 ///
 /// The reference encoder uses closed GOPs, I/P/B reordering, integer-pixel P-picture motion
 /// estimation, zero-vector bidirectional B prediction, one slice per macroblock row, and VBR
-/// (`vbv_delay = 0xffff`) operation bounded by the Main Profile/Main Level maximum bit rate.
+/// (`vbv_delay = 0xffff`) operation at Main Profile/Main or High Level.
 /// Reconstruction is produced by the native decoder.
 ///
 /// # Errors
@@ -222,9 +222,9 @@ fn validate_input(frames: &[VideoFrame], options: &Mpeg2EncodeOptions) -> Result
     let first = frames
         .first()
         .ok_or_else(|| Error::InvalidData("cannot encode an empty MPEG-2 sequence".into()))?;
-    if first.width == 0 || first.height == 0 || first.width > 720 || first.height > 576 {
+    if first.width == 0 || first.height == 0 || first.width > 1_920 || first.height > 1_152 {
         return Err(Error::Unsupported(
-            "MPEG-2 Main Profile/Main Level encoder dimensions must be at most 720x576".into(),
+            "MPEG-2 Main Profile encoder dimensions must be at most 1920x1152".into(),
         ));
     }
     if first.format != PixelFormat::Yuv420p8 || first.width % 2 != 0 || first.height % 2 != 0 {
@@ -241,10 +241,18 @@ fn validate_input(frames: &[VideoFrame], options: &Mpeg2EncodeOptions) -> Result
         ));
     }
     validate_sequence_settings(options)?;
-    if matches!(
-        options.frame_rate,
-        FrameRate::Fps50 | FrameRate::Fps59_94 | FrameRate::Fps60
-    ) {
+    let high_level = options.sequence.profile_and_level_indication == 0x44;
+    if !high_level && (first.width > 720 || first.height > 576) {
+        return Err(Error::Unsupported(
+            "MPEG-2 Main Profile/Main Level encoder dimensions must be at most 720x576; use Main Profile/High Level (0x44) for HD".into(),
+        ));
+    }
+    if !high_level
+        && matches!(
+            options.frame_rate,
+            FrameRate::Fps50 | FrameRate::Fps59_94 | FrameRate::Fps60
+        )
+    {
         return Err(Error::Unsupported(
             "MPEG-2 Main Level encoder supports frame rates through 30 fps".into(),
         ));
@@ -268,9 +276,10 @@ fn validate_input(frames: &[VideoFrame], options: &Mpeg2EncodeOptions) -> Result
                 .map(|denominator| rate_samples / denominator)
         })
         .ok_or_else(|| Error::Unsupported("MPEG-2 sample rate overflows".into()))?;
-    if samples_per_second > 10_368_000 {
+    let sample_rate_limit = if high_level { 62_668_800 } else { 10_368_000 };
+    if samples_per_second > sample_rate_limit {
         return Err(Error::Unsupported(format!(
-            "MPEG-2 Main Level sample rate {samples_per_second} exceeds 10368000 samples/s"
+            "MPEG-2 sample rate {samples_per_second} exceeds the selected level limit of {sample_rate_limit} samples/s"
         )));
     }
     for (index, frame) in frames.iter().enumerate() {
@@ -291,9 +300,10 @@ fn validate_sequence_settings(options: &Mpeg2EncodeOptions) -> Result<()> {
             "MPEG-2 encoder supports aspect-ratio information codes 1 through 4".into(),
         ));
     }
-    if sequence.profile_and_level_indication != 0x48 {
+    if !matches!(sequence.profile_and_level_indication, 0x48 | 0x44) {
         return Err(Error::Unsupported(
-            "MPEG-2 reference encoder only emits Main Profile at Main Level (0x48)".into(),
+            "MPEG-2 reference encoder emits Main Profile at Main Level (0x48) or High Level (0x44)"
+                .into(),
         ));
     }
     if sequence.bit_rate == 0 || !sequence.bit_rate.is_multiple_of(400) {

@@ -12,12 +12,19 @@ use mmrecode_core::{
 
 mod command;
 mod project;
+mod project_file;
 
-pub use command::{CommandOutput, EditCommand, EditorSession, FrameValue, parse_command};
+pub use command::{
+    CommandOutput, EDITOR_COMMAND_NAMES, EDITOR_MANUAL_TOPICS, EXPORT_PRESET_NAMES, EditCommand,
+    EditorSession, FrameValue, ImportedMedia, PROJECT_SETTING_NAMES, format_compact_timecode,
+    parse_command,
+};
 pub use project::{
     MediaId, MediaKind, MediaLink, MediaLinkId, MediaListing, MediaNode, MediaOrigin, MediaPath,
-    MediaProject,
+    MediaProject, ProjectColorSpace, ProjectRateConformPolicy, ProjectRateConformReport,
+    ProjectScanMode, ProjectSettings, VisualScaleMode,
 };
+pub use project_file::{load_project_file, save_project_file, save_project_file_from};
 
 /// Stable identifier for one media source in an edit sequence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

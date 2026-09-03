@@ -7,7 +7,7 @@ fn mpeg2_inspect_decode_encode_and_decode_round_trip() {
     let binary = env!("CARGO_BIN_EXE_mmrecode");
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/mpeg2/valid/main-ml-progressive-ibp.m2v");
-    let stem = format!("mmrecode-cli-mpeg2-slice-{}", std::process::id());
+    let stem = format!("mmrecode-mpeg2-slice-{}", std::process::id());
     let decoded = std::env::temp_dir().join(format!("{stem}.y4m"));
     let encoded = std::env::temp_dir().join(format!("{stem}-encoded.m2v"));
     let roundtrip = std::env::temp_dir().join(format!("{stem}-roundtrip.y4m"));

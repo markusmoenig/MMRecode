@@ -268,6 +268,8 @@ The interaction model resembles a small shell over this linked media graph:
 ```text
 mmrecode edit
 
+new Film using web-1080p30
+import media/camera.ts as Clip0
 pwd
 /
 
@@ -286,7 +288,7 @@ ColorGrade  |===================|
 Mask        |       [mask]      |
 
 info
-in +12f
+in +0:12
 play around cursor
 ```
 
@@ -303,7 +305,7 @@ text add "Hallo" as Title at 12:12 for 4s
 cd Title
 rect add as Background left=5% bottom=6% width=40% height=12% \
     fill=#101018e8 radius=12
-fade in 8f
+fade in 0:08
 ```
 
 There is no separate track object required by the authoring abstraction: ordered child links are
@@ -315,7 +317,53 @@ Familiar navigation commands such as `ls`, `cd`, `pwd`, `tree`, and `info` shoul
 media commands such as `add`, `in`, `out`, `play`, `seek`, `split`, `ripple`, `keyframe`, `render`,
 and `explain`. Mutating commands participate in undoable transactions so a multi-command edit can
 be committed or reverted as one operation. Human-friendly aliases may be accepted interactively,
-while command history and saved projects retain stable media and link identifiers.
+while command history and saved projects retain stable media and link identifiers. The first
+frontend is a full-screen shell from startup, including for an empty project. Up/Down recall
+commands and returning past the newest entry restores the current draft. Interactive command
+history persists across launches. Tab completion follows the same context: it completes commands,
+help/info topics, project settings and presets, delivery presets, project paths for `open`, media
+paths for `import`, and child aliases for `cd`.
+
+Project documents and media are deliberately different operations. `open` loads a versioned
+`.mmrecode` project; `save` and `save as` persist the recursive graph, resolved authoring settings,
+and stable identifiers as readable JSON. `import` probes media and places it in the current local
+timeline. Managed paths are relative to the project document so a project folder can move as a
+unit, while deliberate links outside it remain explicit external paths. A modified session is
+marked and cannot be replaced or quit without saving or an explicit `--discard`.
+The editor begins with a usable Untitled project, so `new` is not required for the normal workflow.
+`save as MyFilm` appends `.mmrecode` automatically and adopts `MyFilm` as the name of that initial
+Untitled project. `new` remains useful for starting another project without restarting the editor
+or for selecting a preset explicitly.
+
+Project settings describe the authoring canvas rather than a delivery codec: dimensions, exact
+frame rate, pixel aspect, scan organization, working color, audio sample rate, and channel count.
+`project presets`, `project preset`, and `project set` resolve these values early. `project match`
+instead probes the currently focused media and adopts its video format plus supported container
+audio format as one undoable, time-preserving project change. Export remains a
+separate operation because one project may produce several deliveries. `export plan` explains the
+work before writing; `export <file> using <preset>` performs it. The first executable delivery is
+the deliberately constrained `mpeg2-ts` path. YouTube-oriented authoring presets exist now, while
+H.264/MP4 delivery remains explicit future work rather than being silently delegated.
+
+Frame rate is not frozen merely because media has been placed. `project set rate <N|N/D>` defaults
+to `conform time`: direct root placement boundaries are rescaled to preserve presentation time and
+non-exact results are explicitly counted as nearest-frame rounding. `conform frames` instead keeps
+the integer root frame numbers and intentionally changes their presentation time. The operation is
+undoable and never rewrites a media definition's native time base or source in/out range. Nested
+timelines remain local to their media. The first MPEG-2 delivery path demonstrates the intended
+boundary: compatible material remains packet-preserved, while a rate or canvas mismatch selects a
+visible full-render plan that decodes, conforms, scales/composites, and re-encodes.
+
+The panel beside the monitor combines inspection with contextual command discovery. On startup,
+`help` presents the concise vocabulary; `man <command>` presents detailed syntax and behavior;
+`info` follows the selected media while `info project`, `info video`, `info audio`, and `info
+source` request focused views. A successful command may expose its next useful operations in the
+same panel. For example, after `in` or `out` selects a trim boundary, `left <time>` and `right
+<time>` adjust that boundary without repeating its name. These conveniences expand to the same
+canonical typed commands used by scripts.
+Command names, manual topics, setting names, and delivery preset names are shared metadata rather
+than separate UI copies. Tests require the interactive manuals to cover that vocabulary so adding
+a command or setting cannot silently leave the built-in documentation behind.
 
 Each navigation step establishes local presentation time. Child timing is relative to its parent;
 by default children follow the parent's presentation time when that placement moves. Source-time
@@ -323,10 +371,15 @@ mapping remains explicit so trims cannot silently change whether an attachment f
 or original source time. Composition cycles are invalid even though reusable media may have several
 acyclic placements.
 
-Time notation must be explicit and frame-accurate. Depending on context, the editor may accept
-timecode (`00:00:12:12`), seconds plus frames (`12s+12f`), absolute frames (`312f`), decimal media
-time (`12.480s`), and relative expressions (`+8f` or `start+12f`). The resolved time base and any
-rounding must remain visible rather than becoming an implicit user-interface decision.
+Time notation must be explicit and frame-accurate. The canonical editor form is compact non-drop
+timecode counted from the right: `1:15` is one second and fifteen frames, `2:01:15` is two minutes,
+one second, and fifteen frames, and `1:02:03:12` includes hours. Only occupied leading fields are
+shown, while the frame field is always present. A leading `+` or `-` makes a trim relative, as in
+`out -0:10`; without it, `out 1:15` is absolute. Resolution uses the current media's native rate,
+including a nominal frame field for fractional rates such as 30000/1001. Drop-frame notation,
+decimal media time, named anchors, and explicit cross-time-base conversion can be added later
+without changing the internal exact timestamps. Legacy raw-frame syntax remains readable for early
+scripts but is not the editor's displayed language.
 
 ### One command model, multiple frontends
 
@@ -348,10 +401,19 @@ frontend that created it.
 
 The first implemented command slice establishes this boundary in `mmrecode-edit`. `MediaProject`
 stores stable media definitions and timed placement links; `MediaPath` traverses placement context;
-and `EditorSession` applies typed navigation, add, trim, undo, and redo commands. Both
-`mmrecode edit` and `mmrecode edit <script>` call the same parser/session implementation. Project
-persistence, source import, graph-to-render compilation, and preview integration with the editor
-session remain explicit next slices rather than hidden behavior in this prototype.
+and `EditorSession` applies typed project lifecycle, import, navigation, settings, export requests,
+add, trim, undo, and redo commands.
+Both `mmrecode edit` and `mmrecode edit <script>` call the same parser/session implementation. The
+CLI now resolves an `import` request by probing a real MPEG-2 ES/TS source, inserting it as an
+undoable media placement, and entering the same terminal preview used by standalone playback.
+Commands typed below the moving image mutate that shared session; trims, undo, and redo update the
+playable source range immediately. Versioned project persistence, resolved presets, dirty-state
+protection, and project-root MPEG-2/TS timeline export are implemented. Export is independent of
+the current navigation context and walks every root placement, trim, position, and gap. A single
+compatible placement may take the packet-preserving path; other progressive root timelines take a
+CPU full-render path with explicit fit, fill, stretch, and native placement modes. Fingerprints,
+relinking/collection, recursive generated/effect composition, alpha, audio delivery, and dedicated
+adjustment modes remain explicit next slices.
 
 ### Preview and render transparency
 
@@ -361,15 +423,34 @@ preview window and simpler textual fallbacks keep the editor useful across termi
 consumer of the same media graph, effects, clock, and color rules as final rendering, although it
 may deliberately select lower-resolution or proxy processing for responsiveness.
 
-The first preview proof is implemented independently as `mmrecode preview <media-file>`. It renders
+The first preview proof is available independently as `mmrecode preview <media-file>`. It renders
 real MPEG-2 ES/TS frames using a capability-selected Kitty, Sixel, or iTerm2 image protocol and a
 24-bit Unicode half-block fallback. Direct Kitty playback switches between completely uploaded
 image slots instead of blanking the visible placement between frames. Decoding and fallback
 terminal image encoding are asynchronous and use a bounded look-ahead cache, so input
-stays responsive during playback and seeking. This deliberately tests whether a terminal can be a
-credible visual editor surface before command grammar grows. The next integration should place this
-same preview backend beside `mmrecode edit`; it should not create a second playback or rendering
-model.
+stays responsive during playback and seeking. `mmrecode edit` now embeds this exact backend beside
+the shared command prompt for its first real-source edit loop; no second playback or rendering
+model was introduced. The terminal surface exists before media is imported and uses a compact
+monitor, contextual help/inspector, result area, command prompt, and graphical timeline rather than
+treating the monitor as the entire editor. The timeline combines a time ruler,
+retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures with keyboard/mouse
+scrubbing. The first integration deliberately previews one MPEG-2 placement, leaving recursive
+composition and synchronized audio for later bounded slices.
+
+The layout may later switch between the complete editing workspace and a full-screen monitor while
+retaining the same session, playback controller, frame cache, and playhead. Likewise, the timeline
+may become a raster surface rendered by MMRecode and sent through the same terminal image protocol
+as preview frames. A hybrid remains preferable initially: terminal-native text stays sharp and
+accessible, while dense thumbnails, waveforms, curves, and colored timeline content use pixels.
+
+The contextual panel follows the current hierarchical location rather than acting as a fixed
+transport help box. At the project root it presents project identity, duration, time base, and
+child count. Inside a media placement it presents the linked definition, source and parent ranges,
+origin, and kind-specific settings such as video dimensions, chroma, scan mode, rate, and coding
+profile. The last semantic command may select a focused view: after `in` or `out`, the inspector
+emphasizes that boundary, the exact command, opposite boundary, selected duration, playhead, and
+available focused adjustment commands. `help`, `man`, and the explicit `info` topics use this same
+panel, keeping discovery tied to the current media hierarchy and operation.
 
 Codec-aware behavior should be visible during editing. Commands such as `explain` should report
 which areas will be copied, timestamp-rewritten, bridge-encoded, or fully rendered and why. This
