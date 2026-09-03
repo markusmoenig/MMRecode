@@ -19,6 +19,11 @@ use mmrecode_edit::{Clip, ClipId, EditSequence, SourceId, TimeRange, Track, Trac
 mod compositor;
 pub use compositor::scale_yuv420_to_canvas;
 
+#[cfg(feature = "h264")]
+mod h264;
+#[cfg(feature = "h264")]
+pub use h264::{H264CleanRemuxPlan, execute_h264_clean_remux, plan_h264_clean_remux};
+
 #[cfg(feature = "mpeg2")]
 mod mpeg2;
 #[cfg(feature = "mpeg2")]

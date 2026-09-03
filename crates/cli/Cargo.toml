@@ -19,13 +19,15 @@ image.workspace = true
 mmrecode-core.workspace = true
 mmrecode-dv.workspace = true
 mmrecode-edit.workspace = true
+mmrecode-h264.workspace = true
+mmrecode-isobmff.workspace = true
 mmrecode-mjpeg.workspace = true
 mmrecode-mpegaudio.workspace = true
 mmrecode-mpeg2.workspace = true
 mmrecode-mpegts.workspace = true
 mmrecode-playback.workspace = true
 mmrecode-quality.workspace = true
-mmrecode-render = { workspace = true, features = ["mpegts"] }
+mmrecode-render = { workspace = true, features = ["h264", "mpegts"] }
 mmrecode-y4m.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true

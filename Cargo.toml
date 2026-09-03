@@ -5,10 +5,12 @@ members = [
     "crates/capi",
     "crates/cli",
     "crates/codecs/dv",
+    "crates/codecs/h264",
     "crates/codecs/mjpeg",
     "crates/codecs/mpegaudio",
     "crates/codecs/mpeg2",
     "crates/containers/mpegts",
+    "crates/containers/isobmff",
     "crates/containers/y4m",
     "crates/core",
     "crates/edit",
@@ -36,11 +38,13 @@ mmrecode-bitstream = { path = "crates/bitstream" }
 mmrecode-capi = { path = "crates/capi" }
 mmrecode-core = { path = "crates/core" }
 mmrecode-dv = { path = "crates/codecs/dv" }
+mmrecode-h264 = { path = "crates/codecs/h264" }
 mmrecode-edit = { path = "crates/edit" }
 mmrecode-mjpeg = { path = "crates/codecs/mjpeg" }
 mmrecode-mpegaudio = { path = "crates/codecs/mpegaudio" }
 mmrecode-mpeg2 = { path = "crates/codecs/mpeg2" }
 mmrecode-mpegts = { path = "crates/containers/mpegts" }
+mmrecode-isobmff = { path = "crates/containers/isobmff" }
 mmrecode-playback = { path = "crates/playback" }
 mmrecode-quality = { path = "crates/quality" }
 mmrecode-render = { path = "crates/render" }

@@ -23,7 +23,7 @@ returns a complete video/audio settings snapshot, which the session applies atom
 same time-preserving conformance and undo semantics.
 `mmrecode edit` and `mmrecode edit <script>` use the same parser and `EditorSession`. Mutations
 return an explicit changed event so an interactive frontend can refresh preview without making
-preview a script-side edit semantic. The CLI's first MPEG-2 ES/TS integration uses that event to
+preview a script-side edit semantic. The CLI's MPEG-2 ES/TS and H.264 MP4/MOV integrations use that event to
 update the full-screen terminal preview range immediately after trims and undo/redo. Interactive
 frontends may expose contextual aliases such as `left <time>` after an in/out operation, but expand
 them into canonical typed trim commands before applying them.
@@ -64,5 +64,5 @@ placement ranges, project-relative managed paths, and explicit external paths. S
 sessions track clean/modified state. The CLI host appends `.mmrecode` to save targets and makes the
 first Save As file stem the initial Untitled project's name; the session adopts this canonicalized
 snapshot only after the write succeeds. Current limits remain intentional: the host importer accepts
-MPEG-2 ES/TS video, while fingerprints, relinking/collection, recursive composition preview and
+MPEG-2 ES/TS and non-fragmented H.264 MP4/MOV video, while fingerprints, relinking/collection, recursive composition preview and
 export, speed mapping, automation curves, and detailed effect schemas are not implemented yet.

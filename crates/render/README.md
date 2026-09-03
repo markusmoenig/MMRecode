@@ -65,6 +65,14 @@ boundaries, resumes packet copy between them, concatenates a second source, and 
 resulting 14-frame timeline natively and with FFmpeg. Production VBV continuity, transitions,
 multi-clip audio, and progress/cancellation remain future slices.
 
+The optional `h264` feature adds a deliberately narrower lossless path. It indexes AVC samples in
+an MP4/MOV, accepts only half-open presentation ranges whose start and end are matching container
+sync samples containing IDR pictures, verifies that the selected pictures form complete contiguous
+decode-order GOPs with no external dependencies, and remuxes their encoded bytes unchanged into a
+video-only MP4. It reports presentation and decode ranges, GOP count, copied bytes, and zero encoded
+frames. Cuts inside a GOP are rejected explicitly; they are not rounded. This is clean-GOP remuxing,
+not yet general H.264 smart rendering.
+
 The `mmrecode` binary exposes the earlier one-clip path as `render-plan` and `render`. Those
 argument-heavy commands are development and integration-test harnesses, not the intended editor
 interface. The user-facing direction is one typed command model shared by script files and an

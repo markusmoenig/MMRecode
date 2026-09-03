@@ -1,6 +1,6 @@
 [package]
-name = "mmrecode-playback"
-description = "Media timeline and playback clock primitives for MMRecode"
+name = "mmrecode-isobmff"
+description = "ISO Base Media File Format and QuickTime sample-table demuxing for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,9 +10,6 @@ publish.workspace = true
 
 [dependencies]
 mmrecode-core.workspace = true
-mmrecode-h264.workspace = true
-mmrecode-isobmff.workspace = true
-mmrecode-mpeg2.workspace = true
 
 [lints]
 workspace = true

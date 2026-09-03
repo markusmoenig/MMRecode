@@ -1,21 +1,27 @@
 //! Reusable media timeline and playback-clock primitives.
 
+mod h264;
 mod mpeg2;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use mmrecode_core::{Error, Rational, Result};
 
+pub use h264::{H264PlaybackEvent, H264PlaybackSource, H264VideoIndex, IndexedH264Frame};
 pub use mpeg2::{IndexedMpeg2Frame, Mpeg2PlaybackEvent, Mpeg2PlaybackSource, Mpeg2VideoIndex};
 
-/// A fixed-rate video timeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A fixed- or variable-frame-rate video timeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaybackTimeline {
     frame_rate: Rational,
     rate_numerator: u128,
     rate_denominator: u128,
     frame_count: usize,
     duration: Duration,
+    frame_positions: Option<Arc<[Duration]>>,
 }
 
 impl PlaybackTimeline {
@@ -47,37 +53,94 @@ impl PlaybackTimeline {
             rate_denominator,
             frame_count,
             duration,
+            frame_positions: None,
+        })
+    }
+
+    /// Creates a variable-frame-rate timeline from normalized presentation positions.
+    ///
+    /// `nominal_frame_rate` remains available for timecode and UI scaling. Frame selection and
+    /// playback use the exact positions, which must begin at zero and increase strictly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid nominal rate, empty or unordered positions, or positions
+    /// that do not fit within `duration`.
+    pub fn variable(
+        nominal_frame_rate: Rational,
+        frame_positions: Vec<Duration>,
+        duration: Duration,
+    ) -> Result<Self> {
+        if frame_positions.is_empty() {
+            return Err(Error::InvalidData(
+                "a playback timeline must contain at least one frame".into(),
+            ));
+        }
+        if nominal_frame_rate.numerator() <= 0 || nominal_frame_rate.denominator() <= 0 {
+            return Err(Error::InvalidData(
+                "a playback frame rate must be positive".into(),
+            ));
+        }
+        if frame_positions[0] != Duration::ZERO
+            || !frame_positions.windows(2).all(|pair| pair[0] < pair[1])
+            || frame_positions
+                .last()
+                .is_none_or(|position| *position >= duration)
+        {
+            return Err(Error::InvalidData(
+                "variable playback positions must start at zero, increase, and precede duration"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            frame_rate: nominal_frame_rate,
+            rate_numerator: u128::try_from(nominal_frame_rate.numerator())
+                .map_err(|_| Error::InvalidData("frame-rate numerator is negative".into()))?,
+            rate_denominator: u128::try_from(nominal_frame_rate.denominator())
+                .map_err(|_| Error::InvalidData("frame-rate denominator is negative".into()))?,
+            frame_count: frame_positions.len(),
+            duration,
+            frame_positions: Some(frame_positions.into()),
         })
     }
 
     /// Returns the exact nominal frame rate.
     #[must_use]
-    pub const fn frame_rate(self) -> Rational {
+    pub const fn frame_rate(&self) -> Rational {
         self.frame_rate
     }
 
     /// Returns the number of video frames.
     #[must_use]
-    pub const fn frame_count(self) -> usize {
+    pub const fn frame_count(&self) -> usize {
         self.frame_count
     }
 
-    /// Returns the nominal duration of all frames.
+    /// Returns the presentation duration of all frames.
     #[must_use]
-    pub const fn duration(self) -> Duration {
+    pub const fn duration(&self) -> Duration {
         self.duration
     }
 
     /// Returns the presentation position of a frame, saturating at the last frame.
     #[must_use]
-    pub fn position_of_frame(self, frame_index: usize) -> Duration {
+    pub fn position_of_frame(&self, frame_index: usize) -> Duration {
         let index = frame_index.min(self.frame_count - 1);
+        if let Some(positions) = &self.frame_positions {
+            return positions[index];
+        }
         scaled_duration_saturating(index as u128 * self.rate_denominator, self.rate_numerator)
     }
 
     /// Selects the frame visible at `position`, saturating at the last frame.
     #[must_use]
-    pub fn frame_at(self, position: Duration) -> usize {
+    pub fn frame_at(&self, position: Duration) -> usize {
+        if let Some(positions) = &self.frame_positions {
+            return positions
+                .partition_point(|candidate| *candidate <= position)
+                .saturating_sub(1)
+                .min(self.frame_count - 1);
+        }
         let nanos = position.as_nanos();
         let numerator = nanos.saturating_mul(self.rate_numerator);
         let denominator = 1_000_000_000_u128 * self.rate_denominator;
@@ -121,8 +184,8 @@ impl PlaybackController {
 
     /// Returns the underlying video timeline.
     #[must_use]
-    pub const fn timeline(&self) -> PlaybackTimeline {
-        self.timeline
+    pub const fn timeline(&self) -> &PlaybackTimeline {
+        &self.timeline
     }
 
     /// Returns whether playback is currently advancing.
@@ -249,6 +312,25 @@ mod tests {
         assert_eq!(timeline.frame_at(Duration::ZERO), 0);
         assert_eq!(timeline.frame_at(timeline.position_of_frame(123)), 123);
         assert_eq!(timeline.frame_at(timeline.duration()), 299);
+    }
+
+    #[test]
+    fn maps_variable_frame_positions_exactly() {
+        let timeline = PlaybackTimeline::variable(
+            Rational::new(30, 1).unwrap(),
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(20),
+                Duration::from_millis(70),
+            ],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert_eq!(timeline.frame_at(Duration::from_millis(19)), 0);
+        assert_eq!(timeline.frame_at(Duration::from_millis(20)), 1);
+        assert_eq!(timeline.frame_at(Duration::from_millis(69)), 1);
+        assert_eq!(timeline.frame_at(Duration::from_millis(70)), 2);
+        assert_eq!(timeline.position_of_frame(2), Duration::from_millis(70));
     }
 
     #[test]

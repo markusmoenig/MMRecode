@@ -22,7 +22,9 @@ roadmap does not turn every possible feature into an immediate commitment.
    and backpressure.
 6. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
    the reusable codec layer.
-7. Start H.264 only after the edit/render interfaces have been exercised by the existing codecs.
+7. Extend the native H.264 decoder foundation from raw IDR macroblocks through intra prediction,
+   residual decoding, inter prediction, reference management, and deblocking; then extend the new
+   clean-GOP remuxer into dependency-aware arbitrary edit boundaries.
 
 ## Shared core and bitstream
 
@@ -169,7 +171,7 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
   source/timeline ranges, ordered children, contextual paths, and cycle rejection.
 - [x] Add the first shared typed command/session layer and `mmrecode edit [script]` frontend with
   `pwd`, `ls`, `info`, `cd`, `add`, `in`, `out`, undo, and redo.
-- [x] Add a host-resolved typed `import` request and probe real MPEG-2 ES/TS sources into an
+- [x] Add a host-resolved typed `import` request and probe real MPEG-2 ES/TS and H.264 MP4/MOV sources into an
   undoable external media placement with its native frame time base.
 - [x] Persist a readable versioned project snapshot with resolved authoring settings, stable IDs,
   project-relative managed media, explicit external links, atomic save, and validated load.
@@ -193,7 +195,7 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
 - [ ] Compile nested media/effect content recursively into the flattened render intent, including
   alpha-aware composition rather than the current opaque-video ordering.
 - [x] Prove capability-selected Kitty, Sixel, iTerm2, and 24-bit half-block terminal preview with
-  real asynchronous MPEG-2 ES/TS playback, stepping, seeking, looping, and bounded buffering.
+  real asynchronous MPEG-2 ES/TS and H.264 MP4/MOV playback, stepping, seeking, looping, and bounded buffering.
 - [x] Add a double-buffered direct Kitty playback path for flicker-free local terminal
   video in Kitty-compatible terminals such as Ghostty.
 - [x] Make `mmrecode` / `mmrecode edit` a full-screen editor shell even with no source loaded, then
@@ -303,26 +305,73 @@ cache; other media and audio remain eager.
 
 ## Additional containers
 
-**Status:** MPEG-TS and Y4M are the only container/file-format slices. Each item below should be its
-own crate and bounded vertical slice.
+**Status:** MPEG-TS, Y4M, and a first ISO-BMFF/QuickTime sample-table demuxer plus single-video-track
+MP4 writer exist. Each remaining item below should be its own crate and bounded vertical slice.
 
 - [ ] **AVI:** prioritize OpenDML indexing, MJPEG, DV, PCM, and metadata preservation.
-- [ ] **QuickTime/MOV and ISO BMFF/MP4:** start with sample tables, timestamps, seeking, and the
-  codecs actually implemented by MMRecode; keep MOV-specific behavior explicit.
+- [x] **QuickTime/MOV and ISO BMFF/MP4:** read non-fragmented sample tables, DTS/PTS and composition
+  offsets, sync samples, chunk offsets, `avcC`, `pasp`, `colr`, track rotation, basic AAC sample-entry
+  metadata, generic packets, and keyframe-aligned seeking for H.264 editor import/playback.
+- [ ] Add fragmented MP4, edit lists, multiple sample descriptions, richer metadata preservation,
+  incremental I/O, and audio/multitrack muxing as separate ISO-BMFF slices.
 - [ ] **MPEG Program Stream/VOB:** add PES, SCR, navigation/private-stream handling, and MPEG-2/MP2
   mappings as required by archive/DVD workflows.
 - [ ] **MXF:** begin with one operational pattern and concrete DV/MPEG-2 archive samples rather than
   attempting all of SMPTE MXF at once.
 - [ ] Add container-independent indexing and metadata-preservation tests shared by these crates.
 
-## Future video codecs
+## H.264 and future video codecs
 
-**Status:** No H.264, HEVC, AV1, or VVC crate has been started. These should not block proving the
-editing architecture with the current codecs.
+**Status:** The H.264 syntax/indexing, MP4/MOV editor import/playback, and video-only clean-GOP
+remux slices are implemented.
+Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
+currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
+in-loop deblocking and single-reference CAVLC P slices are also implemented, including skip,
+16x16, 16x8, 8x16, and sub-macroblock partitions with fractional-sample motion compensation,
+explicit weighted prediction, and inter residuals. The same path accepts the High Profile subset using CAVLC, implicit flat
+scaling, and 4x4 transforms. MMRecode itself owns demuxing, timestamps, NAL conversion, SPS/PPS/VUI/slice
+parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have not been started.
 
-- [ ] **H.264/AVC:** begin with Annex B/length-prefixed parsing, parameter sets, access units,
-  reference dependencies, random access, and smart-render planning; then add native decode. Treat a
-  production encoder as a separate decision.
+- [x] **H.264/AVC foundation:** Annex-B and length-prefixed NAL handling, `avcC`, SPS/PPS/VUI and
+  leading slice headers, container-timed access-unit indexing, IDR/reference classification, and a
+  conservative active-reference dependency index.
+- [x] Import, inspect, seek, scrub, and play ordinary non-fragmented H.264 MP4/MOV media in the
+  terminal editor, including `project match` from SPS/VUI and container audio/display metadata.
+- [ ] Replace conservative dependency sets with complete reference-list modification, decoded
+  reference picture marking/MMCO, frame-num gap, field, recovery-point, and POC semantics.
+- [x] Add the native Rust decoder foundation behind the playback interface: activate `avcC`
+  parameter sets, traverse one frame-coded IDR I-slice, reconstruct 8-bit 4:2:0 `I_PCM` and CAVLC
+  `Intra_16x16` and `Intra_4x4` macroblocks with all luma/chroma predictors, neighbor-context coefficient parsing,
+  nonzero DC/AC quantization and inverse transforms, normative intra-picture deblocking and slice
+  offsets, crop the coded canvas, preserve timing/colour metadata, retain one decoded reference,
+  reconstruct single-reference CAVLC P slices with skip, 16x16, 16x8, 8x16, and sub-macroblock
+  partitions down to 4x4, quarter-sample luma/eighth-sample chroma motion compensation, inter
+  residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture boundary
+  strengths, plus High Profile CAVLC/4x4 streams, and try it before
+  fallback. Verify flat, residual, Intra4, multicolour, deblocked, fractional-motion, partitioned-P,
+  and multi-frame x264 vectors byte-for-byte against independent FFmpeg reconstruction.
+- [x] Establish the native CABAC arithmetic layer and integrate real x264 CABAC `I_PCM`, Intra16,
+  and Intra4 IDRs:
+  initialize adaptive contexts from slice QP, decode regular/bypass/termination bins, cross the
+  byte-aligned PCM region, restart arithmetic decoding, derive neighboring luma/chroma DC/AC
+  coded-block and coded-block-pattern contexts, reconstruct quantized residuals and prediction
+  modes, and verify exact filtered pixels against FFmpeg.
+- [x] Extend CABAC into P slices with all three `cabac_init_idc` tables, skip, 16x16, 16x8, 8x16,
+  and 8x8 partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, context-coded motion-vector
+  differences, luma/chroma residuals, QP deltas, and inter-picture filtering; verify skipped,
+  motion-only, residual, partitioned, and sustained mixed-macroblock x264 GOPs byte-for-byte.
+- [x] Preserve and apply the High Profile QP-zero transform-bypass SPS flag for lossless Intra4 and
+  inter luma/chroma residuals, including horizontal/vertical residual DPCM across chroma sub-blocks;
+  verify mixed CABAC PCM/Intra4 pictures and a lossless P GOP byte-for-byte against FFmpeg.
+- [ ] Complete native H.264 reconstruction with `Intra_8x8`, scaling matrices, remaining CABAC tools,
+  B slices, multiple-reference decoded-picture-buffer/reference-list semantics, fields, multi-slice
+  filtering rules, recovery points, and complete picture ordering; retain system acceleration only
+  as an optional backend.
+- [x] Add explainable video-only clean-GOP MP4 remuxing: require IDR/sync boundaries, verify a
+  contiguous dependency-closed decode range, preserve encoded sample bytes and display metadata,
+  rebuild exact timing/sample tables, and reject rather than round an unsafe cut.
+- [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
+  Treat a production encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.
 - [ ] **AV1:** evaluate as a separate modern-codec slice when it supports a real workflow.
 - [ ] **VVC:** defer until ecosystem demand and patent/licensing requirements justify the cost.

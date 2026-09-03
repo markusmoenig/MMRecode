@@ -3,8 +3,8 @@
 ## Status
 
 This document describes the intended architecture and the implemented Motion JPEG, DV25,
-MPEG-2 Video, and MPEG-2 Transport Stream vertical slices. APIs remain unstable while more
-containers and editing operations exercise the boundaries.
+MPEG-2 Video, MPEG-2 Transport Stream, and first H.264-in-ISO-BMFF vertical slices. APIs remain
+unstable while more containers and editing operations exercise the boundaries.
 
 ## Design goals
 
@@ -81,8 +81,10 @@ crates/
 │   ├── mjpeg/               mmrecode-mjpeg
 │   ├── mpegaudio/           mmrecode-mpegaudio; Layer II framing/timing
 │   ├── dv/                  mmrecode-dv; raw-DV25 slice
-│   └── mpeg2/               mmrecode-mpeg2; MPEG-2 Video elementary-stream slice
+│   ├── mpeg2/               mmrecode-mpeg2; MPEG-2 Video elementary-stream slice
+│   └── h264/                mmrecode-h264; AVC syntax/dependency slice
 ├── containers/
+│   ├── isobmff/             mmrecode-isobmff; MP4/MOV sample-table demuxer
 │   ├── mpegts/              mmrecode-mpegts; H.222.0 transport slice
 │   └── y4m/                 mmrecode-y4m
 ├── playback/                mmrecode-playback; timeline/clock policy
@@ -99,14 +101,11 @@ Planned crates are added only when implementation begins:
 ```text
 crates/
 ├── codecs/
-│   ├── dv/                  mmrecode-dv
-│   ├── h264/                mmrecode-h264
 │   ├── hevc/                mmrecode-hevc
 │   ├── av1/                 mmrecode-av1
 │   └── vvc/                 mmrecode-vvc
 ├── containers/
 │   ├── avi/                 mmrecode-avi
-│   ├── isobmff/             mmrecode-isobmff
 │   └── mxf/                 mmrecode-mxf
 └── facade/                  optional future package: mmrecode-sdk
 ```
@@ -294,6 +293,44 @@ bitrate/VBV size, and GOP timecode origin. Custom matrices affect coefficient qu
 also written into sequence/quant-matrix syntax. Drop-frame timecode is computed for 30000/1001
 content rather than treated as a punctuation flag.
 
+### Implemented H.264 syntax and playback slice
+
+`mmrecode-h264` owns Annex-B and ISO/`avcC` length-prefixed NAL framing, decoder configuration
+records, emulation-prevention removal, Exp-Golomb syntax, SPS/PPS/VUI interpretation, leading slice
+headers, picture classification, and a conservative active-reference index. ISO-BMFF timestamps
+remain authoritative: the syntax index pairs each coded sample with its exact DTS, PTS, duration,
+IDR status, and decode-order dependencies without teaching the container about AVC.
+
+`mmrecode-playback` adapts that index to the existing bounded request/event interface. It selects a
+preceding sync sample and attempts native Rust reconstruction first. The first native pixel slice
+handles single-slice, frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC
+`Intra_16x16`, or CAVLC `Intra_4x4` macroblocks. Its complete Intra16, Intra4, and chroma
+prediction modes work across the macroblock raster, with neighbor-context CAVLC DC/AC parsing,
+quantization, inverse transforms, in-loop deblocking, coded-canvas placement, and display cropping.
+Its CAVLC P-slice path retains one list-0 reference and reconstructs skip, 16x16, 16x8, 8x16, and
+8x8 sub-macroblock partitions down to 4x4. Motion-vector prediction, quarter-sample luma and
+eighth-sample chroma interpolation, explicit weighted prediction, inter residuals, mixed intra
+macroblocks, and inter-picture boundary strengths are native. Baseline and High Profile streams
+using CAVLC, implicit flat scaling, and 4x4 transforms share this path. For unsupported
+reconstruction tools, playback constructs only the
+required Annex-B window and sends it to an optional installed FFmpeg fallback. FFmpeg does not
+demux the file, define timestamps, choose seek points, or perform edit planning.
+The CABAC layer supplies its own context-state initialization, binary arithmetic decision, bypass,
+termination, and restart processes. CABAC `I_PCM`, Intra16, and Intra4 IDRs use that path end to
+end, including prediction syntax, coded-block-pattern and neighboring-block context derivation,
+luma/chroma DC and AC coefficients, quantization, inverse transforms, filtering, and exact
+x264/FFmpeg interoperability coverage. CABAC P slices additionally reconstruct skipped, 16x16,
+16x8, 8x16, and 8x8-partitioned inter macroblocks down to 4x4, plus mixed Intra4/Intra16/PCM
+macroblocks, with context-coded motion-vector differences, luma/chroma residuals, QP deltas, and
+inter-picture filtering. The High Profile QP-zero bypass path directly reconstructs lossless
+Intra4 and inter residual samples, including horizontal/vertical chroma residual DPCM. B slices and
+8x8 transform syntax still return `Unsupported` for fallback.
+Complete decoded-reference-picture marking and reference-list modification remain necessary before
+the index is strong enough for arbitrary-boundary H.264 smart rendering. The first render adapter
+already uses the conservative graph for a stricter operation: it accepts only complete contiguous
+GOPs bounded by MP4 sync samples that contain IDR pictures, reports why the range is copy-safe, and
+copies every encoded sample unchanged. No H.264 encoder has been started.
+
 ### Avoid premature algorithm abstraction
 
 Codecs may share concepts without sharing implementations.
@@ -337,6 +374,21 @@ Container implementations do not own:
 - MPEG-2 GOP semantics
 - H.264 SPS/PPS interpretation
 - Codec reconstruction
+
+### Implemented ISO-BMFF/QuickTime slice
+
+`mmrecode-isobmff` reads non-fragmented MP4/MOV box hierarchies and expands `stsd`, `stts`, `ctts`,
+`stsc`, `stsz`, `stco`/`co64`, and `stss` into generic timed packets. It preserves `avcC` as opaque
+codec configuration and exposes container-level `pasp`, `colr`, audio sample-entry, dimension, and
+track-matrix rotation metadata. Seeking selects the closest preceding video sync sample. The crate
+does not depend on H.264 and never parses parameter sets or slice syntax.
+
+The crate also has a minimal single-video-track MP4 writer for clean packet-copy workflows. It
+rebuilds decode/composition-time, size, chunk, and sync tables while preserving opaque `avcC`,
+rotation, pixel aspect, colour metadata, and sample bytes. The render adapter—not the writer—proves
+that a requested H.264 range is independently decodable. The current slice deliberately excludes
+fragmented movies, edit lists, multiple active sample descriptions, incremental I/O, DRM,
+audio/multitrack muxing, and files above 4 GiB.
 
 ### Implemented MPEG-2 Transport Stream slice
 

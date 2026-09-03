@@ -1809,6 +1809,8 @@ dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
  "mmrecode-edit",
+ "mmrecode-h264",
+ "mmrecode-isobmff",
  "mmrecode-mjpeg",
  "mmrecode-mpeg2",
  "mmrecode-mpegaudio",
@@ -1862,6 +1864,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmrecode-h264"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-bitstream",
+ "mmrecode-core",
+ "mmrecode-isobmff",
+]
+
+[[package]]
+name = "mmrecode-isobmff"
+version = "0.0.1"
+dependencies = [
+ "mmrecode-core",
+]
+
+[[package]]
 name = "mmrecode-mjpeg"
 version = "0.0.1"
 dependencies = [
@@ -1903,6 +1921,8 @@ name = "mmrecode-playback"
 version = "0.0.1"
 dependencies = [
  "mmrecode-core",
+ "mmrecode-h264",
+ "mmrecode-isobmff",
  "mmrecode-mpeg2",
 ]
 
@@ -1921,6 +1941,8 @@ dependencies = [
  "mmrecode-core",
  "mmrecode-dv",
  "mmrecode-edit",
+ "mmrecode-h264",
+ "mmrecode-isobmff",
  "mmrecode-mjpeg",
  "mmrecode-mpeg2",
  "mmrecode-mpegaudio",

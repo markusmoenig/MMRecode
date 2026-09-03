@@ -16,9 +16,9 @@ use mmrecode_core::{ColorRange, PixelFormat, Plane, Rational, VideoFrame};
 use mmrecode_edit::{
     CommandOutput, EditCommand, EditorSession, MediaOrigin, MediaPath, format_compact_timecode,
 };
-use mmrecode_mpeg2::DecodedMpeg2Picture;
 use mmrecode_playback::{
-    Mpeg2PlaybackEvent, Mpeg2PlaybackSource, PlaybackController, PlaybackTimeline,
+    H264PlaybackEvent, H264PlaybackSource, Mpeg2PlaybackEvent, Mpeg2PlaybackSource,
+    PlaybackController, PlaybackTimeline,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -39,8 +39,7 @@ use ratatui_image::{
     thread::{ResizeRequest, ResizeResponse, ThreadProtocol},
 };
 
-use crate::command_history::CommandHistory;
-use crate::prompt_completion;
+use crate::{command_history::CommandHistory, media_probe, prompt_completion};
 
 const LOOK_AHEAD: usize = 23;
 const BUFFER_FRAMES: usize = 8;
@@ -48,7 +47,7 @@ const REFILL_THRESHOLD: usize = 12;
 const CACHE_FRAMES: usize = 36;
 const EVENT_WAIT: Duration = Duration::from_millis(8);
 
-/// Runs the interactive terminal preview for an MPEG-2 elementary or transport stream.
+/// Runs the interactive terminal preview for supported MPEG-2 or H.264 media.
 pub(crate) fn run(path: &Path) -> Result<(), String> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("preview requires an interactive terminal on stdin and stdout".into());
@@ -63,9 +62,12 @@ pub(crate) fn run(path: &Path) -> Result<(), String> {
     result.and(restore_result)
 }
 
-pub(crate) fn open_source(path: &Path) -> Result<Mpeg2PlaybackSource, String> {
+fn open_source(path: &Path) -> Result<PreviewSource, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("cannot read '{}': {error}", path.display()))?;
+    if media_probe::looks_like_isobmff(&bytes) {
+        return H264PlaybackSource::new(bytes).map(PreviewSource::H264);
+    }
     let elementary = if bytes.len() >= mmrecode_mpegts::TS_PACKET_SIZE && bytes[0] == 0x47 {
         mmrecode_mpegts::demux_transport_stream(&bytes)
             .map_err(|error| error.to_string())?
@@ -74,7 +76,7 @@ pub(crate) fn open_source(path: &Path) -> Result<Mpeg2PlaybackSource, String> {
     } else {
         bytes
     };
-    Mpeg2PlaybackSource::new(elementary)
+    Mpeg2PlaybackSource::new(elementary).map(PreviewSource::Mpeg2)
 }
 
 /// Runs the full-screen editor shell, initially with an empty project.
@@ -119,7 +121,7 @@ fn spawn_resize_worker() -> Result<ResizeWorker, String> {
 
 fn run_initialized(
     terminal: &mut DefaultTerminal,
-    source: Mpeg2PlaybackSource,
+    source: PreviewSource,
     path: &Path,
 ) -> Result<(), String> {
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
@@ -779,11 +781,10 @@ fn load_editor_media(
             candidate.display()
         )
     })?;
+    let probe = media_probe::probe_media(&path, session.project().settings())?;
     let source = open_source(&path)?;
-    let rate = source.index().frame_rate();
-    let time_base =
-        Rational::new(rate.denominator(), rate.numerator()).map_err(|error| error.to_string())?;
-    let duration = i64::try_from(source.index().frame_count())
+    let time_base = probe.frame_time_base()?;
+    let duration = i64::try_from(probe.frame_count)
         .map_err(|_| "media frame count exceeds editor limits".to_owned())?;
     let name = path
         .file_name()
@@ -809,8 +810,7 @@ fn load_editor_media(
         .add_imported_media(&mmrecode_edit::ImportedMedia {
             name: name.clone(),
             alias: alias.clone(),
-            kind: mmrecode_edit::MediaKind::new("video/mpeg2")
-                .map_err(|error| error.to_string())?,
+            kind: probe.kind,
             time_base,
             duration,
             origin: MediaOrigin::External { path: path.clone() },
@@ -840,7 +840,7 @@ fn load_project_preview(
         .list(&MediaPath::root())
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|entry| entry.kind.as_str() == "video/mpeg2")
+        .find(|entry| matches!(entry.kind.as_str(), "video/mpeg2" | "video/h264"))
     else {
         return Ok(None);
     };
@@ -984,9 +984,124 @@ fn event_loop(
     }
 }
 
+enum PreviewSource {
+    Mpeg2(Mpeg2PlaybackSource),
+    H264(H264PlaybackSource),
+}
+
+impl From<Mpeg2PlaybackSource> for PreviewSource {
+    fn from(source: Mpeg2PlaybackSource) -> Self {
+        Self::Mpeg2(source)
+    }
+}
+
+impl From<H264PlaybackSource> for PreviewSource {
+    fn from(source: H264PlaybackSource) -> Self {
+        Self::H264(source)
+    }
+}
+
+enum PreviewDecodeEvent {
+    Frame {
+        generation: u64,
+        frame_index: usize,
+        frame: Box<VideoFrame>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+impl PreviewSource {
+    fn frame_count(&self) -> usize {
+        match self {
+            Self::Mpeg2(source) => source.index().frame_count(),
+            Self::H264(source) => source.index().frame_count(),
+        }
+    }
+
+    fn playback_timeline(&self) -> Result<PlaybackTimeline, String> {
+        match self {
+            Self::Mpeg2(source) => {
+                PlaybackTimeline::new(source.index().frame_rate(), source.index().frame_count())
+                    .map_err(|error| error.to_string())
+            }
+            Self::H264(source) => source.index().playback_timeline(),
+        }
+    }
+
+    fn request(&mut self, frame_index: usize, look_ahead: usize) -> Result<u64, String> {
+        match self {
+            Self::Mpeg2(source) => source.request(frame_index, look_ahead),
+            Self::H264(source) => source.request(frame_index, look_ahead),
+        }
+    }
+
+    fn try_event(&self) -> Result<Option<PreviewDecodeEvent>, String> {
+        match self {
+            Self::Mpeg2(source) => source.try_event().map(|event| {
+                event.map(|event| match event {
+                    Mpeg2PlaybackEvent::Frame {
+                        generation,
+                        frame_index,
+                        picture,
+                    } => PreviewDecodeEvent::Frame {
+                        generation,
+                        frame_index,
+                        frame: Box::new(picture.frame),
+                    },
+                    Mpeg2PlaybackEvent::Error {
+                        generation,
+                        message,
+                    } => PreviewDecodeEvent::Error {
+                        generation,
+                        message,
+                    },
+                })
+            }),
+            Self::H264(source) => source.try_event().map(|event| {
+                event.map(|event| match event {
+                    H264PlaybackEvent::Frame {
+                        generation,
+                        frame_index,
+                        frame,
+                    } => PreviewDecodeEvent::Frame {
+                        generation,
+                        frame_index,
+                        frame,
+                    },
+                    H264PlaybackEvent::Error {
+                        generation,
+                        message,
+                    } => PreviewDecodeEvent::Error {
+                        generation,
+                        message,
+                    },
+                })
+            }),
+        }
+    }
+
+    fn is_intra_frame(&self, frame_index: usize) -> bool {
+        match self {
+            Self::Mpeg2(source) => source
+                .index()
+                .frames()
+                .get(frame_index)
+                .is_some_and(|frame| frame.picture_type == mmrecode_mpeg2::PictureType::I),
+            Self::H264(source) => source
+                .index()
+                .frames()
+                .get(frame_index)
+                .is_some_and(|frame| frame.is_idr),
+        }
+    }
+}
+
 struct PreviewApp {
-    source: Mpeg2PlaybackSource,
-    frames: BTreeMap<usize, Box<DecodedMpeg2Picture>>,
+    source: PreviewSource,
+    frames: BTreeMap<usize, Box<VideoFrame>>,
     generation: u64,
     requested_range: Range<usize>,
     playback: PlaybackController,
@@ -1004,16 +1119,15 @@ struct PreviewApp {
 
 impl PreviewApp {
     fn new(
-        source: Mpeg2PlaybackSource,
+        source: impl Into<PreviewSource>,
         picker: Picker,
         resize_tx: mpsc::Sender<ResizeRequest>,
         path: &Path,
         terminal_size: Size,
     ) -> Result<Self, String> {
-        let timeline =
-            PlaybackTimeline::new(source.index().frame_rate(), source.index().frame_count())
-                .map_err(|error| error.to_string())?;
-        let playback_range = 0..source.index().frame_count();
+        let source = source.into();
+        let timeline = source.playback_timeline()?;
+        let playback_range = 0..source.frame_count();
         let direct_kitty = picker.protocol_type() == ProtocolType::Kitty && !inside_tmux();
         Ok(Self {
             source,
@@ -1168,18 +1282,18 @@ impl PreviewApp {
     fn poll_decoder(&mut self) -> Result<(), String> {
         while let Some(event) = self.source.try_event()? {
             match event {
-                Mpeg2PlaybackEvent::Frame {
+                PreviewDecodeEvent::Frame {
                     generation,
                     frame_index,
-                    picture,
+                    frame,
                 } if generation == self.generation => {
-                    self.frames.insert(frame_index, picture);
+                    self.frames.insert(frame_index, frame);
                 }
-                Mpeg2PlaybackEvent::Error {
+                PreviewDecodeEvent::Error {
                     generation,
                     message,
                 } if generation == 0 || generation == self.generation => return Err(message),
-                Mpeg2PlaybackEvent::Frame { .. } | Mpeg2PlaybackEvent::Error { .. } => {}
+                PreviewDecodeEvent::Frame { .. } | PreviewDecodeEvent::Error { .. } => {}
             }
         }
         let focus = self.playback.frame_index();
@@ -1206,15 +1320,15 @@ impl PreviewApp {
         {
             return Ok(());
         }
-        let Some(picture) = self.frames.get(&frame_index) else {
+        let Some(video_frame) = self.frames.get(&frame_index) else {
             return Ok(());
         };
         let bounds = if self.kitty.is_some() {
-            native_pixel_bounds(&picture.frame)?
+            native_pixel_bounds(video_frame)?
         } else {
             fallback_pixel_bounds(self.terminal_size, self.picker.font_size())
         };
-        let image = video_frame_image(&picture.frame, bounds)?;
+        let image = video_frame_image(video_frame, bounds)?;
         if let Some(kitty) = &mut self.kitty {
             kitty.queue(frame_index, image.into_rgb8());
         } else if let Some(image_state) = &mut self.image_state {
@@ -2064,51 +2178,83 @@ fn source_inspector_text(media: &mmrecode_edit::MediaNode) -> String {
 }
 
 fn append_video_inspector(text: &mut String, app: &PreviewApp) {
-    let Some(frame) = app
-        .source
-        .index()
-        .frames()
-        .get(app.playback.frame_index())
-        .or_else(|| app.source.index().frames().first())
-    else {
-        return;
-    };
-    let sequence = &frame.sequence;
-    let chroma = match sequence.chroma_format {
-        mmrecode_mpeg2::ChromaFormat::Yuv420 => "4:2:0",
-        mmrecode_mpeg2::ChromaFormat::Yuv422 => "4:2:2",
-        mmrecode_mpeg2::ChromaFormat::Yuv444 => "4:4:4",
-        mmrecode_mpeg2::ChromaFormat::Reserved => "reserved",
-    };
-    let scan = if sequence.progressive_sequence {
-        "progressive"
-    } else {
-        "interlaced/mixed"
-    };
-    let display = sequence.display.map_or_else(
-        || format!("{}×{}", sequence.width, sequence.height),
-        |display| {
-            format!(
-                "{}×{}",
-                display.display_horizontal_size, display.display_vertical_size
-            )
-        },
-    );
-    let bit_rate = sequence.bit_rate.map_or_else(
-        || "unspecified".into(),
-        |bits| format!("{}.{:03} Mb/s", bits / 1_000_000, bits % 1_000_000 / 1_000),
-    );
-    let _ = write!(
-        text,
-        "\n\nVideo\nCodec      MPEG-2 Video\nCoded      {}×{}\nDisplay    {display}\nChroma     {chroma}\nScan       {scan}\nRate       {}/{} fps\nBit rate   {bit_rate}\nProfile    0x{:02x}\nPicture    {:?} / {:?}",
-        sequence.width,
-        sequence.height,
-        sequence.frame_rate.numerator(),
-        sequence.frame_rate.denominator(),
-        sequence.profile_and_level_indication,
-        frame.picture_type,
-        frame.picture_structure,
-    );
+    match &app.source {
+        PreviewSource::Mpeg2(source) => {
+            let Some(frame) = source
+                .index()
+                .frames()
+                .get(app.playback.frame_index())
+                .or_else(|| source.index().frames().first())
+            else {
+                return;
+            };
+            let sequence = &frame.sequence;
+            let chroma = match sequence.chroma_format {
+                mmrecode_mpeg2::ChromaFormat::Yuv420 => "4:2:0",
+                mmrecode_mpeg2::ChromaFormat::Yuv422 => "4:2:2",
+                mmrecode_mpeg2::ChromaFormat::Yuv444 => "4:4:4",
+                mmrecode_mpeg2::ChromaFormat::Reserved => "reserved",
+            };
+            let scan = if sequence.progressive_sequence {
+                "progressive"
+            } else {
+                "interlaced/mixed"
+            };
+            let display = sequence.display.map_or_else(
+                || format!("{}×{}", sequence.width, sequence.height),
+                |display| {
+                    format!(
+                        "{}×{}",
+                        display.display_horizontal_size, display.display_vertical_size
+                    )
+                },
+            );
+            let bit_rate = sequence.bit_rate.map_or_else(
+                || "unspecified".into(),
+                |bits| format!("{}.{:03} Mb/s", bits / 1_000_000, bits % 1_000_000 / 1_000),
+            );
+            let _ = write!(
+                text,
+                "\n\nVideo\nCodec      MPEG-2 Video\nCoded      {}×{}\nDisplay    {display}\nChroma     {chroma}\nScan       {scan}\nRate       {}/{} fps\nBit rate   {bit_rate}\nProfile    0x{:02x}\nPicture    {:?} / {:?}",
+                sequence.width,
+                sequence.height,
+                sequence.frame_rate.numerator(),
+                sequence.frame_rate.denominator(),
+                sequence.profile_and_level_indication,
+                frame.picture_type,
+                frame.picture_structure,
+            );
+        }
+        PreviewSource::H264(source) => {
+            let Some(frame) = source
+                .index()
+                .frames()
+                .get(app.playback.frame_index())
+                .or_else(|| source.index().frames().first())
+            else {
+                return;
+            };
+            let index = source.index();
+            let scan = if index.is_progressive() {
+                "progressive"
+            } else {
+                "interlaced/mixed"
+            };
+            let _ = write!(
+                text,
+                "\n\nVideo\nCodec      H.264/AVC\nDisplay    {}×{}\nScan       {scan}\nRate       {}/{} fps\nPicture    {:?}\nIDR        {}\nReference  {}\nPTS / DTS  {} / {}",
+                index.display_width(),
+                index.display_height(),
+                index.frame_rate().numerator(),
+                index.frame_rate().denominator(),
+                frame.picture_type,
+                frame.is_idr,
+                frame.is_reference,
+                frame.pts,
+                frame.dts,
+            );
+        }
+    }
 }
 
 fn timecode_or_unknown(frame: i64, time_base: Rational) -> String {
@@ -2199,8 +2345,8 @@ fn timeline_picture_row(app: &PreviewApp, width: usize) -> String {
         return String::new();
     }
     let mut cells = vec![' '; width];
-    for (index, frame) in app.source.index().frames().iter().enumerate() {
-        if frame.picture_type == mmrecode_mpeg2::PictureType::I {
+    for index in 0..app.source.frame_count() {
+        if app.source.is_intra_frame(index) {
             let column = timeline_column_for_frame(index, width, app.frame_count());
             cells[column] = 'I';
         }

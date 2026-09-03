@@ -2,6 +2,7 @@
 
 mod command_history;
 mod editor_export;
+mod media_probe;
 mod prompt_completion;
 mod terminal_preview;
 
@@ -46,6 +47,8 @@ fn run() -> Result<(), String> {
         Some("preview") => terminal_preview_command(&mut arguments),
         None | Some("edit") => editor_command(&mut arguments),
         Some("plan-mpeg2") => plan_mpeg2_command(&mut arguments),
+        Some("plan-h264") => h264_remux_command(&mut arguments, false),
+        Some("remux-h264") => h264_remux_command(&mut arguments, true),
         Some("render-plan") => render_plan_command(&mut arguments),
         Some("render") => render_command(&mut arguments),
         Some("decode") => {
@@ -119,6 +122,65 @@ fn run() -> Result<(), String> {
             "command '{other}' is not implemented; run 'mmrecode help' for available commands"
         )),
     }
+}
+
+fn h264_remux_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+    write_output: bool,
+) -> Result<(), String> {
+    let usage = if write_output {
+        "usage: mmrecode remux-h264 <input.mp4|mov> <output.mp4> <start-frame> <end-frame>"
+    } else {
+        "usage: mmrecode plan-h264 <input.mp4|mov> <start-frame> <end-frame>"
+    };
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = write_output
+        .then(|| arguments.next().ok_or_else(|| usage.to_owned()))
+        .transpose()?;
+    let start = parse_frame_argument(arguments.next(), "start-frame", usage)?;
+    let end = parse_frame_argument(arguments.next(), "end-frame", usage)?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+
+    let movie = mmrecode_isobmff::IsoBmffFile::open(std::path::Path::new(&input))
+        .map_err(|error| error.to_string())?;
+    let plan = mmrecode_render::plan_h264_clean_remux(&movie, start..end)
+        .map_err(|error| error.to_string())?;
+    println!("H.264 clean-GOP remux plan");
+    println!(
+        "  presentation frames: {}..{}",
+        plan.presentation_frame_range.start, plan.presentation_frame_range.end
+    );
+    println!(
+        "  decode samples:      {}..{}",
+        plan.sample_range.start, plan.sample_range.end
+    );
+    println!("  GOPs copied:         {}", plan.gop_count);
+    println!("  encoded bytes copied: {}", plan.copied_bytes);
+    println!("  encoded frames:      0");
+    println!("  decision:            {}", plan.reason);
+    if let Some(output) = output {
+        let bytes = mmrecode_render::execute_h264_clean_remux(&movie, &plan)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&output, bytes).map_err(|error| error.to_string())?;
+        println!("  output:              {}", output.to_string_lossy());
+        println!("  audio:               omitted (video-only first slice)");
+    }
+    Ok(())
+}
+
+fn parse_frame_argument(
+    value: Option<std::ffi::OsString>,
+    name: &str,
+    usage: &str,
+) -> Result<usize, String> {
+    value
+        .ok_or_else(|| usage.to_owned())?
+        .to_str()
+        .ok_or_else(|| format!("{name} must be valid UTF-8"))?
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be a non-negative integer"))
 }
 
 fn terminal_preview_command(
@@ -370,11 +432,9 @@ fn import_editor_media(
     alias: Option<String>,
 ) -> Result<bool, String> {
     let path = resolve_existing_path(base_directory, locator, "media")?;
-    let source = terminal_preview::open_source(&path)?;
-    let rate = source.index().frame_rate();
-    let time_base = mmrecode_core::Rational::new(rate.denominator(), rate.numerator())
-        .map_err(|error| error.to_string())?;
-    let duration = i64::try_from(source.index().frame_count())
+    let probe = media_probe::probe_media(&path, session.project().settings())?;
+    let time_base = probe.frame_time_base()?;
+    let duration = i64::try_from(probe.frame_count)
         .map_err(|_| "media frame count exceeds editor limits".to_owned())?;
     let derived_name = path
         .file_name()
@@ -393,8 +453,7 @@ fn import_editor_media(
         .add_imported_media(&mmrecode_edit::ImportedMedia {
             name: derived_name,
             alias: alias.clone(),
-            kind: mmrecode_edit::MediaKind::new("video/mpeg2")
-                .map_err(|error| error.to_string())?,
+            kind: probe.kind,
             time_base,
             duration,
             origin: mmrecode_edit::MediaOrigin::External { path: path.clone() },
@@ -407,7 +466,6 @@ fn import_editor_media(
         })
         .map_err(|error| error.to_string())?;
     print_editor_output(entered);
-    drop(source);
     Ok(false)
 }
 
@@ -442,102 +500,10 @@ pub(crate) fn match_project_to_focused_media(
         }
         _ => return Err("the focused media origin cannot be probed for project matching".into()),
     };
-    let bytes = std::fs::read(&source_path)
-        .map_err(|error| format!("cannot read '{}': {error}", source_path.display()))?;
-    let (elementary, audio_format) =
-        if bytes.len() >= mmrecode_mpegts::TS_PACKET_SIZE && bytes.first() == Some(&0x47) {
-            let transport = mmrecode_mpegts::demux_transport_stream(&bytes)
-                .map_err(|error| error.to_string())?;
-            let audio_format = match transport.mpeg1_audio_bytes() {
-                Ok(audio) => {
-                    let frames = mmrecode_mpegaudio::parse_layer2_stream(&audio)
-                        .map_err(|error| error.to_string())?;
-                    frames
-                        .first()
-                        .map(|frame| (frame.header.sample_rate, u16::from(frame.header.channels)))
-                }
-                Err(_) => None,
-            };
-            (
-                transport
-                    .mpeg2_video_bytes()
-                    .map_err(|error| error.to_string())?,
-                audio_format,
-            )
-        } else {
-            (bytes, None)
-        };
-    let stream = mmrecode_mpeg2::parse_stream(&elementary).map_err(|error| error.to_string())?;
-    let sequence = &stream
-        .pictures()
-        .first()
-        .ok_or_else(|| "focused MPEG-2 media contains no pictures".to_owned())?
-        .sequence;
-    let mut settings = session.project().settings().clone();
-    settings.width = u32::try_from(sequence.width)
-        .map_err(|_| "focused video width exceeds project limits".to_owned())?;
-    settings.height = u32::try_from(sequence.height)
-        .map_err(|_| "focused video height exceeds project limits".to_owned())?;
-    settings.frame_rate = sequence.frame_rate;
-    let aspect_ratio_information = stream
-        .sequence_headers()
-        .first()
-        .map_or(1, |header| header.aspect_ratio_information);
-    settings.pixel_aspect = mpeg2_pixel_aspect(sequence, aspect_ratio_information)?;
-    settings.scan_mode = if sequence.progressive_sequence {
-        mmrecode_edit::ProjectScanMode::Progressive
-    } else {
-        mmrecode_edit::ProjectScanMode::Interlaced
-    };
-    settings.color_space = if sequence
-        .display
-        .and_then(|display| display.colour_description)
-        .is_some_and(|colour| colour.colour_primaries == 9)
-    {
-        mmrecode_edit::ProjectColorSpace::Rec2020
-    } else {
-        mmrecode_edit::ProjectColorSpace::Rec709
-    };
-    if let Some((sample_rate, channels)) = audio_format {
-        settings.audio_sample_rate = sample_rate;
-        settings.audio_channels = channels;
-    }
+    let probe = media_probe::probe_media(&source_path, session.project().settings())?;
     session
-        .match_project_settings(settings, audio_format.is_some())
+        .match_project_settings(probe.project_settings, probe.has_audio_format)
         .map_err(|error| error.to_string())
-}
-
-fn mpeg2_pixel_aspect(
-    sequence: &mmrecode_mpeg2::SequenceParameters,
-    aspect_ratio_information: u8,
-) -> Result<mmrecode_core::Rational, String> {
-    let width = i64::try_from(sequence.width)
-        .map_err(|_| "focused video width exceeds rational limits".to_owned())?;
-    let height = i64::try_from(sequence.height)
-        .map_err(|_| "focused video height exceeds rational limits".to_owned())?;
-    let (display_width, display_height) = match aspect_ratio_information {
-        1 => return mmrecode_core::Rational::new(1, 1).map_err(|error| error.to_string()),
-        2 => (4_i64, 3_i64),
-        3 => (16_i64, 9_i64),
-        4 => (221_i64, 100_i64),
-        _ => return mmrecode_core::Rational::new(1, 1).map_err(|error| error.to_string()),
-    };
-    let numerator = display_width
-        .checked_mul(height)
-        .ok_or_else(|| "focused video pixel aspect overflows".to_owned())?;
-    let denominator = display_height
-        .checked_mul(width)
-        .ok_or_else(|| "focused video pixel aspect overflows".to_owned())?;
-    let divisor = greatest_common_divisor(numerator, denominator);
-    mmrecode_core::Rational::new(numerator / divisor, denominator / divisor)
-        .map_err(|error| error.to_string())
-}
-
-fn greatest_common_divisor(mut left: i64, mut right: i64) -> i64 {
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-    left.abs().max(1)
 }
 
 fn print_editor_output(output: mmrecode_edit::CommandOutput) {
@@ -1703,6 +1669,9 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
     if is_mpegts(&bytes) {
         return inspect_mpegts(path, &bytes);
     }
+    if media_probe::looks_like_isobmff(&bytes) {
+        return inspect_isobmff(path, bytes);
+    }
     if is_mpeg2_video(&bytes) {
         return inspect_mpeg2(path, &bytes);
     }
@@ -1750,6 +1719,126 @@ fn is_mpegts(bytes: &[u8]) -> bool {
             .chunks(mmrecode_mpegts::TS_PACKET_SIZE)
             .take(3)
             .all(|packet| packet.first() == Some(&0x47))
+}
+
+#[allow(clippy::too_many_lines)]
+fn inspect_isobmff(path: &std::path::Path, bytes: Vec<u8>) -> Result<(), String> {
+    let movie = mmrecode_isobmff::IsoBmffFile::parse(bytes).map_err(|error| error.to_string())?;
+    println!("ISO-BMFF/QuickTime: {}", path.display());
+    println!("Tracks: {}", movie.tracks().len());
+    for track in movie.tracks() {
+        let tag = track.descriptor.codec.codec_tag.map_or_else(
+            || "----".to_owned(),
+            |tag| String::from_utf8_lossy(&tag.0).into_owned(),
+        );
+        println!(
+            "  Track {}: {} ({tag}), time base {}/{}, {} sample(s)",
+            track.track_id,
+            track.descriptor.codec.codec_id.as_str(),
+            track.descriptor.time_base.numerator(),
+            track.descriptor.time_base.denominator(),
+            track.samples.len()
+        );
+        if let (Some(width), Some(height)) = (track.width, track.height) {
+            println!(
+                "    Display: {width}x{height}, rotation {} degrees",
+                track.rotation_degrees
+            );
+        }
+        if let (Some(rate), Some(channels)) = (track.sample_rate, track.channel_count) {
+            println!("    Audio: {rate} Hz, {channels} channel(s)");
+        }
+        println!(
+            "    Sync samples: {}",
+            track.samples.iter().filter(|sample| sample.is_sync).count()
+        );
+    }
+    let Some(track) = movie.h264_track() else {
+        return Ok(());
+    };
+    let avcc =
+        mmrecode_h264::AvcDecoderConfigurationRecord::parse(&track.descriptor.codec.configuration)
+            .map_err(|error| error.to_string())?;
+    let mut indexer = mmrecode_h264::H264StreamIndexer::default();
+    indexer
+        .configure_avcc(&avcc)
+        .map_err(|error| error.to_string())?;
+    for (sample_index, sample) in track.samples.iter().enumerate() {
+        let units = mmrecode_h264::length_prefixed_nal_units(
+            movie
+                .sample_data(sample)
+                .map_err(|error| error.to_string())?,
+            avcc.length_size,
+        )
+        .map_err(|error| format!("H.264 sample {sample_index}: {error}"))?;
+        indexer
+            .push_access_unit(
+                sample_index,
+                mmrecode_h264::PictureTiming {
+                    dts: sample.dts,
+                    pts: sample.pts,
+                    duration: sample.duration,
+                },
+                &units,
+            )
+            .map_err(|error| format!("H.264 sample {sample_index}: {error}"))?;
+    }
+    let index = indexer.finish();
+    if let Some(sps) = index.sequence_parameter_sets.values().next() {
+        let chroma = match sps.chroma_format_idc {
+            0 => "4:0:0",
+            1 => "4:2:0",
+            2 => "4:2:2",
+            3 => "4:4:4",
+            _ => "reserved",
+        };
+        println!(
+            "H.264: {}x{}, profile {}, level {}, {}-bit {chroma}, {} reference frame(s)",
+            sps.width,
+            sps.height,
+            sps.profile_idc,
+            sps.level_idc,
+            sps.bit_depth_luma,
+            sps.max_num_ref_frames
+        );
+        if let Some(vui) = sps.vui {
+            if let (Some(num_units), Some(time_scale)) = (vui.num_units_in_tick, vui.time_scale) {
+                println!(
+                    "  VUI timing: {time_scale}/(2*{num_units}) ticks, fixed-rate {:?}",
+                    vui.fixed_frame_rate
+                );
+            }
+            if let Some(aspect) = vui.aspect_ratio {
+                println!("  Sample aspect: {}:{}", aspect.width, aspect.height);
+            }
+            if let Some(primaries) = vui.colour_primaries {
+                println!(
+                    "  Colour: primaries {primaries}, transfer {}, matrix {}",
+                    vui.transfer_characteristics.unwrap_or(2),
+                    vui.matrix_coefficients.unwrap_or(2)
+                );
+            }
+        }
+    }
+    let pictures = index
+        .access_units
+        .iter()
+        .filter_map(|unit| unit.picture.as_ref())
+        .collect::<Vec<_>>();
+    println!(
+        "  Pictures: {}, IDR: {}, reference: {}, reordered: {}",
+        pictures.len(),
+        pictures.iter().filter(|picture| picture.is_idr).count(),
+        pictures
+            .iter()
+            .filter(|picture| picture.is_reference)
+            .count(),
+        pictures
+            .iter()
+            .filter(|picture| picture.timing.pts != picture.timing.dts)
+            .count()
+    );
+    Ok(())
 }
 
 fn inspect_mpegts(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
@@ -2148,8 +2237,8 @@ fn print_help() {
          Usage: mmrecode [command] [arguments]\n\
          With no command, MMRecode starts the interactive editor.\n\n\
          Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
-         preview <media-file>  Preview MPEG-2 Video or MPEG-TS inside this terminal\n  \
-         inspect <media-file>  Inspect JPEG/MJPEG, raw DV, MPEG-2 Video, or MPEG-TS syntax\n  \
+         preview <media-file>  Preview MPEG-2 ES/TS or H.264 MP4/MOV inside this terminal\n  \
+         inspect <media-file>  Inspect JPEG/MJPEG, DV, MPEG-2/TS, or H.264 MP4/MOV syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
          decode <media-file> <y4m>  Decode JPEG, raw DV, MPEG-2 Video, or MPEG-TS to YUV4MPEG2\n  \
          encode-dv <y4m> <dv>  Encode native-layout Y4M frame(s) as raw DV25\n  \
@@ -2158,6 +2247,9 @@ fn print_help() {
          demux-mpegts <ts> <m2v>  Extract the first MPEG-2 Video elementary stream\n  \
          extract-mpegts-audio <ts> <mp2>  Extract MPEG-1 Audio Layer II\n  \
          plan-mpeg2 <m2v> <start> <end>  Explain copy and bridge-encode picture ranges\n  \
+         plan-h264 <mp4|mov> <start> <end>  Validate and explain a clean-GOP H.264 cut\n  \
+         remux-h264 <mp4|mov> <output.mp4> <start> <end>\n  \
+             Losslessly copy complete H.264 GOPs into a video-only MP4\n  \
          render-plan <m2v> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
              Validate and explain one MPEG-2 replacement render without writing a container\n  \
          render <m2v> <ts> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \

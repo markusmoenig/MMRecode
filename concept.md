@@ -345,6 +345,32 @@ work before writing; `export <file> using <preset>` performs it. The first execu
 the deliberately constrained `mpeg2-ts` path. YouTube-oriented authoring presets exist now, while
 H.264/MP4 delivery remains explicit future work rather than being silently delegated.
 
+H.264 MP4/MOV is now also an editor input. MMRecode parses the ISO-BMFF sample tables and AVC
+syntax itself, preserving exact DTS/PTS ordering and selecting bounded keyframe/dependency windows
+for seeks. Pixel reconstruction now attempts the native Rust decoder first. Its initial exact slices
+support single-slice 8-bit 4:2:0 IDR pictures containing raw `I_PCM`, CAVLC `Intra_16x16`, or
+CAVLC `Intra_4x4` macroblocks, including all luma/chroma prediction modes, nonzero DC/AC
+coefficient decoding, quantization, inverse transforms, and in-loop deblocking with slice offsets.
+The CAVLC P-slice path retains one list-0 reference and handles skip, 16x16, 16x8, 8x16, and
+sub-macroblock partitions down to 4x4, including fractional-sample motion compensation, inter
+residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture deblocking.
+This includes the High Profile subset that uses CAVLC, implicit flat scaling, and 4x4 transforms.
+The native CABAC arithmetic core and exact CABAC `I_PCM`, Intra16, and Intra4 IDR paths are also
+present, including prediction syntax and luma/chroma DC and AC coefficient decoding with
+neighboring-block contexts. CABAC P pictures also reconstruct skip, 16x16, 16x8, 8x16, and 8x8
+partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion, residuals, QP changes, and
+filtering. QP-zero transform bypass is native for lossless Intra4 and inter residuals, including
+chroma residual DPCM. Unsupported `Intra_8x8`/8x8 transforms, custom matrices, B slices, multiple-reference tools, and
+multi-slice pictures still use an optional installed
+FFmpeg fallback behind the same request/event boundary. This does not make FFmpeg the demuxer,
+timing authority, or render planner, and it does not start H.264 encoding.
+
+The first lossless H.264 output operation is intentionally narrower than editor delivery:
+`plan-h264` and `remux-h264` accept only complete IDR-delimited GOP ranges. MMRecode verifies both
+the container sync marks and codec dependencies, rewrites timestamps/sample tables, and copies the
+selected encoded bytes into a video-only MP4. A cut inside a GOP is rejected rather than rounded or
+silently decoded. Audio remuxing and arbitrary-boundary smart rendering remain later slices.
+
 Frame rate is not frozen merely because media has been placed. `project set rate <N|N/D>` defaults
 to `conform time`: direct root placement boundaries are rescaled to preserve presentation time and
 non-exact results are explicitly counted as nearest-frame rounding. `conform frames` instead keeps
@@ -404,7 +430,7 @@ stores stable media definitions and timed placement links; `MediaPath` traverses
 and `EditorSession` applies typed project lifecycle, import, navigation, settings, export requests,
 add, trim, undo, and redo commands.
 Both `mmrecode edit` and `mmrecode edit <script>` call the same parser/session implementation. The
-CLI now resolves an `import` request by probing a real MPEG-2 ES/TS source, inserting it as an
+CLI now resolves an `import` request by probing a real MPEG-2 ES/TS or H.264 MP4/MOV source, inserting it as an
 undoable media placement, and entering the same terminal preview used by standalone playback.
 Commands typed below the moving image mutate that shared session; trims, undo, and redo update the
 playable source range immediately. Versioned project persistence, resolved presets, dirty-state
@@ -424,7 +450,8 @@ consumer of the same media graph, effects, clock, and color rules as final rende
 may deliberately select lower-resolution or proxy processing for responsiveness.
 
 The first preview proof is available independently as `mmrecode preview <media-file>`. It renders
-real MPEG-2 ES/TS frames using a capability-selected Kitty, Sixel, or iTerm2 image protocol and a
+real MPEG-2 ES/TS and H.264 MP4/MOV frames using a capability-selected Kitty, Sixel, or iTerm2 image
+protocol and a
 24-bit Unicode half-block fallback. Direct Kitty playback switches between completely uploaded
 image slots instead of blanking the visible placement between frames. Decoding and fallback
 terminal image encoding are asynchronous and use a bounded look-ahead cache, so input
@@ -433,9 +460,9 @@ the shared command prompt for its first real-source edit loop; no second playbac
 model was introduced. The terminal surface exists before media is imported and uses a compact
 monitor, contextual help/inspector, result area, command prompt, and graphical timeline rather than
 treating the monitor as the entire editor. The timeline combines a time ruler,
-retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures with keyboard/mouse
-scrubbing. The first integration deliberately previews one MPEG-2 placement, leaving recursive
-composition and synchronized audio for later bounded slices.
+retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures and H.264 IDRs with
+keyboard/mouse scrubbing. The first integration deliberately previews one source placement,
+leaving recursive composition and synchronized H.264/AAC audio for later bounded slices.
 
 The layout may later switch between the complete editing workspace and a full-screen monitor while
 retaining the same session, playback controller, frame cache, and playhead. Likewise, the timeline
@@ -551,9 +578,11 @@ component planes, pixel samples, block boundaries, and JPEG structure. It remain
 and container libraries in the dependency graph so UI choices cannot shape normative media APIs.
 It now also provides fixed-rate animation and synchronized audio playback. A reusable playback
 crate maps exact rational frame rates to media time, accepts the rendered audio position as the
-master clock, and provides indexed, background MPEG-2 picture reconstruction for both viewer and
-future editor preview. MPEG-2 pixels are decoded on demand into a bounded cache rather than all at
-open; device handling and temporary third-party MP2 sample decoding remain viewer-local.
+master clock, and provides indexed, background MPEG-2 and H.264 picture reconstruction for editor
+preview. Pixels are decoded on demand into bounded caches rather than all at open. H.264 attempts
+native reconstruction first and uses an optional FFmpeg pixel-decoder process for tools beyond the
+current native intra slices, after native MP4 demuxing and access-unit selection; device handling
+and temporary third-party audio decoding remain application-local.
 
 ### Subsequent vertical slices
 

@@ -12,11 +12,14 @@ publish.workspace = true
 default = []
 mpeg2 = ["dep:mmrecode-mpeg2"]
 mpegts = ["mpeg2", "dep:mmrecode-mpegaudio", "dep:mmrecode-mpegts"]
+h264 = ["dep:mmrecode-h264", "dep:mmrecode-isobmff"]
 
 [dependencies]
 image.workspace = true
 mmrecode-core.workspace = true
 mmrecode-edit.workspace = true
+mmrecode-h264 = { workspace = true, optional = true }
+mmrecode-isobmff = { workspace = true, optional = true }
 mmrecode-mpegaudio = { workspace = true, optional = true }
 mmrecode-mpeg2 = { workspace = true, optional = true }
 mmrecode-mpegts = { workspace = true, optional = true }

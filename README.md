@@ -83,6 +83,15 @@ and native-encoder vectors are checked against FFmpeg. Current limits—includin
 dual-prime prediction, chroma profiles, and production VBV rate control—are explicit in
 [`crates/codecs/mpeg2/README.md`](crates/codecs/mpeg2/README.md).
 
+The H.264 vertical slice owns ISO-BMFF sample parsing, AVC syntax, timing, dependency indexing,
+editor import/seek/playback, `project match`, and clean-GOP video remuxing. Its native Rust decoder
+currently reconstructs CAVLC I/P pictures for the documented single-reference 4x4-transform
+subset, plus CABAC `I_PCM`, Intra16, and Intra4 IDRs. CABAC P pictures support skip, 16x16,
+16x8, 8x16, and 8x8 partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion,
+luma/chroma residuals, QP changes, filtering, and QP-zero transform bypass for lossless Intra4 and
+inter residuals. Unsupported B slices, 8x8 transforms, custom scaling matrices, and fuller reference semantics remain on the explicit optional
+playback fallback path; no H.264 encoder has been started.
+
 The first container slice is implemented in `mmrecode-mpegts`. It validates 188-byte transport
 packets, continuity, PAT/PMT PSI and CRCs; discovers programs and streams; reassembles MPEG-2 PES
 with PTS/DTS and PCR timing; and deterministically muxes timed MPEG-2 Video with optional MPEG-1
