@@ -2,7 +2,38 @@
 
 use std::collections::BTreeMap;
 
-use crate::{CodecDescriptor, Packet, PixelFormat, Rational, Result, VideoFrame};
+use crate::{AudioFrame, CodecDescriptor, Packet, PixelFormat, Rational, Result, VideoFrame};
+
+/// A stateful compressed-audio decoder with explicit input and output queues.
+pub trait AudioDecoder {
+    /// Configures the decoder from container or caller-provided codec metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor is invalid or unsupported.
+    fn configure(&mut self, descriptor: &CodecDescriptor) -> Result<()>;
+
+    /// Submits one encoded audio packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packet is invalid or cannot be accepted.
+    fn send_packet(&mut self, packet: Packet) -> Result<()>;
+
+    /// Receives one decoded PCM block, if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when audio reconstruction fails.
+    fn receive_frame(&mut self) -> Result<Option<AudioFrame>>;
+
+    /// Signals end of input and drains delayed samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delayed input cannot be decoded.
+    fn flush(&mut self) -> Result<()>;
+}
 
 /// Generic video encoder settings shared across codec implementations.
 #[derive(Clone, Debug)]

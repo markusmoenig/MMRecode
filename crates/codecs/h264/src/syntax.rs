@@ -6,7 +6,7 @@ use mmrecode_core::{Error, Result};
 use crate::{NalUnit, NalUnitType, remove_emulation_prevention};
 
 /// H.264 picture-order-count syntax selected by the SPS.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PictureOrderCountType {
     /// POC LSB and MSB syntax.
     Type0 {
@@ -17,6 +17,12 @@ pub enum PictureOrderCountType {
     Type1 {
         /// Whether slice headers omit both delta POC syntax elements.
         delta_pic_order_always_zero: bool,
+        /// POC adjustment applied to non-reference pictures.
+        offset_for_non_ref_pic: i32,
+        /// POC distance from a top field to its paired bottom field.
+        offset_for_top_to_bottom_field: i32,
+        /// Reference-picture offsets in one frame-number POC cycle.
+        offset_for_ref_frame: Vec<i32>,
     },
     /// POC derived from frame number.
     Type2,
@@ -140,8 +146,12 @@ pub struct Pps {
     pub num_slice_groups_minus1: u32,
     /// Default number of active list-0 references minus one.
     pub num_ref_idx_l0_default_active_minus1: u32,
+    /// Default number of active list-1 references minus one.
+    pub num_ref_idx_l1_default_active_minus1: u32,
     /// Whether P/SP slices carry weighted-prediction syntax.
     pub weighted_pred: bool,
+    /// B-slice weighted biprediction mode.
+    pub weighted_bipred_idc: u8,
     /// Initial luma quantization offset from 26.
     pub pic_init_qp_minus26: i32,
     /// Chroma quantization offset for the Cb component.
@@ -404,19 +414,22 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         }
         1 => {
             let delta_pic_order_always_zero = reader.bit()?;
-            let _offset_for_non_ref_pic = reader.se()?;
-            let _offset_for_top_to_bottom_field = reader.se()?;
+            let offset_for_non_ref_pic = reader.se()?;
+            let offset_for_top_to_bottom_field = reader.se()?;
             let cycle = reader.ue()?;
             if cycle > 255 {
                 return Err(Error::Unsupported(
                     "H.264 POC cycle longer than 255 entries".into(),
                 ));
             }
-            for _ in 0..cycle {
-                let _offset_for_ref_frame = reader.se()?;
-            }
+            let offset_for_ref_frame = (0..cycle)
+                .map(|_| reader.se())
+                .collect::<Result<Vec<_>>>()?;
             PictureOrderCountType::Type1 {
                 delta_pic_order_always_zero,
+                offset_for_non_ref_pic,
+                offset_for_top_to_bottom_field,
+                offset_for_ref_frame,
             }
         }
         2 => PictureOrderCountType::Type2,
@@ -615,9 +628,10 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
         skip_slice_groups(&mut reader, num_slice_groups_minus1)?;
     }
     let num_ref_idx_l0_default_active_minus1 = reader.ue()?;
-    let _num_ref_idx_l1_default_active_minus1 = reader.ue()?;
+    let num_ref_idx_l1_default_active_minus1 = reader.ue()?;
     let weighted_pred = reader.bit()?;
-    let _weighted_bipred_idc = reader.bits(2)?;
+    let weighted_bipred_idc = u8::try_from(reader.bits(2)?)
+        .map_err(|_| Error::InvalidData("H.264 weighted_bipred_idc overflows".into()))?;
     let pic_init_qp_minus26 = reader.se()?;
     let _pic_init_qs_minus26 = reader.se()?;
     let chroma_qp_index_offset = reader.se()?;
@@ -667,7 +681,9 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
         bottom_field_pic_order_in_frame_present,
         num_slice_groups_minus1,
         num_ref_idx_l0_default_active_minus1,
+        num_ref_idx_l1_default_active_minus1,
         weighted_pred,
+        weighted_bipred_idc,
         pic_init_qp_minus26,
         chroma_qp_index_offset,
         second_chroma_qp_index_offset,
@@ -783,12 +799,12 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
     let mut delta_pic_order_cnt_bottom = None;
     let mut delta_pic_order_cnt0 = None;
     let mut delta_pic_order_cnt1 = None;
-    match sps.pic_order_cnt_type {
+    match &sps.pic_order_cnt_type {
         PictureOrderCountType::Type0 {
             log2_max_pic_order_cnt_lsb,
         } => {
             pic_order_cnt_lsb = Some(
-                u32::try_from(reader.bits(log2_max_pic_order_cnt_lsb)?)
+                u32::try_from(reader.bits(*log2_max_pic_order_cnt_lsb)?)
                     .map_err(|_| Error::InvalidData("H.264 POC LSB overflows".into()))?,
             );
             if pps.bottom_field_pic_order_in_frame_present && !field_pic {
@@ -797,8 +813,9 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
         }
         PictureOrderCountType::Type1 {
             delta_pic_order_always_zero,
+            ..
         } => {
-            if !delta_pic_order_always_zero {
+            if !*delta_pic_order_always_zero {
                 delta_pic_order_cnt0 = Some(reader.se()?);
                 if pps.bottom_field_pic_order_in_frame_present && !field_pic {
                     delta_pic_order_cnt1 = Some(reader.se()?);
@@ -869,6 +886,19 @@ pub struct PictureTiming {
     pub duration: u32,
 }
 
+/// Recovery-point supplemental enhancement information attached to an access unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryPoint {
+    /// Number of decoded frame pictures before output is guaranteed correct.
+    pub recovery_frame_count: u32,
+    /// Whether every recovered picture exactly matches an uninterrupted decode.
+    pub exact_match: bool,
+    /// Whether pictures decoded before recovery may refer across a broken link.
+    pub broken_link: bool,
+    /// Slice-group transition mode used during recovery.
+    pub changing_slice_group_idc: u8,
+}
+
 /// One indexed coded picture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PictureUnit {
@@ -882,6 +912,10 @@ pub struct PictureUnit {
     pub is_idr: bool,
     /// Whether this picture participates as a decoding reference.
     pub is_reference: bool,
+    /// Modulus of `frame_num` for the active SPS.
+    pub max_frame_num: u32,
+    /// Recovery-point metadata carried in the same access unit.
+    pub recovery_point: Option<RecoveryPoint>,
     /// Conservative decode dependencies expressed as earlier sample indexes.
     pub dependencies: Vec<usize>,
 }
@@ -939,6 +973,7 @@ impl H264StreamIndexer {
     /// # Errors
     ///
     /// Returns an error for malformed NAL syntax or references to unavailable parameter sets.
+    #[allow(clippy::too_many_lines)]
     pub fn push_access_unit(
         &mut self,
         sample_index: usize,
@@ -948,6 +983,7 @@ impl H264StreamIndexer {
         let mut primary_slice = None;
         let mut is_idr = false;
         let mut is_reference = false;
+        let mut recovery_point = None;
         let mut nal_types = Vec::with_capacity(nal_units.len());
         for unit in nal_units {
             nal_types.push(unit.header.unit_type);
@@ -959,6 +995,9 @@ impl H264StreamIndexer {
                 NalUnitType::Pps => {
                     let pps = parse_pps(unit.data)?;
                     self.index.picture_parameter_sets.insert(pps.id, pps);
+                }
+                NalUnitType::Sei => {
+                    recovery_point = recovery_point.or(parse_recovery_point_sei(unit.data)?);
                 }
                 NalUnitType::CodedSlice | NalUnitType::IdrSlice if primary_slice.is_none() => {
                     let pps_id = peek_slice_pps_id(unit.data)?;
@@ -987,6 +1026,35 @@ impl H264StreamIndexer {
             }
         }
         let picture = if let Some(slice) = primary_slice {
+            let pps = self
+                .index
+                .picture_parameter_sets
+                .get(&slice.picture_parameter_set_id)
+                .ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "slice references unknown PPS {}",
+                        slice.picture_parameter_set_id
+                    ))
+                })?;
+            let sps = self
+                .index
+                .sequence_parameter_sets
+                .get(&pps.sequence_parameter_set_id)
+                .ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "PPS {} references unknown SPS {}",
+                        slice.picture_parameter_set_id, pps.sequence_parameter_set_id
+                    ))
+                })?;
+            let max_frame_num = 1_u32 << sps.log2_max_frame_num;
+            if let Some(recovery) = recovery_point
+                && recovery.recovery_frame_count >= max_frame_num
+            {
+                return Err(Error::InvalidData(format!(
+                    "H.264 recovery_frame_cnt {} exceeds MaxFrameNum - 1",
+                    recovery.recovery_frame_count
+                )));
+            }
             if is_idr {
                 self.active_references.clear();
             }
@@ -997,18 +1065,7 @@ impl H264StreamIndexer {
                     self.active_references.iter().copied().collect()
                 };
             if is_reference {
-                let max_references = self
-                    .index
-                    .picture_parameter_sets
-                    .get(&slice.picture_parameter_set_id)
-                    .and_then(|pps| {
-                        self.index
-                            .sequence_parameter_sets
-                            .get(&pps.sequence_parameter_set_id)
-                    })
-                    .map_or(16, |sps| {
-                        usize::try_from(sps.max_num_ref_frames).unwrap_or(16)
-                    });
+                let max_references = usize::try_from(sps.max_num_ref_frames).unwrap_or(16);
                 self.active_references.push_back(sample_index);
                 while self.active_references.len() > max_references {
                     self.active_references.pop_front();
@@ -1020,6 +1077,8 @@ impl H264StreamIndexer {
                 slice,
                 is_idr,
                 is_reference,
+                max_frame_num,
+                recovery_point,
                 dependencies,
             })
         } else {
@@ -1044,6 +1103,62 @@ impl H264StreamIndexer {
     }
 }
 
+/// Parses the first recovery-point payload in an SEI NAL unit.
+///
+/// # Errors
+///
+/// Returns an error when the NAL is not SEI or a payload header/body is truncated or malformed.
+pub fn parse_recovery_point_sei(nal: &[u8]) -> Result<Option<RecoveryPoint>> {
+    require_type(nal, NalUnitType::Sei)?;
+    let rbsp = remove_emulation_prevention(&nal[1..]);
+    let mut cursor = 0_usize;
+    while cursor < rbsp.len() {
+        if cursor + 1 == rbsp.len() && rbsp[cursor] == 0x80 {
+            break;
+        }
+        let payload_type = read_sei_extended_value(&rbsp, &mut cursor, "payload type")?;
+        let payload_size = read_sei_extended_value(&rbsp, &mut cursor, "payload size")?;
+        let payload_end = cursor
+            .checked_add(payload_size)
+            .ok_or_else(|| Error::InvalidData("H.264 SEI payload range overflows".into()))?;
+        let payload = rbsp
+            .get(cursor..payload_end)
+            .ok_or_else(|| Error::InvalidData("truncated H.264 SEI payload".into()))?;
+        cursor = payload_end;
+        if payload_type == 6 {
+            let mut reader = SyntaxReader::new(payload);
+            let recovery_frame_count = reader.ue()?;
+            let exact_match = reader.bit()?;
+            let broken_link = reader.bit()?;
+            let changing_slice_group_idc = u8::try_from(reader.bits(2)?)
+                .map_err(|_| Error::InvalidData("H.264 slice-group idc overflows".into()))?;
+            return Ok(Some(RecoveryPoint {
+                recovery_frame_count,
+                exact_match,
+                broken_link,
+                changing_slice_group_idc,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn read_sei_extended_value(data: &[u8], cursor: &mut usize, name: &str) -> Result<usize> {
+    let mut value = 0_usize;
+    loop {
+        let byte = *data
+            .get(*cursor)
+            .ok_or_else(|| Error::InvalidData(format!("truncated H.264 SEI {name}")))?;
+        *cursor += 1;
+        value = value
+            .checked_add(usize::from(byte))
+            .ok_or_else(|| Error::InvalidData(format!("H.264 SEI {name} overflows")))?;
+        if byte != 0xff {
+            return Ok(value);
+        }
+    }
+}
+
 fn peek_slice_pps_id(nal: &[u8]) -> Result<u32> {
     let rbsp = remove_emulation_prevention(
         nal.get(1..)
@@ -1057,9 +1172,12 @@ fn peek_slice_pps_id(nal: &[u8]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use mmrecode_bitstream::BitWriter;
+
     use super::{
-        DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTRA, PictureOrderCountType,
-        PictureType, parse_pps, parse_slice_header, parse_sps,
+        DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTRA, H264StreamIndexer,
+        PictureOrderCountType, PictureTiming, PictureType, RecoveryPoint, parse_pps,
+        parse_recovery_point_sei, parse_slice_header, parse_sps,
     };
 
     // Baseline 1280x720 SPS/PPS emitted by a conventional x264 stream.
@@ -1094,6 +1212,104 @@ mod tests {
     }
 
     #[test]
+    fn preserves_type1_picture_order_cycle_parameters() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(66, 8).unwrap();
+        writer.write_bits(0, 8).unwrap();
+        writer.write_bits(30, 8).unwrap();
+        write_ue(&mut writer, 0);
+        write_ue(&mut writer, 0);
+        write_ue(&mut writer, 1);
+        writer.write_bit(false).unwrap();
+        write_se(&mut writer, -1);
+        write_se(&mut writer, 2);
+        write_ue(&mut writer, 2);
+        write_se(&mut writer, 3);
+        write_se(&mut writer, -2);
+        write_ue(&mut writer, 2);
+        writer.write_bit(false).unwrap();
+        write_ue(&mut writer, 0);
+        write_ue(&mut writer, 0);
+        writer.write_bit(true).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bit(false).unwrap();
+        writer.write_bit(false).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.align_to_byte();
+        let sps = parse_sps(&[vec![0x67], writer.into_bytes()].concat()).unwrap();
+        assert_eq!(
+            sps.pic_order_cnt_type,
+            PictureOrderCountType::Type1 {
+                delta_pic_order_always_zero: false,
+                offset_for_non_ref_pic: -1,
+                offset_for_top_to_bottom_field: 2,
+                offset_for_ref_frame: vec![3, -2],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_and_indexes_recovery_point_sei() {
+        let sei = recovery_point_sei(5, true, false, 2);
+        let expected = RecoveryPoint {
+            recovery_frame_count: 5,
+            exact_match: true,
+            broken_link: false,
+            changing_slice_group_idc: 2,
+        };
+        assert_eq!(parse_recovery_point_sei(&sei).unwrap(), Some(expected));
+
+        let slice = [0x65, 0xb8, 0x40];
+        let units = [SPS, PPS, sei.as_slice(), slice.as_slice()].map(|data| crate::NalUnit {
+            source_range: 0..data.len(),
+            header: crate::NalUnitHeader::parse(data[0]).unwrap(),
+            data,
+        });
+        let mut indexer = H264StreamIndexer::default();
+        indexer
+            .push_access_unit(
+                0,
+                PictureTiming {
+                    dts: 0,
+                    pts: 0,
+                    duration: 1,
+                },
+                &units,
+            )
+            .unwrap();
+        assert_eq!(
+            indexer.index().access_units[0]
+                .picture
+                .as_ref()
+                .unwrap()
+                .recovery_point,
+            Some(expected)
+        );
+        assert!(parse_recovery_point_sei(&[0x06, 6, 2, 0x30]).is_err());
+
+        let invalid_sei = recovery_point_sei(16, true, false, 0);
+        let invalid_units =
+            [SPS, PPS, invalid_sei.as_slice(), slice.as_slice()].map(|data| crate::NalUnit {
+                source_range: 0..data.len(),
+                header: crate::NalUnitHeader::parse(data[0]).unwrap(),
+                data,
+            });
+        assert!(
+            H264StreamIndexer::default()
+                .push_access_unit(
+                    0,
+                    PictureTiming {
+                        dts: 0,
+                        pts: 0,
+                        duration: 1,
+                    },
+                    &invalid_units,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn resolves_picture_scaling_matrix_fallbacks() {
         let sps = parse_sps(SPS).unwrap();
         let mut pps = parse_pps(PPS).unwrap();
@@ -1121,5 +1337,47 @@ mod tests {
         assert_eq!(slice.picture_type, PictureType::I);
         assert_eq!(slice.frame_num, 0);
         assert_eq!(slice.idr_pic_id, Some(0));
+    }
+
+    fn write_ue(writer: &mut BitWriter, value: u32) {
+        let code_num = u64::from(value) + 1;
+        let bits = 64 - code_num.leading_zeros();
+        for _ in 1..bits {
+            writer.write_bit(false).unwrap();
+        }
+        writer
+            .write_bits(code_num, u8::try_from(bits).unwrap())
+            .unwrap();
+    }
+
+    fn write_se(writer: &mut BitWriter, value: i32) {
+        let code_num = if value <= 0 {
+            value.unsigned_abs() * 2
+        } else {
+            u32::try_from(value).unwrap() * 2 - 1
+        };
+        write_ue(writer, code_num);
+    }
+
+    fn recovery_point_sei(
+        frame_count: u32,
+        exact_match: bool,
+        broken_link: bool,
+        changing_slice_group_idc: u8,
+    ) -> Vec<u8> {
+        let mut payload = BitWriter::new();
+        write_ue(&mut payload, frame_count);
+        payload.write_bit(exact_match).unwrap();
+        payload.write_bit(broken_link).unwrap();
+        payload
+            .write_bits(u64::from(changing_slice_group_idc), 2)
+            .unwrap();
+        payload.write_bit(true).unwrap();
+        payload.align_to_byte();
+        let payload = payload.into_bytes();
+        let mut nal = vec![0x06, 6, u8::try_from(payload.len()).unwrap()];
+        nal.extend(payload);
+        nal.push(0x80);
+        nal
     }
 }

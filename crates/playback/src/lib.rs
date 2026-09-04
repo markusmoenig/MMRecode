@@ -1,5 +1,7 @@
 //! Reusable media timeline and playback-clock primitives.
 
+mod aac;
+mod executor;
 mod h264;
 mod mpeg2;
 
@@ -10,6 +12,12 @@ use std::{
 
 use mmrecode_core::{Error, Rational, Result};
 
+pub use aac::{AacAudioIndex, AacPlaybackEvent, AacPlaybackSource, IndexedAacSample};
+#[cfg(not(target_arch = "wasm32"))]
+pub use executor::NativeDecodeExecutor;
+pub use executor::{
+    DecodeExecutor, DecodeTask, InlineDecodeExecutor, SubmitError, default_decode_executor,
+};
 pub use h264::{H264PlaybackEvent, H264PlaybackSource, H264VideoIndex, IndexedH264Frame};
 pub use mpeg2::{IndexedMpeg2Frame, Mpeg2PlaybackEvent, Mpeg2PlaybackSource, Mpeg2VideoIndex};
 

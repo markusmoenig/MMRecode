@@ -6,15 +6,14 @@ The crate maps exact positive rational frame rates to `Duration`, selects frames
 positions, and manages play, pause, seek, end, loop, wall-clock, and external-clock state.
 Applications may synchronize it to rendered audio samples so audio remains the master clock.
 
-Its first decode orchestration is `Mpeg2PlaybackSource`: construction indexes picture metadata and
-dependencies without reconstructing pixels; requests run on a background worker from the closest
-preceding clean random-access point and deliver only a bounded presentation window. The caller owns
-the final frame-cache policy. The crate has no GUI, audio-device, or container dependency.
+Its indexed decode sources cover MPEG-2 elementary video, H.264 in ISO-BMFF, and AAC in ISO-BMFF.
+MPEG-2 and H.264 requests reconstruct bounded presentation windows. AAC indexes exact access-unit
+timing and currently reconstructs a complete short track to PCM through the shared executor. The
+caller owns video frame-cache and audio-device policy; this crate has no GUI or device dependency.
 
 Current limits:
 
-- fixed-rate video timelines only;
-- MPEG-2 video only for indexed asynchronous decode;
 - no incremental container packet or audio queues;
 - no device output, resampling, or clock-drift estimation;
-- no variable-frame-rate timestamp index yet.
+- AAC-LC PCM currently uses an optional native FFmpeg bridge; the Rust spectral decoder and browser
+  output are not implemented yet.

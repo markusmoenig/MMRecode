@@ -15,13 +15,15 @@ path = "src/main.rs"
 [dependencies]
 base64-simd.workspace = true
 directories.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["png"] }
 mmrecode-core.workspace = true
+mmrecode-aac.workspace = true
 mmrecode-dv.workspace = true
 mmrecode-edit.workspace = true
 mmrecode-h264.workspace = true
 mmrecode-isobmff.workspace = true
 mmrecode-mjpeg.workspace = true
+mmrecode-mmfx.workspace = true
 mmrecode-mpegaudio.workspace = true
 mmrecode-mpeg2.workspace = true
 mmrecode-mpegts.workspace = true
@@ -31,6 +33,7 @@ mmrecode-render = { workspace = true, features = ["h264", "mpegts"] }
 mmrecode-y4m.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
+rodio.workspace = true
 
 [lints]
 workspace = true

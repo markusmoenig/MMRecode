@@ -16,7 +16,7 @@ mod stream;
 mod time;
 
 pub use audio::{AudioFrame, AudioSampleFormat};
-pub use codec::{Decoder, Encoder, VideoEncoderSettings};
+pub use codec::{AudioDecoder, Decoder, Encoder, VideoEncoderSettings};
 pub use container::{Demuxer, Muxer, SeekResult};
 pub use dependency::{
     AccessUnitInfo, DependencyAnalyzer, ParameterFingerprint, PictureId, PictureKind,

@@ -76,6 +76,8 @@ pub struct Track {
     pub channel_count: Option<u16>,
     /// Audio sample rate from the sample entry.
     pub sample_rate: Option<u32>,
+    /// Track presentation duration after applying a supported edit list, in track time-base ticks.
+    pub presentation_duration: Option<u64>,
     /// Samples in decode order.
     pub samples: Vec<Sample>,
 }
@@ -108,9 +110,14 @@ impl IsoBmffFile {
             ));
         }
         let children = boxes_in(&data, moov.payload.clone())?;
+        let movie_timescale = children
+            .iter()
+            .find(|header| header.kind == *b"mvhd")
+            .map(|header| parse_mvhd(&data, header))
+            .transpose()?;
         let mut tracks = Vec::new();
         for trak in children.iter().filter(|header| header.kind == *b"trak") {
-            match parse_track(&data, trak, tracks.len()) {
+            match parse_track(&data, trak, tracks.len(), movie_timescale) {
                 Ok(track) => tracks.push(track),
                 Err(Error::Unsupported(_)) => {}
                 Err(error) => return Err(error),
@@ -270,6 +277,9 @@ fn boxes_in(data: &[u8], range: Range<usize>) -> Result<Vec<BoxHeader>> {
     let mut boxes = Vec::new();
     let mut offset = range.start;
     while offset < range.end {
+        if range.end - offset < 8 && data[offset..range.end].iter().all(|&byte| byte == 0) {
+            break;
+        }
         let base = data.get(offset..offset + 8).ok_or_else(|| {
             Error::InvalidData(format!("truncated ISO-BMFF box header at byte {offset}"))
         })?;
@@ -318,7 +328,12 @@ struct TrackHeader {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_track(data: &[u8], trak: &BoxHeader, ordinal: usize) -> Result<Track> {
+fn parse_track(
+    data: &[u8],
+    trak: &BoxHeader,
+    ordinal: usize,
+    movie_timescale: Option<u32>,
+) -> Result<Track> {
     let children = boxes_in(data, trak.payload.clone())?;
     let tkhd = children
         .iter()
@@ -335,6 +350,7 @@ fn parse_track(data: &[u8], trak: &BoxHeader, ordinal: usize) -> Result<Track> {
             "ISO-BMFF track timescale is zero".into(),
         ));
     }
+    let edit = parse_track_edit(data, &children, movie_timescale, timescale)?;
     let handler_type = parse_hdlr(data, child(&mdia_children, *b"hdlr", "mdia")?)?;
     let media_type = match &handler_type {
         b"vide" => MediaType::Video,
@@ -377,7 +393,7 @@ fn parse_track(data: &[u8], trak: &BoxHeader, ordinal: usize) -> Result<Track> {
         .map(|header| parse_stss(data, header))
         .transpose()?;
     let ranges = expand_sample_offsets(&chunk_offsets, &chunk_map, &sample_sizes, data.len())?;
-    let mut dts = 0_i64;
+    let mut dts = edit.timestamp_offset;
     let samples = ranges
         .into_iter()
         .zip(durations)
@@ -443,8 +459,128 @@ fn parse_track(data: &[u8], trak: &BoxHeader, ordinal: usize) -> Result<Track> {
         rotation_degrees: tkhd.rotation_degrees,
         channel_count: sample_entry.channel_count,
         sample_rate: sample_entry.sample_rate,
+        presentation_duration: edit.presentation_duration,
         samples,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TrackEdit {
+    timestamp_offset: i64,
+    presentation_duration: Option<u64>,
+}
+
+fn parse_track_edit(
+    data: &[u8],
+    track_children: &[BoxHeader],
+    movie_timescale: Option<u32>,
+    track_timescale: u32,
+) -> Result<TrackEdit> {
+    let Some(edts) = track_children.iter().find(|header| header.kind == *b"edts") else {
+        return Ok(TrackEdit::default());
+    };
+    let movie_timescale = movie_timescale.ok_or_else(|| {
+        Error::InvalidData(
+            "ISO-BMFF track has an edit list but movie timescale is unavailable".into(),
+        )
+    })?;
+    if movie_timescale == 0 {
+        return Err(Error::InvalidData(
+            "ISO-BMFF movie timescale is zero".into(),
+        ));
+    }
+    let children = boxes_in(data, edts.payload.clone())?;
+    let elst = child(&children, *b"elst", "edts")?;
+    parse_elst(payload(data, elst)?, movie_timescale, track_timescale)
+}
+
+fn parse_elst(data: &[u8], movie_timescale: u32, track_timescale: u32) -> Result<TrackEdit> {
+    let version = *data
+        .first()
+        .ok_or_else(|| Error::InvalidData("empty elst".into()))?;
+    if version > 1 {
+        return Err(Error::Unsupported(format!(
+            "ISO-BMFF elst version {version} is not implemented"
+        )));
+    }
+    let entry_count =
+        usize::try_from(read_u32(data, 4, "elst entry count")?).expect("u32 fits usize");
+    let entry_size = if version == 1 { 20 } else { 12 };
+    let mut offset = 8_usize;
+    let mut empty_duration = 0_u64;
+    let mut presentation_duration = 0_u64;
+    let mut media_time = None;
+    for _ in 0..entry_count {
+        let segment_duration = if version == 1 {
+            read_u64(data, offset, "elst segment duration")?
+        } else {
+            u64::from(read_u32(data, offset, "elst segment duration")?)
+        };
+        let time_offset = if version == 1 { 8 } else { 4 };
+        let current_media_time = if version == 1 {
+            read_i64(data, offset + time_offset, "elst media time")?
+        } else {
+            i64::from(read_i32(data, offset + time_offset, "elst media time")?)
+        };
+        let rate_offset = offset + time_offset + if version == 1 { 8 } else { 4 };
+        let rate_integer = read_i16(data, rate_offset, "elst media rate integer")?;
+        let rate_fraction = read_i16(data, rate_offset + 2, "elst media rate fraction")?;
+        if rate_integer != 1 || rate_fraction != 0 {
+            return Err(Error::Unsupported(
+                "ISO-BMFF edit-list media rates other than 1.0 are not implemented".into(),
+            ));
+        }
+        presentation_duration = presentation_duration
+            .checked_add(segment_duration)
+            .ok_or_else(|| Error::InvalidData("elst presentation duration overflows".into()))?;
+        if current_media_time == -1 {
+            if media_time.is_some() {
+                return Err(Error::Unsupported(
+                    "ISO-BMFF empty edits after media edits are not implemented".into(),
+                ));
+            }
+            empty_duration = empty_duration
+                .checked_add(segment_duration)
+                .ok_or_else(|| Error::InvalidData("elst empty-edit duration overflows".into()))?;
+        } else if current_media_time >= 0 && media_time.replace(current_media_time).is_some() {
+            return Err(Error::Unsupported(
+                "multiple ISO-BMFF media edits are not implemented".into(),
+            ));
+        } else if current_media_time < -1 {
+            return Err(Error::InvalidData(format!(
+                "invalid negative elst media time {current_media_time}"
+            )));
+        }
+        offset = offset
+            .checked_add(entry_size)
+            .ok_or_else(|| Error::InvalidData("elst entry offset overflows".into()))?;
+    }
+    let media_time = media_time.ok_or_else(|| {
+        Error::Unsupported("ISO-BMFF edit list has no playable media edit".into())
+    })?;
+    let empty_ticks = rescale_edit_duration(empty_duration, movie_timescale, track_timescale)?;
+    let duration_ticks =
+        rescale_edit_duration(presentation_duration, movie_timescale, track_timescale)?;
+    let timestamp_offset = i64::try_from(empty_ticks)
+        .map_err(|_| Error::InvalidData("elst empty-edit duration exceeds i64".into()))?
+        .checked_sub(media_time)
+        .ok_or_else(|| Error::InvalidData("elst timestamp offset overflows".into()))?;
+    Ok(TrackEdit {
+        timestamp_offset,
+        presentation_duration: Some(duration_ticks),
+    })
+}
+
+fn rescale_edit_duration(value: u64, source_scale: u32, target_scale: u32) -> Result<u64> {
+    let numerator = u128::from(value)
+        .checked_mul(u128::from(target_scale))
+        .ok_or_else(|| Error::InvalidData("elst duration rescale overflows".into()))?;
+    let rounded = numerator
+        .checked_add(u128::from(source_scale) / 2)
+        .ok_or_else(|| Error::InvalidData("elst duration rounding overflows".into()))?
+        / u128::from(source_scale);
+    u64::try_from(rounded)
+        .map_err(|_| Error::InvalidData("elst duration exceeds track time base".into()))
 }
 
 fn codec_id(format: [u8; 4], media_type: MediaType) -> CodecId {
@@ -518,6 +654,20 @@ fn parse_mdhd(data: &[u8], header: &BoxHeader) -> Result<u32> {
     read_u32(bytes, if version == 1 { 20 } else { 12 }, "mdhd timescale")
 }
 
+fn parse_mvhd(data: &[u8], header: &BoxHeader) -> Result<u32> {
+    let bytes = payload(data, header)?;
+    let version = *bytes
+        .first()
+        .ok_or_else(|| Error::InvalidData("empty mvhd".into()))?;
+    let timescale = read_u32(bytes, if version == 1 { 20 } else { 12 }, "mvhd timescale")?;
+    if timescale == 0 {
+        return Err(Error::InvalidData(
+            "ISO-BMFF movie timescale is zero".into(),
+        ));
+    }
+    Ok(timescale)
+}
+
 fn parse_hdlr(data: &[u8], header: &BoxHeader) -> Result<[u8; 4]> {
     let bytes = payload(data, header)?;
     bytes
@@ -580,8 +730,12 @@ fn parse_stsd(data: &[u8], header: &BoxHeader, media_type: MediaType) -> Result<
     if child_start <= entry_payload.len() {
         for child in boxes_in(entry_payload, child_start..entry_payload.len())? {
             match &child.kind {
-                b"avcC" | b"hvcC" | b"av1C" | b"esds" => {
+                b"avcC" | b"hvcC" | b"av1C" => {
                     result.configuration = entry_payload[child.payload].to_vec();
+                }
+                b"esds" if format == *b"mp4a" => {
+                    result.configuration =
+                        parse_esds_audio_specific_config(&entry_payload[child.payload])?.to_vec();
                 }
                 b"pasp" => {
                     let value = &entry_payload[child.payload];
@@ -600,6 +754,85 @@ fn parse_stsd(data: &[u8], header: &BoxHeader, media_type: MediaType) -> Result<
         }
     }
     Ok(result)
+}
+
+fn parse_esds_audio_specific_config(data: &[u8]) -> Result<&[u8]> {
+    let descriptors = data
+        .get(4..)
+        .ok_or_else(|| Error::InvalidData("truncated esds full-box header".into()))?;
+    let (tag, es) = descriptor(descriptors, "esds ES_Descriptor")?;
+    if tag != 0x03 {
+        return Err(Error::InvalidData(format!(
+            "esds begins with descriptor tag 0x{tag:02x}, expected ES_Descriptor"
+        )));
+    }
+    let flags = *es
+        .get(2)
+        .ok_or_else(|| Error::InvalidData("truncated esds ES_Descriptor header".into()))?;
+    let mut offset = 3_usize;
+    if flags & 0x80 != 0 {
+        offset = offset.saturating_add(2);
+    }
+    if flags & 0x40 != 0 {
+        let url_length = usize::from(
+            *es.get(offset)
+                .ok_or_else(|| Error::InvalidData("truncated esds URL length".into()))?,
+        );
+        offset = offset.saturating_add(1).saturating_add(url_length);
+    }
+    if flags & 0x20 != 0 {
+        offset = offset.saturating_add(2);
+    }
+    let decoder_bytes = es
+        .get(offset..)
+        .ok_or_else(|| Error::InvalidData("truncated esds ES_Descriptor flags".into()))?;
+    let (tag, decoder) = descriptor(decoder_bytes, "esds DecoderConfigDescriptor")?;
+    if tag != 0x04 {
+        return Err(Error::InvalidData(format!(
+            "esds contains descriptor tag 0x{tag:02x}, expected DecoderConfigDescriptor"
+        )));
+    }
+    let children = decoder
+        .get(13..)
+        .ok_or_else(|| Error::InvalidData("truncated esds DecoderConfigDescriptor".into()))?;
+    let (tag, config) = descriptor(children, "esds DecoderSpecificInfo")?;
+    if tag != 0x05 {
+        return Err(Error::InvalidData(format!(
+            "esds contains descriptor tag 0x{tag:02x}, expected DecoderSpecificInfo"
+        )));
+    }
+    if config.is_empty() {
+        return Err(Error::InvalidData(
+            "esds DecoderSpecificInfo is empty".into(),
+        ));
+    }
+    Ok(config)
+}
+
+fn descriptor<'a>(data: &'a [u8], name: &str) -> Result<(u8, &'a [u8])> {
+    let tag = *data
+        .first()
+        .ok_or_else(|| Error::InvalidData(format!("truncated {name} tag")))?;
+    let mut length = 0_usize;
+    let mut length_bytes = 0_usize;
+    for byte in data.get(1..).unwrap_or_default().iter().take(4) {
+        length = length
+            .checked_mul(128)
+            .and_then(|value| value.checked_add(usize::from(byte & 0x7f)))
+            .ok_or_else(|| Error::InvalidData(format!("{name} length overflows")))?;
+        length_bytes += 1;
+        if byte & 0x80 == 0 {
+            let start = 1 + length_bytes;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| Error::InvalidData(format!("{name} range overflows")))?;
+            let payload = data
+                .get(start..end)
+                .ok_or_else(|| Error::InvalidData(format!("truncated {name} payload")))?;
+            return Ok((tag, payload));
+        }
+    }
+    Err(Error::InvalidData(format!("invalid {name} length")))
 }
 
 fn parse_colr(data: &[u8]) -> Result<Option<ColourInformation>> {
@@ -825,6 +1058,17 @@ fn read_i32(data: &[u8], offset: usize, name: &str) -> Result<i32> {
     read_u32(data, offset, name).map(|value| i32::from_be_bytes(value.to_be_bytes()))
 }
 
+fn read_i16(data: &[u8], offset: usize, name: &str) -> Result<i16> {
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or_else(|| Error::InvalidData(format!("truncated {name}")))?;
+    Ok(i16::from_be_bytes(bytes.try_into().expect("two bytes")))
+}
+
+fn read_i64(data: &[u8], offset: usize, name: &str) -> Result<i64> {
+    read_u64(data, offset, name).map(|value| i64::from_be_bytes(value.to_be_bytes()))
+}
+
 fn read_u64(data: &[u8], offset: usize, name: &str) -> Result<u64> {
     let bytes = data
         .get(offset..offset + 8)
@@ -850,7 +1094,20 @@ fn fourcc_text(value: [u8; 4]) -> String {
 mod tests {
     use mmrecode_core::{Demuxer, PacketFlags, Rational, Timestamp};
 
-    use super::IsoBmffFile;
+    use super::{IsoBmffFile, boxes_in, parse_elst, parse_esds_audio_specific_config};
+
+    #[test]
+    fn accepts_zero_alignment_after_sample_entry_children() {
+        let mut data = atom(*b"avcC", vec![1, 2, 3]);
+        data.extend([0; 4]);
+        let boxes = boxes_in(&data, 0..data.len()).unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].kind, *b"avcC");
+
+        let last = data.len() - 1;
+        data[last] = 1;
+        assert!(boxes_in(&data, 0..data.len()).is_err());
+    }
 
     #[test]
     fn parses_timed_h264_samples_and_seeks_to_sync_sample() {
@@ -869,6 +1126,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seek.actual.value, 0);
+    }
+
+    #[test]
+    fn extracts_audio_specific_config_from_esds() {
+        let esds = [
+            0, 0, 0, 0, // FullBox
+            0x03, 0x19, 0, 1, 0, // ES descriptor
+            0x04, 0x11, 0x40, 0x15, 0, 0, 0, 0, 1, 0xf4, 0, 0, 1, 0xf4, 0, // decoder
+            0x05, 0x02, 0x12, 0x10, // AAC-LC, 44.1 kHz, stereo
+            0x06, 0x01, 0x02,
+        ];
+        assert_eq!(
+            parse_esds_audio_specific_config(&esds).unwrap(),
+            [0x12, 0x10]
+        );
+
+        let mut truncated = esds;
+        truncated[5] = 0x7f;
+        assert!(parse_esds_audio_specific_config(&truncated).is_err());
+    }
+
+    #[test]
+    fn maps_empty_and_media_edits_into_track_timestamps() {
+        let mut elst = vec![0; 4];
+        elst.extend(2_u32.to_be_bytes());
+        elst.extend(829_u32.to_be_bytes());
+        elst.extend((-1_i32).to_be_bytes());
+        elst.extend(1_i16.to_be_bytes());
+        elst.extend(0_i16.to_be_bytes());
+        elst.extend(1_129_472_u32.to_be_bytes());
+        elst.extend(2_112_i32.to_be_bytes());
+        elst.extend(1_i16.to_be_bytes());
+        elst.extend(0_i16.to_be_bytes());
+
+        let edit = parse_elst(&elst, 44_100, 44_100).unwrap();
+        assert_eq!(edit.timestamp_offset, -1_283);
+        assert_eq!(edit.presentation_duration, Some(1_130_301));
     }
 
     fn tiny_avc_file() -> Vec<u8> {

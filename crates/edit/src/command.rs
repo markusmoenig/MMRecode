@@ -5,20 +5,21 @@ use std::{fmt::Write as _, path::PathBuf};
 use mmrecode_core::{Error, Rational, Result, Timestamp, TimestampRounding};
 
 use crate::{
-    MediaKind, MediaListing, MediaOrigin, MediaPath, MediaProject, ProjectColorSpace,
-    ProjectRateConformPolicy, ProjectScanMode, ProjectSettings, TimeRange, VisualScaleMode,
+    MediaId, MediaKind, MediaListing, MediaOrigin, MediaPath, MediaProject, MmfxSource,
+    ProjectColorSpace, ProjectRateConformPolicy, ProjectScanMode, ProjectSettings, TimeRange,
+    VisualScaleMode,
 };
 
 /// Primary editor commands accepted by scripts and the interactive prompt.
 pub const EDITOR_COMMAND_NAMES: &[&str] = &[
-    "add", "cd", "export", "help", "import", "in", "info", "ls", "man", "new", "open", "out",
+    "add", "cd", "export", "fx", "help", "import", "in", "info", "ls", "man", "new", "open", "out",
     "project", "pwd", "quit", "redo", "save", "scale", "undo",
 ];
 
 /// Every topic accepted by `man`, including interactive context commands.
 pub const EDITOR_MANUAL_TOPICS: &[&str] = &[
-    "add", "cd", "export", "help", "import", "in", "info", "left", "ls", "man", "move", "new",
-    "open", "out", "project", "pwd", "quit", "redo", "right", "save", "scale", "undo",
+    "add", "cd", "export", "fx", "help", "import", "in", "info", "left", "ls", "man", "move",
+    "new", "open", "out", "project", "pwd", "quit", "redo", "right", "save", "scale", "undo",
 ];
 
 /// Stable field names accepted by `project set`.
@@ -183,6 +184,20 @@ pub enum EditCommand {
         /// Delivery preset; may be inferred from the output extension.
         preset: Option<String>,
     },
+    /// Load an external MMFX document into the focused timeline object's embedded source.
+    FxLoad {
+        /// User-entered MMFX file locator.
+        locator: String,
+    },
+    /// Extract the focused timeline object's embedded MMFX source to a file.
+    FxSave {
+        /// Output file locator.
+        locator: String,
+    },
+    /// Focus the active MMFX source editor.
+    FxEdit,
+    /// Close the active MMFX source document.
+    FxClose,
     /// Show the current placement path.
     Pwd,
     /// List child media in the current local timeline.
@@ -290,6 +305,20 @@ pub enum CommandOutput {
         /// Requested delivery preset.
         preset: Option<String>,
     },
+    /// The application host must load a file into the focused embedded MMFX source.
+    FxLoadRequested {
+        /// User-entered file locator.
+        locator: String,
+    },
+    /// The application host must extract the focused embedded MMFX source.
+    FxSaveRequested {
+        /// Output locator.
+        locator: String,
+    },
+    /// The application host must focus the active MMFX source editor.
+    FxEditRequested,
+    /// The application host must close the active MMFX source document.
+    FxCloseRequested,
     /// Mutation completed and should trigger an interactive preview refresh.
     Changed {
         /// Concise canonical change description.
@@ -351,6 +380,42 @@ impl EditorSession {
     #[must_use]
     pub fn project_file(&self) -> Option<&std::path::Path> {
         self.project_file.as_deref()
+    }
+
+    /// Returns the embedded MMFX payload owned by the currently focused timeline object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error at the project root, for non-FX media, or for a malformed FX node without
+    /// embedded source.
+    pub fn current_mmfx_source(&self) -> Result<(MediaId, &MmfxSource)> {
+        let media_id = self.project.resolve_path(&self.path)?;
+        let media = self
+            .project
+            .media(media_id)
+            .ok_or_else(|| Error::InvalidState("current media disappeared".into()))?;
+        if media.kind.as_str() != "fx" {
+            return Err(Error::Unsupported(
+                "fx commands require `cd` into an FX timeline object first".into(),
+            ));
+        }
+        let source = media.mmfx.as_ref().ok_or_else(|| {
+            Error::InvalidState("focused FX object has no embedded MMFX source".into())
+        })?;
+        Ok((media_id, source))
+    }
+
+    /// Replaces the focused FX object's embedded source as one project undo step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the current hierarchy context selects generated `fx` media.
+    pub fn replace_current_mmfx_source(&mut self, source: MmfxSource) -> Result<CommandOutput> {
+        self.mutate(|project, path| {
+            let media_id = project.resolve_path(path)?;
+            project.set_mmfx_source(media_id, source)?;
+            Ok("edit embedded MMFX source".into())
+        })
     }
 
     /// Replaces the complete session with a loaded project and marks it clean.
@@ -488,6 +553,16 @@ impl EditorSession {
                 locator: Some(locator),
                 preset,
             }),
+            EditCommand::FxLoad { locator } => {
+                self.current_mmfx_source()?;
+                Ok(CommandOutput::FxLoadRequested { locator })
+            }
+            EditCommand::FxSave { locator } => Ok(CommandOutput::FxSaveRequested { locator }),
+            EditCommand::FxEdit => {
+                self.current_mmfx_source()?;
+                Ok(CommandOutput::FxEditRequested)
+            }
+            EditCommand::FxClose => Ok(CommandOutput::FxCloseRequested),
             EditCommand::Pwd => Ok(CommandOutput::Text(self.project.display_path(&self.path)?)),
             EditCommand::List => Ok(CommandOutput::Listing(self.project.list(&self.path)?)),
             EditCommand::Info => self.info(),
@@ -503,6 +578,7 @@ impl EditorSession {
                 duration,
                 start,
             } => self.mutate(|project, path| {
+                let is_fx = kind.as_str() == "fx";
                 let parent = project.resolve_path(path)?;
                 let time_base = project
                     .media(parent)
@@ -520,7 +596,29 @@ impl EditorSession {
                         "add start must be a non-negative absolute timecode".into(),
                     ));
                 }
-                project.add_generated(parent, kind, alias.clone(), start_frame, duration_frames)?;
+                let link_id = project.add_generated(
+                    parent,
+                    kind,
+                    alias.clone(),
+                    start_frame,
+                    duration_frames,
+                )?;
+                if is_fx {
+                    let media_id = project
+                        .link(link_id)
+                        .ok_or_else(|| {
+                            Error::InvalidState("added FX placement disappeared".into())
+                        })?
+                        .media_id;
+                    let settings = project.settings();
+                    project.set_mmfx_source(
+                        media_id,
+                        MmfxSource {
+                            source: mmfx_starter_source(&alias, settings.width, settings.height),
+                            resource_base: None,
+                        },
+                    )?;
+                }
                 Ok(format!(
                     "add {} {alias} {} at {}",
                     project
@@ -698,6 +796,17 @@ impl EditorSession {
             );
             let _ = write!(text, "\nscale: {}", link.scale_mode.as_str());
         }
+        if let Some(mmfx) = &media.mmfx {
+            let _ = write!(
+                text,
+                "\nMMFX source: embedded ({} bytes)\nMMFX resources: {}",
+                mmfx.source.len(),
+                mmfx.resource_base.as_ref().map_or_else(
+                    || "project directory".into(),
+                    |path| path.display().to_string()
+                )
+            );
+        }
         Ok(CommandOutput::Text(text))
     }
 
@@ -831,6 +940,7 @@ pub fn parse_command(line: &str) -> Result<Option<EditCommand>> {
         "import" => parse_import(&tokens)?,
         "project" => parse_project(&tokens)?,
         "export" => parse_export(&tokens)?,
+        "fx" => parse_fx(&tokens)?,
         "pwd" => no_arguments(&tokens, EditCommand::Pwd)?,
         "ls" => no_arguments(&tokens, EditCommand::List)?,
         "info" => {
@@ -895,6 +1005,45 @@ pub fn parse_command(line: &str) -> Result<Option<EditCommand>> {
         }
     };
     Ok(Some(parsed))
+}
+
+fn parse_fx(tokens: &[String]) -> Result<EditCommand> {
+    match tokens {
+        [_] => Ok(EditCommand::FxEdit),
+        [_, command] if command == "edit" => Ok(EditCommand::FxEdit),
+        [_, command, locator] if command == "load" => Ok(EditCommand::FxLoad {
+            locator: locator.clone(),
+        }),
+        [_, command, keyword, locator] if command == "save" && keyword == "as" => {
+            Ok(EditCommand::FxSave {
+                locator: locator.clone(),
+            })
+        }
+        [_, command, locator] if command == "save" => Ok(EditCommand::FxSave {
+            locator: locator.clone(),
+        }),
+        [_, command] if command == "close" => Ok(EditCommand::FxClose),
+        _ => Err(Error::InvalidData(
+            "usage: fx [edit|load <scene.mmfx>|save [as] <scene.mmfx>|close]".into(),
+        )),
+    }
+}
+
+fn mmfx_starter_source(name: &str, width: u32, height: u32) -> String {
+    let name = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let name = if name.is_empty() { "Untitled" } else { &name };
+    format!(
+        "@scene {name} {{\n    width: {width}px;\n    height: {height}px;\n    background: #00000000;\n\n    @rect card {{\n        left: 6%;\n        bottom: 8%;\n        width: 58%;\n        height: 120px;\n        background: #23b8a6;\n        border-radius: 18px;\n    }}\n}}\n"
+    )
 }
 
 fn parse_scale(tokens: &[String]) -> Result<EditCommand> {
@@ -1316,7 +1465,7 @@ fn display_frame_value(value: FrameValue, time_base: Rational) -> Result<String>
 }
 
 fn help_text() -> &'static str {
-    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save the project\nimport <file> [as <alias>]  import media\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nInteractive prompt: Tab completes commands, paths, settings, presets, topics, scale modes, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
+    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save project and embedded FX\nimport <file> [as <alias>]  import media\nadd fx <alias> <duration> [at <start>]\ncd <alias>                  enter an FX timeline object\nfx | fx edit                edit its embedded MMFX source\nfx load <scene.mmfx>        replace it with an embedded copy\nfx save as <scene.mmfx>     extract source to a file\nfx close                    close the source pane\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 project edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nPane focus: Tab/Shift-Tab. MMFX source edits immediately update the focused timeline object; ordinary project `save` persists them. Ctrl-S saves the project, Ctrl-Z/Ctrl-Y undo/redo project edits, and Esc focuses the command prompt. Preview compilation is automatic and keeps the last valid frame when source has errors.\nInteractive prompt: Ctrl-Space completes commands, paths, settings, presets, topics, scale modes, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
 }
 
 fn man_text(command: &str) -> Result<String> {
@@ -1344,6 +1493,10 @@ fn man_text(command: &str) -> Result<String> {
             "EXPORT — render the project timeline\n\nexport plan [using <preset>]\nexport <output-file> [using <preset>]\n\nDelivery presets:\n{}\n\nExport always starts at the project root and renders the complete root timeline; the current `cd` context does not select a source for export. The output filename is only the delivery destination. The executable mpeg2-ts slice supports any number of root video/mpeg2 placements, their trims and timeline positions, project-rate conformance, per-placement `scale`, and black frames for gaps. Later overlapping opaque video placements win in project composition order. A single placement covering the timeline with matching rate, canvas, and scan can use packet-preserving smart rendering as an internal optimization; all other supported timelines are fully rendered and re-encoded. Current full rendering requires progressive Yuv420p8 MPEG-2 placements, supports standard MPEG rates through 60 fps and even project canvases through 1920x1152 subject to the Main Profile/High Level limit of 62,668,800 luma samples per second, and does not yet render nested generated/effect media, alpha composition, audio, or interlaced scaling. Use `export plan` to inspect the complete timeline plan and why each path was selected. The YouTube/H.264 presets remain named future targets.",
             EXPORT_PRESET_NAMES.join("\n")
         ),
+        "fx" => {
+            "FX — edit an MMFX timeline object\n\nadd fx <alias> <duration> [at <start>]\ncd <alias>\nfx | fx edit\nfx load <scene.mmfx>\nfx save as <scene.mmfx>\nfx close\n\n`add fx` creates a generated object in the current local timeline with starter MMFX source and project-sized canvas. Enter it with `cd`, then `fx edit` opens that object's embedded source in the right-hand pane. MMFX commands reject the project root and non-FX objects, so the hierarchy always identifies exactly what is being edited.\n\nSource is owned by the reusable FX media definition and serialized inside the `.mmrecode` project by ordinary `save`. There is no second MMFX dirty document. `fx load` replaces the focused object's source with an embedded copy of an external UTF-8 file; the original directory is retained as its relative-resource base. `fx save as` extracts a source copy and does not change project ownership. `.mmfx` is appended when the extraction path has no extension.\n\nEditing keys\n  Tab / Shift-Tab    change focused pane\n  arrows, Home, End  move source cursor\n  Page Up / Down     move and scroll by a page\n  Enter / Backspace / Delete and printable text edit source\n  Ctrl-S             save the containing project\n  Ctrl-Z / Ctrl-Y    undo / redo project edits, including source\n  Esc                focus command prompt\n\nEach source edit updates the project object and schedules compilation after a short pause. Diagnostics include source line and column. Invalid source remains editable and persistable, while an invalid render never replaces the last valid monitor frame. Color glyphs and system-font fallback are not part of the current deterministic renderer."
+                .into()
+        }
         "pwd" => {
             "PWD — current context\n\npwd\n\nShows the linked-media path used by the prompt and contextual inspector.".into()
         }
@@ -1552,6 +1705,45 @@ mod tests {
     }
 
     #[test]
+    fn fx_timeline_object_owns_undoable_embedded_source() {
+        let mut session = session();
+        apply(&mut session, "add fx LowerThird 2:00 at 1:00");
+        apply(&mut session, "cd LowerThird");
+        let (media_id, source) = session.current_mmfx_source().unwrap();
+        assert!(source.source.contains("@scene LowerThird"));
+        assert!(source.source.contains("width: 1920px"));
+        assert!(source.resource_base.is_none());
+        assert_eq!(
+            session.project().media(media_id).unwrap().kind.as_str(),
+            "fx"
+        );
+
+        session
+            .replace_current_mmfx_source(MmfxSource {
+                source: "@scene Changed { width: 1px; height: 1px; }".into(),
+                resource_base: Some(PathBuf::from("/tmp/mmfx-resources")),
+            })
+            .unwrap();
+        assert!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .source
+                .contains("Changed")
+        );
+        apply(&mut session, "undo");
+        assert!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .source
+                .contains("LowerThird")
+        );
+    }
+
+    #[test]
     fn import_request_is_typed_and_resolved_media_is_undoable() {
         assert_eq!(
             parse_command("import 'media/source.ts' as Camera").unwrap(),
@@ -1695,6 +1887,28 @@ mod tests {
         };
         assert!(manual.contains("IN — source in-point"));
         assert!(manual.contains("left <time>"));
+
+        assert_eq!(
+            parse_command("fx load scenes/title.mmfx").unwrap(),
+            Some(EditCommand::FxLoad {
+                locator: "scenes/title.mmfx".into()
+            })
+        );
+        assert_eq!(
+            parse_command("fx save as title.mmfx").unwrap(),
+            Some(EditCommand::FxSave {
+                locator: "title.mmfx".into()
+            })
+        );
+        assert_eq!(
+            parse_command("fx close").unwrap(),
+            Some(EditCommand::FxClose)
+        );
+        let CommandOutput::Text(fx_manual) = apply(&mut session, "man fx") else {
+            panic!("fx manual should return text");
+        };
+        assert!(fx_manual.contains("add fx <alias>"));
+        assert!(fx_manual.contains("serialized inside the `.mmrecode` project"));
     }
 
     #[test]

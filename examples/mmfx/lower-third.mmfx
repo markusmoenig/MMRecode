@@ -1,0 +1,58 @@
+/* First executable MMFX scene: a renderer-independent lower third. */
+@scene lower-third {
+    width: 1280px;
+    height: 720px;
+    background: #10151b;
+
+    @font Inter {
+        src: "../../assets/fonts/Inter.ttf";
+    }
+
+    @group title-card {
+        position: absolute;
+        display: overlay;
+        left: 6%;
+        bottom: 8%;
+        width: 58%;
+        height: 150px;
+        overflow: hidden;
+        border-radius: 24px;
+        background: #192433e8;
+
+        @rect accent {
+            left: 0;
+            top: 0;
+            width: 18px;
+            height: 100%;
+            background: #42d6c7;
+        }
+
+        @text title {
+            left: 58px;
+            top: 24px;
+            width: 82%;
+            height: 50px;
+            content: "MMRecode";
+            font-family: Inter;
+            font-size: 38px;
+            font-weight: 650;
+            line-height: 1.1;
+            color: #f4f7f8;
+            white-space: nowrap;
+        }
+
+        @text subtitle {
+            left: 58px;
+            top: 78px;
+            width: 82%;
+            height: 38px;
+            content: "Hierarchical editing, without re-encoding.";
+            font-family: Inter;
+            font-size: 21px;
+            font-weight: 430;
+            line-height: 1.25;
+            color: #9fb0c4;
+            white-space: nowrap;
+        }
+    }
+}

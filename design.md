@@ -281,8 +281,23 @@ the codec-specific propagation rule—including B pictures that precede a change
 in display order and leading B pictures that cross an open GOP—without prematurely defining mux,
 timestamp, multi-source timeline, or effect operations.
 
-Current decoder exclusions are field pictures, dual-prime prediction, non-4:2:0 profiles,
-scalability extensions, and damaged-slice concealment. The encoder emits frame pictures, closed
+Frame-coded pictures remain native when `frame_mbs_only_flag` is clear and MBAFF is disabled; the
+slice field flag is consumed explicitly and the three POC modes distinguish frame, top-field, and
+bottom-field order. IDR intra, reference P, and explicit bipredictive B fields use
+half-height reconstruction canvases, retain a field DPB, build parity-alternating reference lists
+from POC-ordered frame groups, apply field `PicNum` list modification and adaptive MMCO marking, and
+are paired and line-woven before emitting a frame. Multi-slice fields preserve slice-local entropy,
+prediction-neighbor, and deblocking state on those canvases. The CAVLC MBAFF foundation translates
+pair scan addresses to raster addresses, supports frame-coded I/P/B pairs, and interleaves
+field-coded `I_PCM` samples. Field-coded Intra4, Intra8, Intra16, spatial B-direct, every `P_L0` shape, all
+explicit B 16x16/16x8/8x16 combinations, and all `B_8x8` submacroblock shapes are native.
+Mixed-pair CAVLC neighbor derivation, frame/field motion-vector and reference-index conversion,
+field scans, and cross-parity 4:2:0 chroma adjustment are validated byte-for-byte with moving x264
+CAVLC MBAFF GOPs and forced field-intra/all-shape field-B vectors. Current decoder exclusions
+include field-coded temporal-direct B prediction, CABAC and multi-slice MBAFF,
+mixed-mode deblocking, dual-prime prediction, non-4:2:0 profiles, scalability
+extensions, and damaged-slice
+concealment. The encoder emits frame pictures, closed
 GOPs, zero-vector B prediction, and VBR delay signalling; adaptive rate control and a normative VBV
 scheduler remain follow-on work. These limits are explicit API errors and documented in the crate
 README rather than silent approximations.
@@ -303,36 +318,99 @@ IDR status, and decode-order dependencies without teaching the container about A
 
 `mmrecode-playback` adapts that index to the existing bounded request/event interface. It selects a
 preceding sync sample and attempts native Rust reconstruction first. The first native pixel slice
-handles single-slice, frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC
+handles frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC
 `Intra_16x16`, or CAVLC `Intra_4x4` macroblocks. Its complete Intra16, Intra4, and chroma
 prediction modes work across the macroblock raster, with neighbor-context CAVLC DC/AC parsing,
 quantization, inverse transforms, in-loop deblocking, coded-canvas placement, and display cropping.
-Its CAVLC P-slice path retains one list-0 reference and reconstructs skip, 16x16, 16x8, 8x16, and
-8x8 sub-macroblock partitions down to 4x4. Motion-vector prediction, quarter-sample luma and
-eighth-sample chroma interpolation, explicit weighted prediction, inter residuals, mixed intra
-macroblocks, and inter-picture boundary strengths are native. Baseline and High Profile streams
+Multiple CAVLC or CABAC I/P/B slices reconstruct into the same canvas with entropy, intra-neighbor,
+motion-predictor, and coded-block context state restarted at each slice. Filtering is deferred until
+the picture is complete and retains each slice's offsets and `disable_deblocking_filter_idc`
+cross-slice-edge semantics.
+
+Codec work is scheduled through `DecodeExecutor`, not through an H.264-owned thread. Its native
+implementation is a bounded fixed-size pool shared by playback sources. Its portable baseline is
+a deterministic cooperative queue: each host poll executes at most the requested number of jobs,
+so single-threaded `wasm32-unknown-unknown` remains responsive without `std::thread`. H.264 divides
+requests at access-unit boundaries and keeps its mutable decoder/DPB session behind the scheduler;
+progressive non-reference B pictures fork from that session after their reference pictures are
+available. Reference pixels and motion metadata use immutable shared ownership, making a fork
+cheap, while each job owns its output canvas. The main session can advance to the next reference
+picture because these B pictures cannot alter the DPB. The cooperative backend executes the same
+plan serially. Reference-picture frame threading, multi-slice scheduling, and wavefront-style
+macroblock work remain follow-on codec-planning steps. Callers may supply another executor without
+changing container, codec, or playback interfaces.
+
+### Implemented AAC configuration and playback slice
+
+`mmrecode-aac` owns MPEG-4 `AudioSpecificConfig` parsing, AAC-LC rate/channel/frame-length
+resolution, and ADTS adaptation for raw ISO-BMFF access units. `mmrecode-isobmff` unwraps the
+`esds` descriptor hierarchy and stores decoder-specific bytes in the generic codec
+descriptor; it does not parse AAC spectral syntax.
+
+The container also applies the common edit-list shape used for codec priming: an optional leading
+empty edit followed by one rate-1.0 media edit. It maps the movie-scale edit durations into the
+track time base, shifts packet timestamps, and exposes the edited presentation duration. Arbitrary
+multi-segment edits and non-unit media rates remain outside this slice.
+
+`AacPlaybackSource` builds a presentation index from exact sample-table DTS, PTS, duration, and
+byte ranges, then schedules complete-track PCM reconstruction through `DecodeExecutor`. The first
+native backend constructs ADTS from MMRecode-owned configuration and samples and delegates only
+spectral reconstruction to an optional FFmpeg process. Its output crosses the new generic
+`AudioDecoder`/`AudioFrame` boundary. The terminal application owns device negotiation and uses the
+rendered PCM position as the H.264 master clock across play, pause, seek, buffering, and looping.
+Baseline WebAssembly retains parsing, indexing, and cooperative scheduling but reports native
+spectral reconstruction as unsupported until the Rust AAC-LC decoder lands.
+
+Its CAVLC P-slice path retains a bounded short-term decoded-picture buffer and reconstructs
+default-list reference indices for skip, 16x16, 16x8, 8x16, and 8x8 sub-macroblock partitions down
+to 4x4. Motion-vector prediction, quarter-sample luma and eighth-sample chroma interpolation,
+single-reference explicit weighted prediction, inter residuals, mixed intra macroblocks, and
+inter-picture boundary strengths are native. Baseline and High Profile streams
 using CAVLC and 4x4 transforms share this path. For unsupported
 reconstruction tools, playback constructs only the
 required Annex-B window and sends it to an optional installed FFmpeg fallback. FFmpeg does not
 demux the file, define timestamps, choose seek points, or perform edit planning.
 The CABAC layer supplies its own context-state initialization, binary arithmetic decision, bypass,
-termination, and restart processes. CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDRs use that path end to
-end, including prediction syntax, coded-block-pattern and neighboring-block context derivation,
+termination, and restart processes. CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDR and non-IDR I
+pictures use that path end to end, including entry without prior reference state, prediction syntax, coded-block-pattern and neighboring-block context derivation,
 luma/chroma DC and AC coefficients, quantization, inverse transforms, filtering, and exact
 x264/FFmpeg interoperability coverage. CABAC P slices additionally reconstruct skipped, 16x16,
 16x8, 8x16, and 8x8-partitioned inter macroblocks down to 4x4, plus mixed Intra4/Intra16/PCM
-macroblocks, with context-coded motion-vector differences, luma/chroma residuals, QP deltas, and
-inter-picture filtering. High Profile CABAC intra and inter macroblocks may use the native 8x8
-luma inverse transform; the deblocker suppresses the internal 4x4 edges inside those transform
-blocks. SPS/PPS scaling lists are resolved using AVC fallback rules and feed native 4x4 and 8x8
-inverse quantization. The High Profile QP-zero bypass path directly reconstructs lossless Intra4
-and inter residual samples, including horizontal/vertical chroma residual DPCM. B slices still
-return `Unsupported` for fallback.
-Complete decoded-reference-picture marking and reference-list modification remain necessary before
-the index is strong enough for arbitrary-boundary H.264 smart rendering. The first render adapter
-already uses the conservative graph for a stricter operation: it accepts only complete contiguous
+macroblocks, with context-coded default-list reference indices and motion-vector differences,
+luma/chroma residuals, QP deltas, and inter-picture filtering. High Profile CABAC intra and inter
+macroblocks may use the native 8x8 luma inverse transform; the deblocker suppresses the internal
+4x4 edges inside those transform blocks. SPS/PPS scaling lists are resolved using AVC fallback
+rules and feed native 4x4 and 8x8 inverse quantization. The High Profile QP-zero bypass path
+directly reconstructs lossless Intra4 and inter residual samples, including horizontal/vertical
+chroma residual DPCM. Frame-picture POC types 0, 1, and 2 drive reference ordering, including
+type-1 offset cycles, frame-number wrap, non-reference adjustments, and MMCO 5 resets. The B-slice layer constructs both default
+reference lists, and reconstructs CAVLC `B_L0_16x16`, `B_L1_16x16`, and `B_Bi_16x16` with
+unweighted prediction. All 18 explicit 16x8/8x16 macroblock types share the separate list motion
+predictors. Spatial-direct `B_Direct_16x16` and `B_Skip` derive both reference indices and motion
+vectors from neighboring partitions, including the co-located zero rule. Explicit `B_8x8`
+sub-macroblocks cover every L0/L1/Bi shape from 8x8 through 4x4. Spatial-direct `B_Direct_8x8`
+supports both SPS inference granularities. Temporal direct retains colocated reference identity,
+maps it into the current list 0, scales motion by picture-order distance, and derives 8x8 or 4x4
+partitions as required. Explicit weight tables and implicit POC-distance weights cover CAVLC
+single-list, bidirectional, and direct partitions. B-picture deblocking compares both reference
+lists by decoded-picture identity and accepts equivalent swapped list pairs. CABAC B slices reuse
+the same reconstruction machinery after context-coded skip, macroblock/sub-macroblock type,
+reference-index, and motion-difference parsing. They cover direct/skip, every explicit inter shape,
+embedded intra macroblocks, temporal direct, implicit weighting, High Profile 8x8 transforms, and
+in-loop filtering; direct-8x8 colocated selection uses the normative representative corner blocks.
+Short- and long-term list-0 modification is applied natively for P-picture reconstruction,
+including wrapped frame-number arithmetic. The frame-picture DPB applies sliding-window and all six
+adaptive MMCO operations, including maximum-index management, reset, conversion, and current/IDR
+long-term assignment. Corresponding dependency indexing remains necessary before the index is
+strong enough for arbitrary-boundary H.264 smart rendering. The first render adapter already uses
+the conservative graph for a stricter operation: it accepts only complete contiguous
 GOPs bounded by MP4 sync samples that contain IDR pictures, reports why the range is copy-safe, and
 copies every encoded sample unchanged. No H.264 encoder has been started.
+Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
+window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
+reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;
+cyclic intra-refresh P windows populate a bounded set of neutral unavailable short-term pictures,
+decode forward from the recovery access unit, and expose output beginning at the target.
 
 ### Avoid premature algorithm abstraction
 
@@ -449,6 +527,13 @@ child source range, and eventually transform/override data. Paths traverse links
 local editing context; they are not filesystem ownership. Stable media and link identifiers allow
 one media definition to be placed more than once while keeping instance edits unambiguous. Cycles
 are forbidden in the composition graph.
+
+Frontends project only the current path's local timeline into editable object rows. Changing path
+with `cd` therefore changes timeline scope; it does not merely select an object while leaving every
+ancestor and sibling expanded. The breadcrumb names the active local time domain, ordered direct
+children become stable visual lanes, and a synthetic `self/source` row provides the current
+object's base-media context without entering the authoring graph. Frontends may add an explicit
+overview or parent-context strip, but must not make a global flattened track stack the default.
 
 The existing `EditSequence` remains the renderer-facing, codec-independent intent model. A later
 compiler flattens the recursive graph into sources, typed streams, tracks, clips, exact ranges,

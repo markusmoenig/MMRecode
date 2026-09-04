@@ -5,15 +5,17 @@ It begins with independently coded production formats and grows toward inter-fra
 container support, verification, and minimal-recompression editing.
 
 The project is growing through bounded, complete vertical slices. Its purpose and intended scope are described in
-[`concept.md`](concept.md); crate boundaries and dependency rules are described in
-[`design.md`](design.md); and remaining work across codecs, containers, editing, playback, APIs,
-and release engineering is tracked in [`todo.md`](todo.md).
+[`concept.md`](concept.md); MMFX is explored in [`mmfx-concept.md`](mmfx-concept.md); product
+positioning is recorded in [`marketing.md`](marketing.md); crate boundaries and dependency rules
+are described in [`design.md`](design.md); and remaining work across codecs, containers, editing,
+playback, APIs, and release engineering is tracked in [`todo.md`](todo.md).
 
 ## Initial workspace
 
 - `mmrecode-core`: shared media types and codec/container interfaces
 - `mmrecode-bitstream`: bit-level readers, writers, VLC support, and start-code utilities
 - `mmrecode-mjpeg`: the first codec implementation
+- `mmrecode-aac`: MPEG-4 AAC configuration, access-unit framing, and decoder foundations
 - `mmrecode-mpegaudio`: MPEG-1 Audio Layer II framing and timing for pass-through
 - `mmrecode-dv`: raw DV25 DIF parsing, validation, metadata, and embedded audio
 - `mmrecode-mpeg2`: MPEG-2 Video parsing, I/P/B reconstruction/encoding, and dependency planning
@@ -22,7 +24,7 @@ and release engineering is tracked in [`todo.md`](todo.md).
 - `mmrecode-edit`: recursive linked-media authoring, typed editor commands, and flattened render intent
 - `mmrecode-render`: explicit render planning, minimal-recompression execution, and optional
   MPEG-TS delivery
-- `mmrecode-playback`: exact timelines, audio-clock synchronization, and indexed MPEG-2 preview
+- `mmrecode-playback`: exact timelines, audio-clock synchronization, and indexed MPEG-2/H.264/AAC preview
 - `mmrecode-quality`: objective frame-comparison utilities
 - `mmrecode-testkit`: reusable verification support for codec crates
 - `mmrecode-capi`: experimental C ABI with an owned-buffer boundary
@@ -85,13 +87,67 @@ dual-prime prediction, chroma profiles, and production VBV rate control—are ex
 
 The H.264 vertical slice owns ISO-BMFF sample parsing, AVC syntax, timing, dependency indexing,
 editor import/seek/playback, `project match`, and clean-GOP video remuxing. Its native Rust decoder
-currently reconstructs CAVLC I/P pictures for the documented single-reference 4x4-transform
-subset, plus CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDRs. CABAC P pictures support skip, 16x16,
-16x8, 8x16, and 8x8 partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion,
-luma/chroma residuals, QP changes, resolved SPS/PPS scaling matrices, 4x4/8x8 luma transforms,
-filtering, and QP-zero transform bypass for lossless Intra4 and inter residuals. Unsupported B
-slices and fuller reference semantics remain on the explicit optional playback fallback path; no
-H.264 encoder has been started.
+currently reconstructs CAVLC I/P pictures with a bounded short-term DPB and default-list reference
+indices for the documented 4x4-transform subset, plus CABAC `I_PCM`, Intra16, Intra8, and Intra4
+IDRs. CABAC P pictures use the same bounded short-term DPB and support default-list multiple
+references with skip, 16x16, 16x8, 8x16, and 8x8 partitions down to 4x4, mixed
+Intra4/Intra16/PCM macroblocks, motion, luma/chroma residuals, QP changes, resolved SPS/PPS scaling
+matrices, 4x4/8x8 luma transforms,
+filtering, and QP-zero transform bypass for lossless Intra4 and inter residuals. The first CAVLC
+B-picture slice derives POC type-0 list-0/list-1 order and reconstructs unweighted 16x16 L0, L1,
+bidirectional, spatial-direct, temporal-direct, and skipped prediction, plus every explicit
+16x8/8x16 L0/L1/Bi combination and every B_8x8 subtype down to 4x4. Direct B_8x8 prediction
+supports both SPS inference granularities, and CAVLC B slices apply explicit and implicit weighted
+biprediction and normative in-loop deblocking. CABAC B slices now cover skip/direct, every explicit
+16x16/16x8/8x16 and `B_8x8` prediction form, embedded intra macroblocks, temporal direct,
+implicit weighting, High Profile 8x8 transforms, and in-loop deblocking. All three frame-picture
+POC modes drive reference ordering, including type-1 cycles, type-2 frame-number wrap, and MMCO 5
+resets. Multi-slice CAVLC and CABAC I/P/B frame pictures reconstruct with slice-local
+prediction/context availability, motion predictors, and per-slice deblocking, including
+cross-slice filtering control. Frame-coded pictures under an interlaced SPS are native and tested
+against x264/FFmpeg. The actual field path reconstructs and weaves complementary IDR
+intra, reference P, and explicit bipredictive B fields with POC-derived display order, grouped
+parity-aware default and modified reference lists, adaptive MMCO marking, and a field DPB;
+multi-slice fields retain independent slice reconstruction/deblocking state. CAVLC MBAFF pictures
+now reconstruct frame-coded I/P/B pairs and mixed field-coded `I_PCM` pairs. The first field-coded
+Intra4, Intra8, Intra16, and spatial B-direct paths are native, as are every field-coded `P_L0` shape, all
+explicit B 16x16/16x8/8x16 combinations, and every `B_8x8` submacroblock shape. Their mixed
+frame/field CAVLC neighbors, field coefficient scans, motion-vector/reference-index conversion,
+and cross-parity 4:2:0 chroma offsets decode moving x264 MBAFF GOPs byte-for-byte against FFmpeg.
+Forced vectors cover field Intra4, field Intra8, and every explicit field-B shape. Field-coded
+temporal-direct B prediction, CABAC, mixed-mode deblocking, and multi-slice MBAFF remain on the
+explicit optional playback fallback path.
+No H.264 encoder has been started.
+Short- and long-term list-0
+reordering and frame-picture sliding/adaptive MMCO marking are native, including wrapped frame
+numbers. Recovery-point SEI is indexed with active `MaxFrameNum` validation. Native playback can
+start at a matured non-IDR intra recovery window independently of IDR classification, or decode a
+cyclic intra-refresh P window with bounded neutral unavailable references and begin output at the
+signalled modulo-`frame_num` target. A real x264 cyclic-refresh target is verified byte-for-byte
+against uninterrupted FFmpeg output. H.264 playback now submits access-unit-sized jobs through a
+shared bounded decode-executor API while retaining decoder/DPB state across sequential buffer
+refills. The default native backend is a fixed-size worker pool; the baseline WebAssembly backend
+is cooperative and advances one bounded job whenever playback is polled. Frames are emitted as
+they become available, and obsolete work is interrupted at access-unit boundaries when the user
+scrubs. Progressive non-reference B pictures can fork from a cheap immutable DPB snapshot and run
+concurrently with their siblings and the following reference-picture work. Reference storage is
+shared between forks, so this does not copy near-4K reference planes. The same plan runs serially
+through the cooperative WebAssembly backend. Progressive-frame prediction and deblocking avoid
+the former whole-plane and repeated-boundary work; on the development Mac the native scalar path
+decodes the 1080p version of the screen-recording acceptance sample faster than its 48 fps source
+rate. A 24-frame native window from the original 3456x2234 recording improved from about 14 fps to
+about 25 fps with B-picture fan-out, but remains below its 48 fps source rate.
+
+The first AAC playback slice parses ISO-BMFF `esds` descriptors into validated MPEG-4
+`AudioSpecificConfig`, indexes raw AAC access units and timing, and adapts AAC-LC samples to ADTS
+without delegating demuxing or seek policy. A common empty-edit-plus-media-edit mapping is applied
+to sample timestamps and PCM priming/padding so Apple-style recordings use their edited duration.
+PCM reconstruction is scheduled through the shared
+decode executor. Native builds currently use an optional FFmpeg spectral-decoder bridge, then feed
+interleaved PCM to the terminal preview; rendered audio is the master clock for H.264 video across
+pause, seek, buffering, and looping. The codec-facing `AudioDecoder` interface and baseline
+WebAssembly indexing path are in place, but native Rust AAC-LC spectral reconstruction, browser
+audio output, HE-AAC/SBR/PS, streaming PCM queues, and AAC encoding remain follow-on work.
 
 The first container slice is implemented in `mmrecode-mpegts`. It validates 188-byte transport
 packets, continuity, PAT/PMT PSI and CRCs; discovers programs and streams; reassembles MPEG-2 PES
@@ -204,12 +260,14 @@ minutes, one second, and fifteen frames, and leading zero fields are omitted. A 
 immediately changes the playable range without unexpectedly moving an already valid playhead.
 Up/Down recalls command history and restores an unfinished draft after the newest entry. History
 is persisted across interactive MMRecode launches in the operating system's conventional
-application-state directory. Tab completes command names, `man`/`info` topics, project settings,
+application-state directory. Tab and Shift-Tab move keyboard focus among the command prompt,
+timeline, and inspector. The inspector scrolls with Up/Down, Page Up/Page Down, Home/End, or the
+mouse wheel. Ctrl-Space in the command prompt completes command names, `man`/`info` topics, project settings,
 project/export presets, hierarchy aliases after `cd`, and filesystem paths after `open`, `import`,
 `save as`, or `export`; paths containing spaces are quoted automatically.
 Click or drag anywhere in the timeline to scrub, or use Left/Right for one frame,
 Shift-Left/Right for ten frames, and Page Up/Page Down for roughly one second. Ctrl-Space toggles
-playback; playing while parked at the out-point restarts from the in-point. Home/End seeks to the
+playback while the timeline is focused; playing while parked at the out-point restarts from the in-point. Home/End seeks to the
 edit boundaries, and Ctrl-Z/Ctrl-Y undo or redo. Ctrl-Q leaves a clean editor; unsaved projects
 must first be saved or explicitly closed with `quit --discard`.
 

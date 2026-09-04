@@ -1,13 +1,17 @@
 //! Versioned, human-readable persistence for recursive media projects.
 
-use std::{collections::BTreeMap, io::Write as _, path::Path};
+use std::{
+    collections::BTreeMap,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 use mmrecode_core::{Error, Rational, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MediaId, MediaKind, MediaLinkId, MediaOrigin, MediaProject, ProjectColorSpace, ProjectScanMode,
-    ProjectSettings, TimeRange, VisualScaleMode,
+    MediaId, MediaKind, MediaLinkId, MediaOrigin, MediaProject, MmfxSource, ProjectColorSpace,
+    ProjectScanMode, ProjectSettings, TimeRange, VisualScaleMode,
 };
 
 const FORMAT: &str = "mmrecode-project";
@@ -56,6 +60,15 @@ struct MediaRecord {
     time_base: RationalRecord,
     duration: i64,
     origin: OriginRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mmfx: Option<MmfxRecord>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MmfxRecord {
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_base: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -169,6 +182,14 @@ impl ProjectDocument {
             .media_nodes()
             .filter(|media| media.id != project.root_id())
             .map(|media| {
+                let mmfx = if let Some(mmfx) = &media.mmfx {
+                    Some(MmfxRecord {
+                        source: mmfx.source.clone(),
+                        resource_base: mmfx.resource_base.as_deref().map(path_text).transpose()?,
+                    })
+                } else {
+                    None
+                };
                 Ok(MediaRecord {
                     id: media_id(media.id),
                     name: media.name.clone(),
@@ -176,6 +197,7 @@ impl ProjectDocument {
                     time_base: media.time_base.into(),
                     duration: media.duration.value,
                     origin: OriginRecord::from_origin(&media.origin, directory, source_directory)?,
+                    mmfx,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -232,6 +254,7 @@ impl ProjectDocument {
                 )));
             }
             let time_base = media.time_base.try_into()?;
+            let mmfx = media.mmfx;
             let id = project.create_media(
                 media.name,
                 MediaKind::new(media.kind)?,
@@ -239,6 +262,9 @@ impl ProjectDocument {
                 media.duration,
                 media.origin.into_origin()?,
             )?;
+            if let Some(mmfx) = mmfx {
+                project.set_mmfx_source(id, mmfx.into_source()?)?;
+            }
             media_ids.insert(serialized_id, id);
         }
         for (index, link) in self.links.into_iter().enumerate() {
@@ -299,6 +325,24 @@ impl ProjectDocument {
             }
         }
         Ok(project)
+    }
+}
+
+impl MmfxRecord {
+    fn into_source(self) -> Result<MmfxSource> {
+        let resource_base = self.resource_base.map(PathBuf::from);
+        if resource_base
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(Error::InvalidData(
+                "MMFX external resource base must be absolute".into(),
+            ));
+        }
+        Ok(MmfxSource {
+            source: self.source,
+            resource_base,
+        })
     }
 }
 
@@ -541,6 +585,24 @@ mod tests {
         project
             .set_link_scale_mode(link_id, VisualScaleMode::Fill)
             .unwrap();
+        let fx_id = project
+            .create_media(
+                "LowerThird",
+                MediaKind::new("fx").unwrap(),
+                time_base,
+                60,
+                MediaOrigin::Generated,
+            )
+            .unwrap();
+        project
+            .set_mmfx_source(
+                fx_id,
+                MmfxSource {
+                    source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
+                    resource_base: Some(directory.join("fx")),
+                },
+            )
+            .unwrap();
 
         save_project_file(&project, &path).unwrap();
         let loaded = load_project_file(&path).unwrap();
@@ -557,6 +619,13 @@ mod tests {
         assert_eq!(
             loaded.link(MediaLinkId(1)).unwrap().scale_mode,
             VisualScaleMode::Fill
+        );
+        assert_eq!(
+            loaded.media(MediaId(3)).unwrap().mmfx.as_ref().unwrap(),
+            &MmfxSource {
+                source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
+                resource_base: Some(directory.join("fx")),
+            }
         );
 
         std::fs::remove_dir_all(directory).unwrap();

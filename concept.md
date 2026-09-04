@@ -313,6 +313,33 @@ the local timeline and composition order. Render compilation may derive typed au
 lanes internally without imposing them on the user. Source-media registration and relinking can
 still have a separate browser mode, but it is not the primary editing hierarchy.
 
+### Timeline projection of the current hierarchy
+
+The visible timeline follows the current media path; `cd` changes editing scope rather than merely
+highlighting one object in a permanently expanded global timeline. At the project root, every
+direct child placement appears as its own layered object row. Inside `/Clip0`, the timeline shows
+Clip0's direct children in Clip0-local time. Parent-level siblings are not shown by default because
+they belong to a different local timeline and may use a different time base.
+
+These rows are a frontend projection of ordered child placements, not persistent track objects.
+Their stable vertical order communicates composition order, while row appearance communicates
+kind: video may contain thumbnails, audio a waveform, and text, effects, masks, or MMFX scenes
+their own compact visual forms. The renderer may pack or specialize lanes internally without
+changing the authoring graph.
+
+The timeline title carries the complete breadcrumb and local range, for example
+`Timeline /Clip0/Title · local 0:00..4:00`. A pinned, visually distinct `self` or `source` row shows
+the current object's own media beneath its children. This row is view context rather than an
+additional child placement, and ensures that entering a leaf object does not produce a misleading
+empty timeline. A compact ancestor-context strip may show where the current object sits in its
+parent, but parent siblings stay out of the editable rows.
+
+Selection and navigation remain separate operations. Moving among rows selects a child in the
+current level; `cd <alias>`, Enter, or an equivalent pointer gesture descends into it. `cd ..`
+returns to the parent and restores selection to the placement just exited. A future explicit
+overview mode may flatten descendants or show surrounding parent content, but it is not the
+default editing model.
+
 Familiar navigation commands such as `ls`, `cd`, `pwd`, `tree`, and `info` should be complemented by
 media commands such as `add`, `in`, `out`, `play`, `seek`, `split`, `ripple`, `keyframe`, `render`,
 and `explain`. Mutating commands participate in undoable transactions so a multi-command edit can
@@ -320,9 +347,17 @@ be committed or reverted as one operation. Human-friendly aliases may be accepte
 while command history and saved projects retain stable media and link identifiers. The first
 frontend is a full-screen shell from startup, including for an empty project. Up/Down recall
 commands and returning past the newest entry restores the current draft. Interactive command
-history persists across launches. Tab completion follows the same context: it completes commands,
+history persists across launches. Command completion follows the same context: it completes commands,
 help/info topics, project settings and presets, delivery presets, project paths for `open`, media
 paths for `import`, and child aliases for `cd`.
+
+Keyboard input belongs to an explicitly focused pane. Tab and Shift-Tab move focus among the
+command prompt, timeline, and scrollable inspector, with the focused border and cursor state always visible. Timeline
+transport and zoom keys are inactive while the command prompt owns input, so ordinary command text
+cannot collide with timeline shortcuts. Ctrl-Space performs completion in the command pane and
+play/pause in the timeline pane. The focused inspector uses arrows, Page Up/Page Down, and Home/End,
+and also accepts mouse-wheel scrolling. A later embedded MMFX/code editor joins the same focus cycle; its
+editing mode may retain Tab for indentation while an explicit escape returns to pane navigation.
 
 Project documents and media are deliberately different operations. `open` loads a versioned
 `.mmrecode` project; `save` and `save as` persist the recursive graph, resolved authoring settings,
@@ -346,26 +381,62 @@ the deliberately constrained `mpeg2-ts` path. YouTube-oriented authoring presets
 H.264/MP4 delivery remains explicit future work rather than being silently delegated.
 
 H.264 MP4/MOV is now also an editor input. MMRecode parses the ISO-BMFF sample tables and AVC
-syntax itself, preserving exact DTS/PTS ordering and selecting bounded keyframe/dependency windows
-for seeks. Pixel reconstruction now attempts the native Rust decoder first. Its initial exact slices
-support single-slice 8-bit 4:2:0 IDR pictures containing raw `I_PCM`, CAVLC `Intra_16x16`, or
+syntax itself, preserving exact DTS/PTS ordering and selecting keyframe/dependency windows for
+seeks. A persistent decode session keeps DPB state across sequential buffer refills, submits
+access-unit-sized jobs through the shared executor, publishes each frame immediately, and abandons
+an obsolete request at the next access-unit boundary when a newer scrub arrives. Pixel
+reconstruction now attempts the native Rust decoder first. Its initial exact slices
+support 8-bit 4:2:0 IDR pictures containing raw `I_PCM`, CAVLC `Intra_16x16`, or
 CAVLC `Intra_4x4` macroblocks, including all luma/chroma prediction modes, nonzero DC/AC
 coefficient decoding, quantization, inverse transforms, and in-loop deblocking with slice offsets.
-The CAVLC P-slice path retains one list-0 reference and handles skip, 16x16, 16x8, 8x16, and
-sub-macroblock partitions down to 4x4, including fractional-sample motion compensation, inter
-residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture deblocking.
+The CAVLC P-slice path retains a bounded short-term DPB and handles default-list reference indices
+for skip, 16x16, 16x8, 8x16, and sub-macroblock partitions down to 4x4, including
+fractional-sample motion compensation, inter residuals, single-reference explicit weighted
+prediction, mixed intra macroblocks, and inter-picture deblocking.
 This includes the High Profile subset that uses CAVLC and 4x4 transforms.
-The native CABAC arithmetic core and exact CABAC `I_PCM`, Intra16, Intra8, and Intra4 IDR paths are also
-present, including prediction syntax and luma/chroma DC and AC coefficient decoding with
+The native CABAC arithmetic core and exact CABAC `I_PCM`, Intra16, Intra8, and Intra4 paths are also
+present for IDR and non-IDR I pictures, including prediction syntax and luma/chroma DC and AC coefficient decoding with
 neighboring-block contexts. CABAC P pictures also reconstruct skip, 16x16, 16x8, 8x16, and 8x8
-partitions down to 4x4, mixed Intra4/Intra16/PCM macroblocks, motion, residuals, QP changes, and
-filtering. High Profile CABAC pictures can select 8x8 luma transforms for both intra and inter
-macroblocks, including the transform-aware deblocking edge geometry. SPS/PPS scaling lists are
+partitions down to 4x4 with default-list multiple-reference selection, mixed Intra4/Intra16/PCM
+macroblocks, motion, residuals, QP changes, and filtering. High Profile CABAC pictures can select
+8x8 luma transforms for both intra and inter macroblocks, including the transform-aware deblocking
+edge geometry. SPS/PPS scaling lists are
 parsed with their normative fallback rules and applied to native 4x4 and 8x8 inverse quantization.
 QP-zero transform bypass is native for lossless Intra4 and inter residuals, including chroma
-residual DPCM. Unsupported B slices, multiple-reference tools, and multi-slice pictures still use
-an optional installed FFmpeg fallback behind the same request/event boundary. This does not make FFmpeg the demuxer,
+residual DPCM. Frame-picture sliding/adaptive MMCO marking, long-term references, and short- and
+long-term list-0 reordering are native, including wrapped frame numbers. CAVLC B pictures now have
+an initial POC type-0, 16x16 L0/L1/bidirectional reconstruction path with spatial-direct,
+temporal-direct, and skipped macroblocks, plus all explicit 16x8/8x16 L0/L1/Bi combinations and
+all B_8x8 subtypes down to 4x4. Direct B_8x8 handles both SPS inference granularities. CAVLC B
+slices support explicit and implicit weighted biprediction and two-list in-loop deblocking. CABAC
+B slices now reconstruct skip/direct and every explicit inter partition, embedded intra
+macroblocks, temporal direct, implicit weighting, High Profile 8x8 transforms, and in-loop
+deblocking. Frame pictures use all three POC modes for reference ordering, including type-1 cycles,
+type-2 frame-number wrap, and MMCO 5 reset semantics. Multi-slice CAVLC and CABAC I/P/B frame
+pictures restart slice-local entropy contexts, intra and motion-prediction availability, and apply
+per-slice deblocking modes and offsets after full-picture reconstruction. Frame pictures carried
+under an interlaced SPS are decoded natively with explicit field-flag parsing and all three POC
+modes now derive top/bottom field order in isolation. Complementary IDR intra,
+reference P, and explicit bipredictive B fields decode into field-height buffers, retain individual
+field references, build parity-aware lists from POC-ordered frame groups, pair by frame identity,
+apply field-aware list modification and adaptive MMCO marking, weave into a full YUV frame, and
+expose POC-derived field order. Multi-slice fields restart slice-local reconstruction and retain
+per-slice deblocking behavior before complementary-field weaving. CAVLC MBAFF frame pictures now
+map macroblock-pair scan order into the frame canvas, reconstruct frame-coded I/P/B pairs, and
+interleave field-coded `I_PCM` pairs. Field-coded Intra4, Intra8, Intra16, spatial B-direct, all `P_L0`
+shapes, every explicit B 16x16/16x8/8x16 combination, and all `B_8x8` submacroblock shapes use
+mixed-pair CAVLC neighbor derivation, frame/field motion-vector and reference-index conversion,
+field coefficient scans, and cross-parity 4:2:0 chroma adjustment. Moving x264 MBAFF GOPs and
+forced field-intra/all-shape field-B vectors are pixel-checked byte-for-byte against FFmpeg.
+Field-coded temporal-direct B prediction, CABAC, mixed-mode deblocking, and multi-slice MBAFF still
+use an optional installed FFmpeg fallback behind the same request/event boundary. This does
+not make FFmpeg the demuxer,
 timing authority, or render planner, and it does not start H.264 encoding.
+Recovery-point SEI is carried into the presentation index with its frame-number modulus. Seeks may
+start at a non-IDR intra recovery access unit once the signalled target reference `frame_num` has
+reached output order. Cyclic intra-refresh P windows synthesize bounded neutral unavailable
+short-term references while the decoder advances to that target, so pixels exposed after recovery
+do not depend on state before the selected access unit.
 
 The first lossless H.264 output operation is intentionally narrower than editor delivery:
 `plan-h264` and `remux-h264` accept only complete IDR-delimited GOP ranges. MMRecode verifies both
@@ -464,7 +535,9 @@ monitor, contextual help/inspector, result area, command prompt, and graphical t
 treating the monitor as the entire editor. The timeline combines a time ruler,
 retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures and H.264 IDRs with
 keyboard/mouse scrubbing. The first integration deliberately previews one source placement,
-leaving recursive composition and synchronized H.264/AAC audio for later bounded slices.
+leaving the current-level multi-object timeline projection, recursive composition, and synchronized
+H.264/AAC audio for later bounded slices. Until that projection exists, the single centered source
+strip is a playback diagnostic and must not define the eventual timeline interaction model.
 
 The layout may later switch between the complete editing workspace and a full-screen monitor while
 retaining the same session, playback controller, frame cache, and playhead. Likewise, the timeline
@@ -502,6 +575,9 @@ Interactive or dynamic content may remain live in MMRecode projects and be flatt
 codec-independent video for services such as YouTube.
 
 ### CPU-authoritative effects and typography
+
+The detailed MMFX scene-language, kernel, execution, editor, and implementation direction is
+specified in [`mmfx-concept.md`](mmfx-concept.md).
 
 Final rendering should prioritize reproducible quality over meeting a real-time frame deadline. A
 future MMFX language should compile to a typed portable effect IR with a scalar CPU reference
@@ -582,9 +658,18 @@ It now also provides fixed-rate animation and synchronized audio playback. A reu
 crate maps exact rational frame rates to media time, accepts the rendered audio position as the
 master clock, and provides indexed, background MPEG-2 and H.264 picture reconstruction for editor
 preview. Pixels are decoded on demand into bounded caches rather than all at open. H.264 attempts
-native reconstruction first and uses an optional FFmpeg pixel-decoder process for tools beyond the
-current native I/P subset, after native MP4 demuxing and access-unit selection; device handling
-and temporary third-party audio decoding remain application-local.
+native reconstruction first. Its access-unit work crosses a shared bounded executor: a fixed-size
+pool on native hosts and a cooperative polling queue for baseline browser WebAssembly. This keeps
+the codec-facing scheduling contract portable. Progressive non-reference B pictures already fork
+from immutable shared reference state and execute concurrently without changing the authoritative
+DPB; the cooperative backend follows the same plan serially. Broader reference-picture, slice, and
+wavefront parallelism remains measured follow-on work. Native builds may use an optional FFmpeg pixel-decoder
+process for tools beyond the current native subset, after native MP4 demuxing and access-unit selection;
+that process fallback is unavailable in WebAssembly. AAC follows the same ownership rule: MMRecode
+parses `esds`/`AudioSpecificConfig`, indexes and times raw MP4 access units, and schedules PCM work,
+while the first native playback slice may delegate only spectral reconstruction to an optional
+FFmpeg bridge. Device handling remains application-local. Native AAC-LC reconstruction will replace
+that bridge behind the shared audio-decoder interface without changing container or playback policy.
 
 ### Subsequent vertical slices
 

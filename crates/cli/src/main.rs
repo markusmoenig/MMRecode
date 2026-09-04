@@ -1,10 +1,13 @@
 //! `MMRecode` command-line entry point.
 
+mod audio;
 mod command_history;
 mod editor_export;
 mod media_probe;
 mod prompt_completion;
 mod terminal_preview;
+mod timeline_raster;
+mod timeline_view;
 
 use command_history::CommandHistory;
 
@@ -51,6 +54,7 @@ fn run() -> Result<(), String> {
         Some("remux-h264") => h264_remux_command(&mut arguments, true),
         Some("render-plan") => render_plan_command(&mut arguments),
         Some("render") => render_command(&mut arguments),
+        Some("render-mmfx") => render_mmfx_command(&mut arguments),
         Some("decode") => {
             let input = arguments
                 .next()
@@ -122,6 +126,79 @@ fn run() -> Result<(), String> {
             "command '{other}' is not implemented; run 'mmrecode help' for available commands"
         )),
     }
+}
+
+fn render_mmfx_command(
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let usage = "usage: mmrecode render-mmfx <scene.mmfx> <output.png>";
+    let input = arguments.next().ok_or_else(|| usage.to_owned())?;
+    let output = arguments.next().ok_or_else(|| usage.to_owned())?;
+    if arguments.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let input_path = std::path::Path::new(&input);
+    let output_path = std::path::Path::new(&output);
+    let source = std::fs::read_to_string(input_path)
+        .map_err(|error| format!("cannot read {}: {error}", input_path.display()))?;
+    let scene = mmrecode_mmfx::parse_scene(&source).map_err(|diagnostics| {
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                let (line, column) = diagnostic.span.line_column(&source);
+                let help = diagnostic
+                    .help
+                    .map_or_else(String::new, |help| format!("\n  help: {help}"));
+                format!(
+                    "{}:{line}:{column}: {}{help}",
+                    input_path.display(),
+                    diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let mut resources = mmrecode_mmfx::RenderResources::new();
+    let module_directory = input_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    for font in &scene.fonts {
+        let source = std::path::Path::new(&font.source);
+        if source.is_absolute() {
+            return Err(format!(
+                "font '{}' must use a module-relative source path",
+                font.name
+            ));
+        }
+        let resource_path = module_directory.join(source);
+        let data = std::fs::read(&resource_path).map_err(|error| {
+            format!(
+                "cannot read font '{}' at {}: {error}",
+                font.name,
+                resource_path.display()
+            )
+        })?;
+        resources.add_font(font.name.clone(), data);
+    }
+    let surface = mmrecode_mmfx::render_with_resources(&scene, &resources)
+        .map_err(|error| error.to_string())?;
+    image::save_buffer_with_format(
+        output_path,
+        &surface.to_rgba8(),
+        surface.width(),
+        surface.height(),
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
+    println!(
+        "Rendered MMFX scene '{}' ({}x{}) to {}",
+        scene.name,
+        scene.width,
+        scene.height,
+        output_path.display()
+    );
+    Ok(())
 }
 
 fn h264_remux_command(
@@ -347,6 +424,15 @@ fn execute_editor_line(
                 editor_export::export_project(session, output.as_deref(), preset.as_deref())?;
             println!("{report}");
             return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::FxLoadRequested { .. }
+        | mmrecode_edit::CommandOutput::FxSaveRequested { .. }
+        | mmrecode_edit::CommandOutput::FxEditRequested
+        | mmrecode_edit::CommandOutput::FxCloseRequested => {
+            return Err(
+                "MMFX source editing requires the full-screen interactive editor in a terminal"
+                    .into(),
+            );
         }
         mmrecode_edit::CommandOutput::QuitRequested { discard } => {
             protect_unsaved(session, discard)?;
@@ -1748,6 +1834,24 @@ fn inspect_isobmff(path: &std::path::Path, bytes: Vec<u8>) -> Result<(), String>
         if let (Some(rate), Some(channels)) = (track.sample_rate, track.channel_count) {
             println!("    Audio: {rate} Hz, {channels} channel(s)");
         }
+        if let Some(duration) = track.presentation_duration {
+            println!(
+                "    Presentation edit: {duration} track tick(s), first PTS {}",
+                track.samples.first().map_or(0, |sample| sample.pts)
+            );
+        }
+        if track.descriptor.codec.codec_id.as_str() == "audio/aac"
+            && let Ok(config) =
+                mmrecode_aac::AudioSpecificConfig::parse(&track.descriptor.codec.configuration)
+        {
+            println!(
+                "    AAC: object type {}, {} samples/frame, SBR {}, PS {}",
+                config.audio_object_type,
+                config.samples_per_frame,
+                config.sbr_present,
+                config.ps_present
+            );
+        }
         println!(
             "    Sync samples: {}",
             track.samples.iter().filter(|sample| sample.is_sync).count()
@@ -2237,6 +2341,7 @@ fn print_help() {
          Usage: mmrecode [command] [arguments]\n\
          With no command, MMRecode starts the interactive editor.\n\n\
          Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
+             Interactive editor: `add fx`, `cd`, then `fx edit`; project save embeds source\n  \
          preview <media-file>  Preview MPEG-2 ES/TS or H.264 MP4/MOV inside this terminal\n  \
          inspect <media-file>  Inspect JPEG/MJPEG, DV, MPEG-2/TS, or H.264 MP4/MOV syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
@@ -2254,6 +2359,7 @@ fn print_help() {
              Validate and explain one MPEG-2 replacement render without writing a container\n  \
          render <m2v> <ts> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
              Smart-render one MPEG-2 replacement into MPEG-TS\n  \
+         render-mmfx <scene.mmfx> <output.png>  Render an MMFX scene with the CPU reference backend\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \

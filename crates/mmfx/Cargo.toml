@@ -1,0 +1,17 @@
+[package]
+name = "mmrecode-mmfx"
+description = "Typed scene language and deterministic CPU reference renderer for MMRecode"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+parley.workspace = true
+swash.workspace = true
+zeno.workspace = true
+
+[lints]
+workspace = true

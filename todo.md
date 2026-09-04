@@ -2,7 +2,7 @@
 
 This document is the central index of work that remains across MMRecode. Detailed descriptions of
 the current architecture and implemented slices live in [`concept.md`](concept.md),
-[`design.md`](design.md), and the individual crate READMEs.
+[`design.md`](design.md), [`mmfx-concept.md`](mmfx-concept.md), and the individual crate READMEs.
 
 A codec or container marked **slice complete** has a useful, tested vertical slice; it does not mean
 that every profile, operating mode, or production optimization in the format is implemented.
@@ -16,8 +16,9 @@ roadmap does not turn every possible feature into an immediate commitment.
 2. Add dedicated interactive `in`/`out` adjustment modes while retaining canonical typed commands
    underneath them.
 3. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
-4. Define the typed scene/object boundary and CPU-reference MMFX IR before implementing effects or
-   third-party plugins.
+4. Extend the new typed MMFX `Scene`/`Group`/`Rect` boundary and scalar CPU renderer with text,
+   images, row/column layout, animation, project placements, and live editor preview before custom
+   kernels or third-party plugins.
 5. Extend the new indexed MPEG-2 preview path with incremental TS demux, streaming audio, buffering,
    and backpressure.
 6. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
@@ -122,6 +123,34 @@ PCM.
 - [ ] Add MPEG-2/2.5 audio extensions when required.
 - [ ] Treat Layer I, Layer III, and free-format support as optional separate slices.
 
+## AAC
+
+**Status:** The first AAC-LC playback vertical slice is implemented. ISO-BMFF unwraps `esds` into
+decoder-specific bytes; the AAC crate validates `AudioSpecificConfig` and resolves object type,
+sample rate, channels, and frame length and can frame raw MP4 access units as ADTS. Playback indexes
+exact sample timing and
+schedules complete-track PCM reconstruction through the shared executor. Native terminal preview
+uses optional FFmpeg reconstruction and rendered audio as the H.264 master clock. The actual iPad
+acceptance file's 44.1 kHz stereo track decodes successfully; its HEVC video remains a separate
+codec slice.
+
+- [x] Parse AAC-LC `AudioSpecificConfig`, standard channel configurations, explicit rates, and
+  raw-access-unit ADTS headers.
+- [x] Extract decoder-specific AAC bytes from ISO-BMFF `esds` descriptors and validate them at the
+  codec/playback boundary.
+- [x] Index AAC samples, timing, start offset, duration, and encoded sizes from ISO-BMFF tables.
+- [x] Apply the common optional-empty-plus-single-media edit list and trim decoded AAC priming and
+  padding to the edited presentation interval.
+- [x] Schedule PCM decode through `DecodeExecutor` and synchronize terminal H.264 playback to the
+  audio device clock across play, pause, seek, underflow, and loop operations.
+- [ ] Implement native Rust AAC-LC noiseless coding, inverse quantization, stereo tools, IMDCT,
+  overlap/add, and conformance vectors behind `AudioDecoder`.
+- [ ] Replace eager complete-track PCM with bounded packet/PCM queues and sample-accurate seek
+  preroll for long media.
+- [ ] Add browser audio-device output while preserving cooperative baseline WebAssembly decode.
+- [ ] Add implicit/explicit SBR and Parametric Stereo only after AAC-LC is complete.
+- [ ] Add AAC encoding and ISO-BMFF audio muxing after decode and edit-boundary behavior stabilize.
+
 ## MPEG-2 Transport Stream
 
 **Status:** Single-program 188-byte TS slice complete for PAT/PMT discovery, continuity and CRC
@@ -217,8 +246,12 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
 - [ ] Add dedicated interactive adjustment keymaps/modes that emit the same canonical typed trim
   commands, with visible mode, boundary, delta, and commit/cancel state.
 - [ ] Add an edit/full-screen-monitor view toggle over the same playback state and frame cache.
-- [ ] Evaluate a pixel-rendered 24-bit timeline layer for thumbnails, waveforms, curves, and dense
-  colored media regions while retaining terminal-native text and controls.
+- [x] Add a pixel-rendered 24-bit timeline layer for thumbnails, codec landmarks, smart-render
+  state, and dense colored media regions while retaining terminal-native text and controls.
+- [ ] Project the current hierarchy level into separate ordered object rows, label the timeline
+  with its media-path breadcrumb and local time domain, and add a synthetic `self/source` context
+  row. `cd` should replace the editable rows with the entered object's local children; a future
+  explicit overview may show ancestors or flattened descendants.
 - [x] Create `mmrecode-render` with explicit operations such as `CopyPackets`,
   `RewriteTimestamps`, `Decode`, `ApplyEffects`, `BridgeEncode`, `FullEncode`, and `Mux`.
 - [x] Implement the first independent-frame cut/concatenate path with DV.
@@ -246,14 +279,33 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
 
 ## Effects, compositing, and authoring plugins
 
-**Status:** Architectural direction only. Final effects are CPU-authoritative; GPU execution is an
-optional backend. Plugins exchange versioned semantic values rather than internal Rust objects.
+**Status:** The first executable `.mmfx` foundation parses typed `Scene`/`Group`/`Rect` objects and
+renders nested absolute/overlay layouts through a tested linear-premultiplied scalar CPU backend.
+Final effects remain CPU-authoritative; GPU execution is an optional backend. Plugins exchange
+versioned semantic values rather than internal Rust objects.
+
+- [x] Add strict, source-spanned `.mmfx` parsing with unknown-property rejection and suggestions.
+- [x] Add typed scenes, groups, rectangles, px/% lengths, anchors, translation, color, opacity,
+  clipping, and rounded corners without renderer types in the scene model.
+- [x] Add a scalar linear-premultiplied RGBA reference renderer and a `render-mmfx` PNG CLI proof.
+- [x] Use pinned Zeno coverage masks for antialiased rectangles, rounded corners, fractional
+  placement, and nested rounded clipping.
+- [x] Add explicit module-relative `@font` resources and typed static `@text` with Parley shaping
+  and wrapping plus Swash/Zeno glyph coverage; disable implicit system fonts for final rendering.
+- [x] Make generated `fx` media own embedded `.mmfx` source, create/place it through `add fx`, edit
+  it in hierarchical `cd` context, serialize it with the project, load external source as an embedded
+  copy with a retained resource base, extract it with `fx save as`, and provide multiline editing,
+  project undo/redo, debounced worker preview, diagnostics, last-good retention, and complete help.
+- [ ] Extend static text with fallback chains, color glyphs, decorations, and intrinsic sizing; add
+  typed images/media slots, row/column layout, timing, and animation.
+- [ ] Recursively composite persisted generated scene media into project preview and export.
 
 - [ ] Define typed scene objects for text, paths, rectangles, images, groups, transforms, layout,
   timing, and animation without tying them to a renderer.
 - [ ] Define the safe, bounded MMFX language and typed portable IR, including color, sampling,
   coordinate, edge, precision, and time semantics.
-- [ ] Implement a scalar CPU reference backend with deterministic golden tests.
+- [x] Implement the first scalar CPU reference backend with deterministic parser, layout,
+  compositing, clipping, and pixel tests.
 - [ ] Add tiled multithreaded and SIMD CPU execution with correct halos for large-radius effects and
   differential testing against the reference backend.
 - [ ] Add controlled text shaping, font fallback, vector rasterization, high-quality antialiasing,
@@ -326,25 +378,41 @@ MP4 writer exist. Each remaining item below should be its own crate and bounded 
 remux slices are implemented.
 Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
-in-loop deblocking and single-reference CAVLC P slices are also implemented, including skip,
+in-loop deblocking and default-list multiple-reference CAVLC P slices are also implemented, including skip,
 16x16, 16x8, 8x16, and sub-macroblock partitions with fractional-sample motion compensation,
 explicit weighted prediction, and inter residuals. The same path accepts the High Profile subset using CAVLC and
 4x4 transforms. MMRecode itself owns demuxing, timestamps, NAL conversion, SPS/PPS/VUI/slice
 parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have not been started.
+
+- [x] Make native preview interactive: publish decoded frames immediately, preserve decoder/DPB
+  state across sequential refills, coalesce queued seeks, and interrupt stale work between access
+  units. Remove whole-chroma-plane copies from progressive prediction, add integer-motion fast
+  paths, and cache deblocking boundary strengths. The development acceptance sample reaches its
+  first 3456x2234 frame in about 0.16 seconds and an equivalent 1080p/48 fps encode decodes faster
+  than real time; the original near-4K stream still requires SIMD or parallelism for real-time play.
+- [x] Add a shared bounded decode-executor API. Native builds use a fixed-size process-wide worker
+  pool; baseline WebAssembly uses the same job interface with cooperative polling. Move H.264
+  playback to access-unit-sized jobs with generation cancellation and caller-supplied executors.
+- [x] Add the first dependency-safe H.264 frame parallelism: share immutable DPB reference planes
+  and motion metadata, fork progressive non-reference B pictures onto the executor, skip unneeded
+  non-reference preroll, and keep the main reference-picture session authoritative. Verify forked
+  pixels against sequential native decoding and a real x264/FFmpeg GOP. The 3456x2234 acceptance
+  window improved from roughly 14 fps to 25 fps for 24 frames.
 
 - [x] **H.264/AVC foundation:** Annex-B and length-prefixed NAL handling, `avcC`, SPS/PPS/VUI and
   leading slice headers, container-timed access-unit indexing, IDR/reference classification, and a
   conservative active-reference dependency index.
 - [x] Import, inspect, seek, scrub, and play ordinary non-fragmented H.264 MP4/MOV media in the
   terminal editor, including `project match` from SPS/VUI and container audio/display metadata.
-- [ ] Replace conservative dependency sets with complete reference-list modification, decoded
-  reference picture marking/MMCO, frame-num gap, field, recovery-point, and POC semantics.
+- [ ] Replace conservative dependency sets by teaching the syntax index complete reference-list
+  modification, decoded-picture marking/MMCO, frame-num gap, field, recovery-point, and POC
+  semantics.
 - [x] Add the native Rust decoder foundation behind the playback interface: activate `avcC`
   parameter sets, traverse one frame-coded IDR I-slice, reconstruct 8-bit 4:2:0 `I_PCM` and CAVLC
   `Intra_16x16` and `Intra_4x4` macroblocks with all luma/chroma predictors, neighbor-context coefficient parsing,
   nonzero DC/AC quantization and inverse transforms, normative intra-picture deblocking and slice
   offsets, crop the coded canvas, preserve timing/colour metadata, retain one decoded reference,
-  reconstruct single-reference CAVLC P slices with skip, 16x16, 16x8, 8x16, and sub-macroblock
+  reconstruct CAVLC P slices with skip, 16x16, 16x8, 8x16, and sub-macroblock
   partitions down to 4x4, quarter-sample luma/eighth-sample chroma motion compensation, inter
   residuals, explicit weighted prediction, mixed intra macroblocks, and inter-picture boundary
   strengths, plus High Profile CAVLC/4x4 streams, and try it before
@@ -369,10 +437,104 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Parse and resolve SPS/PPS scaling lists, apply them to native intra/inter 4x4 and luma 8x8
   inverse quantization, and capture the second chroma QP offset for component-correct deblocking;
   verify a sustained non-flat JVT-matrix CABAC I/P GOP byte-for-byte against FFmpeg.
-- [ ] Complete native H.264 reconstruction with remaining CABAC tools,
-  B slices, multiple-reference decoded-picture-buffer/reference-list semantics, fields, multi-slice
-  filtering rules, recovery points, and complete picture ordering; retain system acceleration only
-  as an optional backend.
+- [x] Replace the single retained picture with a bounded sliding short-term DPB and decode default
+  list-0 `ref_idx_l0` syntax for CAVLC P macroblock and sub-macroblock partitions, including
+  unavailable-neighbour motion-predictor substitution; verify a textured 12-frame x264 `ref=2` GOP
+  with older-picture selection and deblocking byte-for-byte against FFmpeg.
+- [x] Decode CABAC default-list `ref_idx_l0` syntax with neighboring-reference contexts for 16x16,
+  16x8, 8x16, and 8x8 sub-macroblock partitions; verify an alternating 12-frame x264 `ref=2` GOP
+  that selects the older picture for every inter block byte-for-byte against FFmpeg.
+- [x] Apply P-slice short-term list-0 modification with normative picture-number prediction,
+  wraparound, insertion, and duplicate removal; verify a reordered skipped picture end to end
+  against an independently decoded handcrafted stream.
+- [x] Implement frame-picture decoded-reference marking: sliding-window eviction, all adaptive
+  MMCO operations, maximum long-term index management, reset, short-to-long conversion, current/IDR
+  long-term assignment, and long-term list-0 modification; verify explicit long-term reconstruction
+  against FFmpeg and every state transition directly.
+- [x] Establish frame-coded B reconstruction with POC type-0 tracking, default list-0/list-1
+  construction, separate list motion state, and CAVLC 16x16 L0, L1, and unweighted bidirectional
+  prediction; verify all three prediction modes against an independently decoded handcrafted GOP.
+- [x] Add CAVLC spatial-direct `B_Direct_16x16` and `B_Skip`, including neighboring-reference
+  inference, separate list motion predictors, and the co-located zero rule; verify handcrafted
+  direct/skip pictures and a reordered x264 B-frame GOP byte-for-byte against FFmpeg.
+- [x] Decode all 18 explicit CAVLC B 16x8/8x16 macroblock types, preserving H.264's list-grouped
+  reference-index and motion-difference syntax and partition-specific motion predictors; verify
+  every L0/L1/Bi combination and both partition orientations against FFmpeg.
+- [x] Decode all twelve explicit CAVLC `B_8x8` sub-macroblock types from 8x8 through 4x4, retain
+  list-not-used neighbors as available with `refIdx = -1`, and verify every subtype, mixed
+  quadrants, nonzero 4x4 motion, and a sustained moving x264 B GOP against FFmpeg.
+- [x] Decode spatial and temporal direct CAVLC B prediction for whole, skipped, and `B_8x8`
+  macroblocks; retain colocated reference identity, scale temporal motion by POC distance, honor
+  both `direct_8x8_inference_flag` granularities, and verify handcrafted and x264 GOPs against
+  FFmpeg.
+- [x] Apply explicit list weight tables and implicit POC-distance weighting to CAVLC B
+  single-list, bidirectional, and direct partitions; verify asymmetric luma/chroma weights and a
+  real weighted x264 GOP byte-for-byte against FFmpeg.
+- [x] Apply in-loop deblocking to B pictures with two-list reference-identity and swapped-pair
+  boundary-strength comparisons; verify a moving x264 B GOP byte-for-byte against FFmpeg.
+- [x] Decode CABAC B slices with context-coded skip, macroblock and sub-macroblock types,
+  reference indices, and motion differences; reconstruct direct/skip, all explicit
+  16x16/16x8/8x16 and `B_8x8` forms, embedded intra macroblocks, temporal direct, implicit
+  weighting, High Profile 8x8 transforms, and in-loop filtering. Verify partitioned, intra-mixed,
+  temporal-direct, weighted, and deblocked x264 GOPs byte-for-byte against FFmpeg.
+- [x] Correct Intra8x8 above-right sample availability for the top-right partition so filtered
+  future references feed weighted/direct B prediction exactly; verify the broader High Profile
+  `testsrc2` CABAC B stress GOP byte-for-byte against FFmpeg with in-loop deblocking enabled.
+- [x] Retain type-1 POC cycle parameters and derive all three frame-picture POC modes, including
+  deltas, non-reference offsets, frame-number wrap, B-list ordering, and MMCO 5 resets; verify custom
+  type-1 B and type-2 reference sequences byte-for-byte against FFmpeg.
+- [x] Parse recovery-point SEI payloads and attach their countdown, exact-match, broken-link, and
+  changing-slice-group semantics to the indexed access unit without treating recovery as IDR.
+- [x] Decode reference and non-reference non-IDR I pictures through the native CAVLC/CABAC intra
+  path, including entry without prior DPB state; verify a non-IDR `I_PCM` picture against FFmpeg.
+- [x] Reconstruct multi-slice CAVLC and CABAC I/P/B frame pictures with slice-local entropy,
+  intra/motion prediction, and coded-block context availability, deferred full-picture filtering,
+  per-slice offsets, and normative `disable_deblocking_filter_idc` cross-slice behavior; verify
+  deblocked, non-row-aligned x264 slices byte-for-byte against FFmpeg.
+- [x] Carry recovery-point SEI into the playback index, validate its count against the active
+  `MaxFrameNum`, resolve the target reference picture using modulo `frame_num` and output order,
+  and start native windows at matured non-IDR intra or cyclic intra-refresh P recovery points;
+  synthesize bounded unavailable short-term references and verify a real x264 target byte-for-byte.
+- [x] Decode frame pictures signalled under an interlaced SPS, consume `field_pic_flag`, preserve
+  non-progressive output metadata, and derive type-0/1/2 POC for frame/top/bottom structures;
+  verify a real x264 fake-interlaced I/P sequence byte-for-byte against FFmpeg.
+- [x] Reconstruct complementary single-slice IDR intra, reference P, and explicit bipredictive B
+  fields on field-height canvases; retain a field DPB, build POC-ordered frame groups and
+  parity-alternating lists, apply field `PicNum` list modification and all adaptive MMCO
+  transitions, pair by frame identity, weave luma/chroma rows, derive output field order from POC,
+  and verify I_PCM, P-skip, modified P/B lists, adaptive marking, and B-bi pixels byte-for-byte
+  against FFmpeg; reject an incomplete pair at drain.
+- [x] Extend complementary IDR I, reference P, and explicit B reconstruction to multi-slice field
+  pictures with field-sized macroblock ranges, slice-local entropy/prediction state, per-slice
+  deblocking behavior, field reference lists, and complementary weaving; verify I/P/B output
+  byte-for-byte against FFmpeg.
+- [x] Establish native CAVLC MBAFF frame reconstruction: translate macroblock-pair scan order to
+  raster storage, decode frame-coded I/P/B pairs, interleave field-coded `I_PCM` luma/chroma rows,
+  retain the resulting frame as a reference, and verify a mixed-pair IDR/P/B sequence byte-for-byte
+  against FFmpeg.
+- [x] Add the first field-coded CAVLC MBAFF prediction paths: reconstruct Intra16, `P_L0`, and
+  B-direct macroblocks on parity-specific field planes, place their residuals into interleaved frame
+  rows, and verify a real four-frame x264 MBAFF GOP byte-for-byte against FFmpeg.
+- [x] Complete the field-coded CAVLC MBAFF `P_L0` family: parse all 16x16, 16x8, 8x16, `P_8x8`,
+  and `P_8x8ref0` macroblock/submacroblock partition shapes; derive mixed frame/field CAVLC
+  neighbors; apply field scans, field-aware motion prediction and reference scaling, and
+  cross-parity 4:2:0 chroma adjustment; verify a moving six-frame x264 MBAFF GOP byte-for-byte
+  against FFmpeg.
+- [x] Reconstruct field-coded CAVLC MBAFF Intra4 macroblocks with mixed-pair prediction-mode
+  neighbors, field-plane sample prediction, field coefficient scans, residual placement, and
+  chroma prediction; verify both a forced field-coded vector and textured x264 MBAFF frames
+  byte-for-byte against FFmpeg.
+- [x] Complete explicit field-coded CAVLC MBAFF B prediction: implement all 16x16, 16x8, 8x16,
+  and `B_8x8` list-0/list-1/bi shapes plus spatial direct, convert motion/reference candidates at
+  mixed frame/field edges, and verify forced all-shape vectors and a residual-bearing moving x264
+  GOP byte-for-byte against FFmpeg.
+- [x] Reconstruct CAVLC Intra8 macroblocks, including four-subblock coefficient interleaving,
+  8x8 field scanning, parity-plane prediction, and stepped residual placement; verify a forced
+  High Profile x264 MBAFF vector byte-for-byte against FFmpeg.
+- [ ] Complete native H.264 reconstruction with fields and their picture-order semantics; retain
+  system acceleration only as an optional backend. Remaining MBAFF work includes field-coded
+  temporal-direct B prediction, CABAC pair flags/contexts, deblocking across mixed pair modes, and
+  multi-slice pair availability.
 - [x] Add explainable video-only clean-GOP MP4 remuxing: require IDR/sync boundaries, verify a
   contiguous dependency-closed decode range, preserve encoded sample bytes and display metadata,
   rebuild exact timing/sample tables, and reject rather than round an unsafe cut.
@@ -432,14 +594,17 @@ still minimal.
 
 ## Performance and hardware acceleration
 
-**Status:** Current code favors clear deterministic reference implementations. Optimization is
-intentionally isolated from correctness.
+**Status:** Current code favors clear deterministic reference implementations. The first profiled
+H.264 scalar optimizations are bit-exact and isolated from correctness; broader codecs and
+workloads still need measured baselines.
 
 - [ ] Profile representative workloads before choosing optimization targets.
 - [ ] Add benchmark coverage for parsing, transforms, motion compensation, color conversion,
   demux/mux, and end-to-end decode/render.
 - [ ] Add runtime-dispatched SIMD behind bit-exact scalar fallbacks.
-- [ ] Add frame/slice/task parallelism with deterministic output and bounded memory.
+- [ ] Extend dependency-aware parallelism beyond non-reference B pictures to safe reference-picture
+  pipelines, independent multi-slice work, and measured wavefront/SIMD kernels while retaining
+  deterministic output and bounded memory. Keep cooperative WebAssembly as the scalar fallback.
 - [ ] Design hardware decode/encode and GPU surface interop only after buffer ownership is ready.
 - [ ] Keep hardware paths optional and retain software reference paths for verification.
 

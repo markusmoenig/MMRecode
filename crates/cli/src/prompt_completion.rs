@@ -11,6 +11,7 @@ const INFO_TOPICS: &[&str] = &["audio", "project", "source", "video"];
 const PROJECT_COMMANDS: &[&str] = &["info", "match", "preset", "presets", "set"];
 const RATE_CONFORM_POLICIES: &[&str] = &["frames", "time"];
 const SCALE_MODES: &[&str] = &["fill", "fit", "native", "stretch"];
+const FX_COMMANDS: &[&str] = &["close", "edit", "load", "save"];
 
 /// A prompt replacement and the candidates that produced it.
 #[derive(Debug, Eq, PartialEq)]
@@ -32,6 +33,17 @@ pub(crate) fn complete(input: &str, session: &EditorSession, base_directory: &Pa
     }
     if let Some(partial) = input.strip_prefix("scale ") {
         return complete_words(partial, "scale ", SCALE_MODES);
+    }
+    if let Some(partial) = input.strip_prefix("fx load ") {
+        return complete_path(partial, "fx load ", None, base_directory);
+    }
+    if let Some(partial) = input.strip_prefix("fx save as ") {
+        return complete_path(partial, "fx save as ", None, base_directory);
+    }
+    if let Some(partial) = input.strip_prefix("fx ")
+        && !partial.contains(char::is_whitespace)
+    {
+        return complete_words(partial, "fx ", FX_COMMANDS);
     }
     if let Some(partial) = input.strip_prefix("project preset ") {
         return complete_words(partial, "project preset ", ProjectSettings::preset_names());
@@ -305,6 +317,8 @@ mod tests {
         );
         let manual = complete("man mo", &session, Path::new("."));
         assert_eq!(manual.replacement, "man move ");
+        let fx = complete("fx lo", &session, Path::new("."));
+        assert_eq!(fx.replacement, "fx load ");
         let scale = complete("scale fi", &session, Path::new("."));
         assert_eq!(scale.replacement, "scale fi");
         assert_eq!(scale.candidates, vec!["fill", "fit"]);

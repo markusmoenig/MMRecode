@@ -67,6 +67,8 @@ fn h264_mp4_inspect_import_and_project_match() {
     assert!(report.contains("ISO-BMFF/QuickTime:"));
     assert!(report.contains("video/h264 (avc1)"));
     assert!(report.contains("audio/aac (mp4a)"));
+    assert!(report.contains("Audio: 48000 Hz, 1 channel(s)"));
+    assert!(report.contains("AAC: object type 2, 1024 samples/frame, SBR false, PS false"));
     assert!(report.contains("H.264: 128x72"));
     assert!(report.contains("Pictures: 30"));
 

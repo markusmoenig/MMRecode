@@ -534,6 +534,7 @@ mod tests {
             rotation_degrees: 90,
             channel_count: None,
             sample_rate: None,
+            presentation_duration: None,
             samples: Vec::new(),
         };
         let packets = [(0, 40, true), (40, 80, false), (80, 40, false)]

@@ -21,8 +21,8 @@ pub use command::{
 };
 pub use project::{
     MediaId, MediaKind, MediaLink, MediaLinkId, MediaListing, MediaNode, MediaOrigin, MediaPath,
-    MediaProject, ProjectColorSpace, ProjectRateConformPolicy, ProjectRateConformReport,
-    ProjectScanMode, ProjectSettings, VisualScaleMode,
+    MediaProject, MmfxSource, ProjectColorSpace, ProjectRateConformPolicy,
+    ProjectRateConformReport, ProjectScanMode, ProjectSettings, VisualScaleMode,
 };
 pub use project_file::{load_project_file, save_project_file, save_project_file_from};
 

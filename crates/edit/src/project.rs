@@ -85,6 +85,15 @@ pub enum MediaOrigin {
     },
 }
 
+/// Source payload owned by one generated MMFX media definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MmfxSource {
+    /// Authoritative MMFX scene source stored inside the project document.
+    pub source: String,
+    /// Optional directory used to resolve module-relative resources imported from an external file.
+    pub resource_base: Option<PathBuf>,
+}
+
 /// Reusable media definition that may establish its own local child timeline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaNode {
@@ -100,6 +109,8 @@ pub struct MediaNode {
     pub duration: Timestamp,
     /// Content origin.
     pub origin: MediaOrigin,
+    /// Embedded MMFX source for `fx` media; absent for every other media kind.
+    pub mmfx: Option<MmfxSource>,
     children: Vec<MediaLinkId>,
 }
 
@@ -389,6 +400,7 @@ impl MediaProject {
                 time_base,
             },
             origin: MediaOrigin::Generated,
+            mmfx: None,
             children: Vec::new(),
         };
         Ok(Self {
@@ -630,10 +642,30 @@ impl MediaProject {
                     time_base,
                 },
                 origin,
+                mmfx: None,
                 children: Vec::new(),
             },
         );
         Ok(id)
+    }
+
+    /// Replaces the embedded source owned by one generated `fx` media definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the media is missing, is not `fx`, or has a non-generated origin.
+    pub fn set_mmfx_source(&mut self, media_id: MediaId, source: MmfxSource) -> Result<()> {
+        let media = self
+            .media
+            .get_mut(&media_id)
+            .ok_or_else(|| Error::InvalidData(format!("missing media {media_id:?}")))?;
+        if media.kind.as_str() != "fx" || media.origin != MediaOrigin::Generated {
+            return Err(Error::Unsupported(
+                "MMFX source can only be attached to generated 'fx' media".into(),
+            ));
+        }
+        media.mmfx = Some(source);
+        Ok(())
     }
 
     /// Places media in a parent's local timeline.
