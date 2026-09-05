@@ -509,10 +509,12 @@ Commands typed below the moving image mutate that shared session; trims, undo, a
 playable source range immediately. Versioned project persistence, resolved presets, dirty-state
 protection, and project-root MPEG-2/TS timeline export are implemented. Export is independent of
 the current navigation context and walks every root placement, trim, position, and gap. A single
-compatible placement may take the packet-preserving path; other progressive root timelines take a
-CPU full-render path with explicit fit, fill, stretch, and native placement modes. Fingerprints,
-relinking/collection, recursive generated/effect composition, alpha, audio delivery, and dedicated
-adjustment modes remain explicit next slices.
+compatible unnested placement may take the packet-preserving path; other progressive root timelines
+take a CPU full-render path with explicit fit, fill, stretch, and native placement modes. Full
+rendering recursively flattens nested MPEG-2 and MMFX placement paths, clips descendants through
+ancestor trims, maps differing local time bases per frame, and preserves stable depth-first
+composition order. Fingerprints, relinking/collection, audio delivery, and dedicated adjustment
+modes remain explicit next slices.
 
 ### Preview and render transparency
 
@@ -534,10 +536,10 @@ model was introduced. The terminal surface exists before media is imported and u
 monitor, contextual help/inspector, result area, command prompt, and graphical timeline rather than
 treating the monitor as the entire editor. The timeline combines a time ruler,
 retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures and H.264 IDRs with
-keyboard/mouse scrubbing. The first integration deliberately previews one source placement,
-leaving the current-level multi-object timeline projection, recursive composition, and synchronized
-H.264/AAC audio for later bounded slices. Until that projection exists, the single centered source
-strip is a playback diagnostic and must not define the eventual timeline interaction model.
+keyboard/mouse scrubbing. The current-level multi-object projection and recursively mapped MMFX
+composition are implemented over one decoded preview source; complete simultaneous multi-source
+preview and multi-source audio mixing remain later bounded slices. Single-source H.264/AAC clock
+synchronization is implemented.
 
 The layout may later switch between the complete editing workspace and a full-screen monitor while
 retaining the same session, playback controller, frame cache, and playhead. Likewise, the timeline
@@ -666,10 +668,16 @@ DPB; the cooperative backend follows the same plan serially. Broader reference-p
 wavefront parallelism remains measured follow-on work. Native builds may use an optional FFmpeg pixel-decoder
 process for tools beyond the current native subset, after native MP4 demuxing and access-unit selection;
 that process fallback is unavailable in WebAssembly. AAC follows the same ownership rule: MMRecode
-parses `esds`/`AudioSpecificConfig`, indexes and times raw MP4 access units, and schedules PCM work,
-while the first native playback slice may delegate only spectral reconstruction to an optional
-FFmpeg bridge. Device handling remains application-local. Native AAC-LC reconstruction will replace
-that bridge behind the shared audio-decoder interface without changing container or playback policy.
+parses `esds`/`AudioSpecificConfig`, indexes and times raw MP4 access units, and schedules PCM work.
+The Rust `AudioDecoder` subset now reconstructs nonzero mono/stereo AAC-LC through native spectral
+Huffman decoding, inverse quantization, PNS, M/S and intensity stereo, pulse reconstruction, TNS,
+and sine/KBD synthesis with persistent overlap. Uncommon 960-sample frames and broader
+profiles/layouts remain explicit unsupported errors, outside the iPhone/YouTube playback target.
+Playback may restart unsupported tracks through the optional FFmpeg bridge,
+but callers can enforce native-only decoding and completion events identify the backend actually
+used. The same Rust subset runs through baseline WebAssembly's cooperative executor. Remaining
+audio tools and conformance coverage will progressively replace the bridge;
+device handling remains application-local. No AAC or H.264 encoder is part of this step.
 
 ### Subsequent vertical slices
 

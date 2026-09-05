@@ -1,0 +1,103 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ */
+
+/* You can override the default Infima variables here. */
+:root {
+  --ifm-color-primary: #087f72;
+  --ifm-color-primary-dark: #067267;
+  --ifm-color-primary-darker: #056c61;
+  --ifm-color-primary-darkest: #04594f;
+  --ifm-color-primary-light: #098c7d;
+  --ifm-color-primary-lighter: #0a9283;
+  --ifm-color-primary-lightest: #0ba694;
+  --ifm-font-family-base: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ifm-font-family-monospace: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --ifm-heading-font-weight: 680;
+  --ifm-code-font-size: 95%;
+  --ifm-navbar-height: 4rem;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --mm-muted: #5b6978;
+  --mm-border: #d8e0e5;
+  --mm-surface: #f5f8f9;
+  --mm-grid: rgba(8, 127, 114, 0.08);
+  --mm-hero-bg: #edf4f4;
+  --mm-hero-text: #101820;
+  --mm-hero-muted: #506266;
+  --mm-hero-link: #176f66;
+  --mm-license-bg: #e4eeee;
+  --mm-license-text: #101820;
+  --mm-license-muted: #506266;
+  --mm-footer-bg: #dbe7e7;
+  --mm-footer-text: #26383b;
+}
+
+/* For readability concerns, you should choose a lighter palette in dark mode. */
+[data-theme='dark'] {
+  --ifm-background-color: #0d1218;
+  --ifm-background-surface-color: #121922;
+  --ifm-color-primary: #56dcc9;
+  --ifm-color-primary-dark: #3bd5bf;
+  --ifm-color-primary-darker: #2ed1ba;
+  --ifm-color-primary-darkest: #24ad9a;
+  --ifm-color-primary-light: #71e3d3;
+  --ifm-color-primary-lighter: #7ee6d7;
+  --ifm-color-primary-lightest: #a6eee4;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --mm-muted: #9ba9b8;
+  --mm-border: #2a3540;
+  --mm-surface: #131b24;
+  --mm-grid: rgba(86, 220, 201, 0.08);
+  --mm-hero-bg: #10151b;
+  --mm-hero-text: #edf5f4;
+  --mm-hero-muted: #aebdbd;
+  --mm-hero-link: #d7e5e3;
+  --mm-license-bg: #0a1117;
+  --mm-license-text: #edf5f4;
+  --mm-license-muted: #aebdbd;
+  --mm-footer-bg: #090d12;
+  --mm-footer-text: #d7e5e3;
+}
+
+.navbar {
+  border-bottom: 1px solid var(--mm-border);
+  box-shadow: none;
+}
+
+.navbar__title {
+  letter-spacing: -0.035em;
+}
+
+.navbar__logo {
+  width: 2rem;
+  height: 2rem;
+}
+
+.button {
+  border-radius: 0.35rem;
+}
+
+.theme-doc-markdown > h1:first-child {
+  font-size: clamp(2.4rem, 5vw, 3.8rem);
+  letter-spacing: -0.05em;
+}
+
+.theme-doc-markdown h2 {
+  margin-top: 2.5rem;
+  letter-spacing: -0.025em;
+}
+
+.theme-doc-markdown > p,
+.theme-doc-markdown > ul,
+.theme-doc-markdown > ol {
+  max-width: 52rem;
+}
+
+.footer--dark {
+  --ifm-footer-background-color: var(--mm-footer-bg);
+  --ifm-footer-color: var(--mm-footer-text);
+  --ifm-footer-link-color: var(--mm-footer-text);
+  --ifm-footer-title-color: var(--mm-footer-text);
+}

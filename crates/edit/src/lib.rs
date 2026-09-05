@@ -16,8 +16,8 @@ mod project_file;
 
 pub use command::{
     CommandOutput, EDITOR_COMMAND_NAMES, EDITOR_MANUAL_TOPICS, EXPORT_PRESET_NAMES, EditCommand,
-    EditorSession, FrameValue, ImportedMedia, PROJECT_SETTING_NAMES, format_compact_timecode,
-    parse_command,
+    EditorSession, FrameValue, ImportedMedia, MonitorTarget, PROJECT_SETTING_NAMES,
+    format_compact_timecode, parse_command,
 };
 pub use project::{
     MediaId, MediaKind, MediaLink, MediaLinkId, MediaListing, MediaNode, MediaOrigin, MediaPath,

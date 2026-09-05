@@ -37,6 +37,14 @@ impl MediaKind {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns whether this is a generated MMFX scene kind.
+    ///
+    /// `fx` is retained for projects written before the scene/kernel command distinction.
+    #[must_use]
+    pub fn is_mmfx_scene(&self) -> bool {
+        matches!(self.as_str(), "scene" | "scene/mmfx" | "fx")
+    }
 }
 
 /// How visual media is mapped into its parent canvas.
@@ -109,7 +117,7 @@ pub struct MediaNode {
     pub duration: Timestamp,
     /// Content origin.
     pub origin: MediaOrigin,
-    /// Embedded MMFX source for `fx` media; absent for every other media kind.
+    /// Embedded MMFX source for generated scene media; absent for other media kinds.
     pub mmfx: Option<MmfxSource>,
     children: Vec<MediaLinkId>,
 }
@@ -649,19 +657,19 @@ impl MediaProject {
         Ok(id)
     }
 
-    /// Replaces the embedded source owned by one generated `fx` media definition.
+    /// Replaces the embedded source owned by one generated MMFX scene definition.
     ///
     /// # Errors
     ///
-    /// Returns an error when the media is missing, is not `fx`, or has a non-generated origin.
+    /// Returns an error when the media is missing, is not an MMFX scene, or has a non-generated origin.
     pub fn set_mmfx_source(&mut self, media_id: MediaId, source: MmfxSource) -> Result<()> {
         let media = self
             .media
             .get_mut(&media_id)
             .ok_or_else(|| Error::InvalidData(format!("missing media {media_id:?}")))?;
-        if media.kind.as_str() != "fx" || media.origin != MediaOrigin::Generated {
+        if !media.kind.is_mmfx_scene() || media.origin != MediaOrigin::Generated {
             return Err(Error::Unsupported(
-                "MMFX source can only be attached to generated 'fx' media".into(),
+                "MMFX source can only be attached to generated scene media".into(),
             ));
         }
         media.mmfx = Some(source);

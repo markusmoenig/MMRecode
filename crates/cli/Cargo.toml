@@ -29,7 +29,7 @@ mmrecode-mpeg2.workspace = true
 mmrecode-mpegts.workspace = true
 mmrecode-playback.workspace = true
 mmrecode-quality.workspace = true
-mmrecode-render = { workspace = true, features = ["h264", "mpegts"] }
+mmrecode-render = { workspace = true, features = ["h264", "mmfx", "mpegts"] }
 mmrecode-y4m.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true

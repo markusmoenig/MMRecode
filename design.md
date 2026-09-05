@@ -340,27 +340,6 @@ plan serially. Reference-picture frame threading, multi-slice scheduling, and wa
 macroblock work remain follow-on codec-planning steps. Callers may supply another executor without
 changing container, codec, or playback interfaces.
 
-### Implemented AAC configuration and playback slice
-
-`mmrecode-aac` owns MPEG-4 `AudioSpecificConfig` parsing, AAC-LC rate/channel/frame-length
-resolution, and ADTS adaptation for raw ISO-BMFF access units. `mmrecode-isobmff` unwraps the
-`esds` descriptor hierarchy and stores decoder-specific bytes in the generic codec
-descriptor; it does not parse AAC spectral syntax.
-
-The container also applies the common edit-list shape used for codec priming: an optional leading
-empty edit followed by one rate-1.0 media edit. It maps the movie-scale edit durations into the
-track time base, shifts packet timestamps, and exposes the edited presentation duration. Arbitrary
-multi-segment edits and non-unit media rates remain outside this slice.
-
-`AacPlaybackSource` builds a presentation index from exact sample-table DTS, PTS, duration, and
-byte ranges, then schedules complete-track PCM reconstruction through `DecodeExecutor`. The first
-native backend constructs ADTS from MMRecode-owned configuration and samples and delegates only
-spectral reconstruction to an optional FFmpeg process. Its output crosses the new generic
-`AudioDecoder`/`AudioFrame` boundary. The terminal application owns device negotiation and uses the
-rendered PCM position as the H.264 master clock across play, pause, seek, buffering, and looping.
-Baseline WebAssembly retains parsing, indexing, and cooperative scheduling but reports native
-spectral reconstruction as unsupported until the Rust AAC-LC decoder lands.
-
 Its CAVLC P-slice path retains a bounded short-term decoded-picture buffer and reconstructs
 default-list reference indices for skip, 16x16, 16x8, 8x16, and 8x8 sub-macroblock partitions down
 to 4x4. Motion-vector prediction, quarter-sample luma and eighth-sample chroma interpolation,
@@ -405,12 +384,100 @@ long-term assignment. Corresponding dependency indexing remains necessary before
 strong enough for arbitrary-boundary H.264 smart rendering. The first render adapter already uses
 the conservative graph for a stricter operation: it accepts only complete contiguous
 GOPs bounded by MP4 sync samples that contain IDR pictures, reports why the range is copy-safe, and
-copies every encoded sample unchanged. No H.264 encoder has been started.
+copies every encoded sample unchanged. The first encoder foundation emits deterministic,
+Baseline-profile, all-IDR `I_PCM` access units with `avcC` configuration and exact reconstruction;
+its optional Intra16 path adds reconstructed-neighbor mode selection, quantized luma DC Hadamard
+and 4x4 luma/chroma residual coefficients, general CAVLC writing, and normative reconstruction. Its
+Intra4 path selects among all nine luma prediction modes per reconstructed 4x4 block, derives
+neighbor mode/CAVLC contexts, and encodes complete luma/chroma residuals. Both compressed paths
+accept a picture QP from 0 through 51. Its stateful inter path builds configurable GOPs from periodic
+Intra4 IDRs, up to four short-term reconstructed references, and the complete P partition tree:
+P16x16, P16x8, P8x16, and P8x8 with 8x8/8x4/4x8/4x4 subpartitions. Deterministic integer search is
+refined to quarter-pixel luma motion with normative six-tap interpolation and matched eighth-sample
+chroma prediction; partition predictors, CAVLC residuals, P-skip runs, frame-number wrap, and
+optional mean-luma scene-cut IDRs remain deterministic. A bounded one-to-three-frame reorder option
+uses type-0 picture order and emits non-reference B pictures with 16x16, 16x8, and 8x16 partitions;
+every split selects its list-0, list-1, or bidirectional direction independently. `B_8x8` covers all
+thirteen sub-macroblock types down to 4x4, including direct regions mixed with explicit prediction.
+Spatial direct derives nonzero neighboring motion, applies per-8x8 colocated-zero overrides from
+retained future-anchor metadata, and emits B-skip runs when the residual is zero. The reorder path
+retains decode-order DTS. Picture-wide temporal direct retains colocated reference identity and
+unwrapped picture order, applies normative distance scaling to both list vectors, and shares whole,
+skip, and mixed `B_Direct_8x8` decisions with spatial mode. Optional target bitrate now drives a
+deterministic frame-level QP controller across IDR, P, and reordered B pictures. It uses packet
+size, positive declared frame duration, and a bounded eight-frame virtual buffer; the configured QP
+is its starting point. Optional macroblock AQ measures mean absolute luma activity, favors quiet
+regions, spends fewer bits on textured regions, and carries modulo-52 QP deltas only through
+macroblocks whose syntax permits a change. Normative HRD/VBV scheduling and signalling remain
+separate follow-on work.
 Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
 window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
 reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;
 cyclic intra-refresh P windows populate a bounded set of neutral unavailable short-term pictures,
 decode forward from the recovery access unit, and expose output beginning at the target.
+
+### Implemented AAC configuration, native spectral decoder, and playback slice
+
+`mmrecode-aac` owns MPEG-4 `AudioSpecificConfig`, explicit/sync-extension SBR/PS detection,
+AAC-LC rate/channel/frame-length resolution, and ADTS adaptation. The bridge rejects configurations
+that ADTS cannot faithfully represent, including 960-sample AAC-LC frames. `mmrecode-isobmff`
+unwraps `esds` into generic decoder-specific bytes; it does not interpret spectral syntax.
+The container applies the common optional-empty-plus-single-rate-1-media edit, shifts packet
+timestamps, and exposes edited presentation duration. Arbitrary multi-segment edits remain outside
+this slice.
+
+`AacLcDecoder` implements `AudioDecoder` without platform or external codec dependencies. Its current
+subset accepts 1024-sample mono/SCE and stereo/CPE access units at standard rates. Native parsing
+covers ICS, long/start/short/stop windows, short-window grouping, common/independent stereo windows,
+M/S masks, bounded section runs, data elements, fill, and END. Fixed prefix tries decode differential
+scalefactors and all eleven signed/unsigned spectral Huffman books. Nonzero sign bits precede
+bounded escape values (maximum magnitude 8191). Scalefactors accumulate across groups, and inverse
+quantization reconstructs each band's signed power-law spectrum. Short-window band data is
+deinterleaved from group/band/window order into eight chronological 128-coefficient windows.
+PNS uses a transactionally advanced deterministic noise state and independently normalizes each
+window band. M/S butterflies exclude noise/intensity bands; intensity stereo then reconstructs the
+right channel from the left. Pulse adjustments are applied in the quantized domain before inverse
+quantization, and bounded TNS filters run after stereo processing. AAC-LC gain-control payloads are
+validated and consumed, matching the reference decoder's no-op behavior.
+
+The synthesis filterbank evaluates the IMDCT through a pre/post-rotated internal radix-2 FFT,
+applies sine or Kaiser-Bessel-derived windows, and performs overlap-add. Window
+transitions include long-start, eight-short (with independent previous/current window shapes), and
+long-stop. The previous shape and a 1024-sample overlap tail belong to each decoder channel, not the
+container or playback index. Zero-spectrum packets still emit any previous nonzero overlap.
+Floating reconstruction uses f64 internally and rounds/saturates only at the signed-16 PCM boundary.
+Multichannel layouts, uncommon 960-sample frames, and HE-AAC remain explicit unsupported errors
+outside the iPhone/YouTube playback target. No partial PCM is emitted for unsupported access units.
+
+Each successfully submitted packet produces one timestamp-preserving interleaved `AudioFrame`.
+Only one output may be queued; callers must drain before submitting more. Decode failure requires
+successful reconfiguration before further packets, preventing a later silence frame from masking
+lost overlap history. Flush preserves queued output and ends input without inventing extra samples.
+Reconfiguration atomically resets the stream and pending output.
+
+`AacPlaybackSource` indexes sample-table DTS/PTS/duration and byte ranges, then schedules full-track
+reconstruction through `DecodeExecutor`. It tries Rust first. Only `Error::Unsupported` may cause
+the optional external fallback; the complete track restarts so backends never exchange partial
+overlap state. `AacDecodePolicy::NativeOnly` disables fallback. Completion events identify the
+actual backend, and the terminal preview displays it. The external bridge concurrently feeds ADTS
+and drains PCM/stderr, avoiding a pipe-capacity deadlock. Both paths share presentation trimming.
+Eager whole-track PCM remains a limitation; bounded streaming and seek preroll are next-stage work.
+
+Baseline WebAssembly executes the same native subset through cooperative scheduling, with no
+external process fallback. Device output remains application-owned; browser audio output is not
+implemented. Tests include every Huffman codeword and truncated prefix, signed/escape vectors,
+scalefactor limits, transform/window identities, nonzero overlap/reset behavior, and independent
+reference PCM. FFmpeg-generated non-silent mono vectors cover all 13 standard rates; stereo cases
+exercise M/S, independently coded spectra, isolated PNS/TNS/intensity tools, and their combined
+default-encoder path. They agree within one signed-16 PCM unit in the tested corpus. Constructed
+PNS, pulse, and nonzero window/group/shape transitions agree exactly. Playback tests enforce
+native-only reconstruction for silence and nonzero MP4 audio, plus explicit fallback for
+unsupported modes. This is subset conformance, not general AAC-LC completeness.
+
+The fixed codeword and band-boundary values are format data cross-checked against the
+[FFmpeg n8.0 AAC tables](https://github.com/FFmpeg/FFmpeg/blob/n8.0/libavcodec/aactab.c); the source
+version and digest are recorded in `tables.rs`. Runtime parsing, spectral reconstruction, and
+synthesis are implemented in this crate, with no linked external codec or transform dependency.
 
 ### Avoid premature algorithm abstraction
 
@@ -691,14 +758,15 @@ stable media/link identifiers, project settings, relative managed origins, expli
 origins, and placement ranges. Saves use a same-directory temporary file and rename. CLI host
 requests distinguish `new`, project `open`, `save`, media `import`, and `export`; replacement and
 quit operations protect dirty sessions unless `--discard` is explicit. Export compilation always
-starts at the project root, independently of the current navigation path. The initial MPEG-2 slice
-walks every root placement in composition order and renders its trim and project position, filling
-gaps with project black. A single placement covering the timeline with matching rate, canvas, and
-scan settings lowers to `EditSequence` and can use the GOP-aware packet path. Other progressive
-root timelines decode required pictures and reference dependencies, conform by project-frame
-timestamps, map YUV 4:2:0 planes into the project canvas with CPU Lanczos scaling, encode bounded
-closed-GOP chunks, and mux the regenerated MPEG-2 stream as MPEG-TS. Nested generated/effect media
-and alpha-aware composition remain the next compiler layer.
+starts at the project root, independently of the current navigation path. The MPEG-2 slice
+recursively flattens every nested placement path in stable depth-first composition order and
+renders its trim and project position, filling gaps with project black. Per-frame mapping walks
+exact link transforms, so ancestor source trims clip descendants and differing local time bases
+retain deterministic floor sampling. A single unnested placement covering the timeline with
+matching rate, canvas, and scan settings lowers to `EditSequence` and can use the GOP-aware packet
+path. Other progressive timelines decode required pictures and reference dependencies, map YUV
+4:2:0 planes into the project canvas with CPU Lanczos scaling, composite cached MMFX pixels, encode
+bounded closed-GOP chunks, and mux the regenerated MPEG-2 stream as MPEG-TS.
 Unsupported delivery presets report
 their missing codec/container slice instead of invoking an opaque external transcoder.
 

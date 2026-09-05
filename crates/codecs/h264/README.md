@@ -1,15 +1,41 @@
 # mmrecode-h264
 
-`mmrecode-h264` is the codec-owned syntax and dependency layer for AVC. It currently provides:
+`mmrecode-h264` is the codec-owned syntax, reconstruction, dependency, and first encoder layer for
+AVC. It currently provides:
 
 - Annex-B and ISO/`avcC` length-prefixed NAL splitting and conversion;
 - AVC decoder configuration record parsing;
 - emulation-prevention removal and Exp-Golomb syntax reading;
 - SPS, PPS, VUI, and leading slice-header parsing;
 - container-timed access-unit indexing;
-- IDR/reference classification and a conservative active-reference dependency set.
+- IDR/reference classification and a conservative active-reference dependency set;
+- a deterministic Baseline-profile encoder foundation that emits lossless, all-IDR `I_PCM`
+  pictures through the shared stateful encoder API, including `avcC` configuration, cropping,
+  emulation prevention, packet timing, and exact native round-trip reconstruction;
+- an optional `mode=intra16` compressed path with reconstructed-neighbor DC/horizontal/vertical
+  mode decisions, quantized luma DC Hadamard plus 4x4 luma/chroma DC/AC coefficients, general CAVLC
+  residual serialization, and a normative reconstruction matching independent FFmpeg decoding;
+- a `mode=intra4` path that selects among all nine luma prediction modes block by block, derives
+  predicted-mode and CAVLC contexts from reconstructed neighbors, and writes full luma/chroma
+  residuals. Both compressed modes accept a `qp=0..51` option;
+- a stateful `mode=inter` path with periodic Intra4 IDRs and the complete P
+  partition tree: adaptive P16x16, P16x8, P8x16, and P8x8 macroblocks whose subpartitions reach
+  8x4, 4x8, and 4x4. Deterministic integer searches receive quarter-pixel luma refinement with
+  matched eighth-sample chroma prediction. The path also writes predicted motion-vector
+  differences, full CAVLC residuals and P-skip runs, retains up to four reconstructed references,
+  and exposes `gop_size`, `search_range`, `max_refs`, and opt-in `scene_cut_threshold`;
+- an optional `b_frames=1..3` reorder path using type-0 picture order, B16x16/B16x8/B8x16
+  list-0/list-1/bi motion combinations, all thirteen `B_8x8` sub-macroblock types, spatial and
+  temporal direct prediction, B-skip decisions, CAVLC residuals, presentation PTS, decode-order
+  DTS, and flush-safe delayed-frame draining;
+- deterministic frame-level bitrate control for every compressed picture mode. The generic
+  `bitrate` setting drives a bounded eight-frame virtual buffer and adjusts QP from the configured
+  starting value using each packet's size and declared frame duration;
+- optional `aq_strength=1..12` macroblock adaptive quantization. Mean absolute luma activity lowers
+  QP in quiet regions and raises it in textured regions relative to the picture QP; zero is the
+  default and disables AQ.
 
-The crate does not parse MP4/MOV or encode H.264. Its native decoder foundation reconstructs
+The crate does not parse MP4/MOV. Its native decoder foundation reconstructs
 frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC `Intra_16x16`, or
 CAVLC `Intra_4x4` macroblocks. All Intra16, Intra4, and 8x8 chroma prediction modes operate across
 the macroblock raster. Neighbor-context CAVLC parsing, DC/AC quantization, inverse transforms, and
@@ -61,6 +87,33 @@ Mixed-pair CAVLC neighbors, frame/field motion-vector and reference-index conver
 coefficient scans, and cross-parity 4:2:0 chroma adjustment are pixel-checked on moving x264 MBAFF
 GOPs and forced all-shape vectors. Field-coded temporal-direct B prediction, mixed-mode deblocking,
 CABAC MBAFF, and multi-slice MBAFF remain explicit follow-on work.
+
+The encoder foundation accepts progressive, even-sized `Yuv420p8` frames, pads the coded canvas to
+macroblock boundaries with edge samples, crops it back to the visible dimensions in the SPS, and
+disables deblocking. Its default `I_PCM` mode is an exact normative reference; `intra16` and
+`intra4` provide deterministic transform-coded all-IDR compression with configurable QP.
+The `inter` mode retains `max_refs=1..4` reconstructed short-term pictures and applies the complete
+P partition tree down to 4x4 with partition-specific integer search and quarter-pixel refinement,
+or P-skip when the predicted list-0 block needs no residual. `b_frames=1..3` delays that many
+display-order pictures, emits the next P anchor first, then emits each non-reference B picture.
+B16x16, B16x8, and B8x16 modes independently select list-0, list-1, or bidirectional prediction per
+partition. `B_8x8` adds every L0/L1/Bi shape from 8x8 through 4x4 plus mixed direct submacroblocks.
+Spatial direct derives nonzero list motion from neighboring blocks and applies the normative
+per-8x8 colocated-zero override; zero-residual macroblocks fold into B-skip runs. This activates
+type-0 picture order and keeps PTS in presentation order while assigning DTS in decode order; flush
+encodes unmatched delayed pictures as P. B mode retains at least two references even when
+`max_refs=1`. `scene_cut_threshold=1..255` inserts an IDR when mean luma difference from the latest
+reconstruction reaches the threshold; zero disables this check. `b_direct=spatial|temporal`
+selects the picture-wide direct derivation, with spatial as the default. Temporal mode retains the
+future anchor's colocated reference identity and unwrapped picture order to scale both list vectors.
+Supplying `VideoEncoderSettings::bitrate` in `intra16`, `intra4`, or `inter` mode enables reactive
+frame-level rate control; `qp` is then its initial value. A positive frame duration sets that
+picture's bit budget, otherwise one configured time-base tick is used. `aq_strength=0..12` then
+redistributes the resulting picture QP across macroblocks according to relative luma activity.
+Macroblock QP deltas advance only where AVC syntax permits, including across skipped and
+zero-residual inter blocks. This controller is bounded and deterministic, but does not yet provide
+HRD signalling or a strict decoder-buffer guarantee. Bitrate control and AQ with fixed-size
+lossless `I_PCM` are rejected.
 
 The editor's first usable H.264 preview keeps pixel decoding behind `mmrecode-playback`'s bounded
 request/event and decode-executor interfaces. Access-unit-sized jobs publish frames incrementally,

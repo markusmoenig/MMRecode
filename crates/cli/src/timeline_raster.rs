@@ -194,7 +194,11 @@ fn object_color(kind: &str) -> Rgb<u8> {
         AUDIO_OBJECT
     } else if kind == "text" || kind.starts_with("text/") {
         TEXT_OBJECT
-    } else if kind.starts_with("fx") || kind == "mask" || kind.starts_with("mask/") {
+    } else if kind == "scene/mmfx"
+        || kind.starts_with("fx")
+        || kind == "mask"
+        || kind.starts_with("mask/")
+    {
         EFFECT_OBJECT
     } else {
         OTHER_OBJECT

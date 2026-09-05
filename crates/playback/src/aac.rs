@@ -15,10 +15,11 @@ use std::{
     process::{Command, Stdio},
 };
 
-use mmrecode_aac::AudioSpecificConfig;
-use mmrecode_core::{AudioFrame, Rational};
-#[cfg(not(target_arch = "wasm32"))]
-use mmrecode_core::{AudioSampleFormat, FrameTiming};
+use mmrecode_aac::{AacLcDecoder, AudioSpecificConfig};
+use mmrecode_core::{
+    AudioDecoder, AudioFrame, AudioSampleFormat, Error, FrameTiming, Packet, PacketFlags, Rational,
+    Timestamp,
+};
 use mmrecode_isobmff::{IsoBmffFile, Track};
 
 use crate::{DecodeExecutor, default_decode_executor};
@@ -101,6 +102,8 @@ pub enum AacPlaybackEvent {
         generation: u64,
         /// Decoded PCM samples.
         audio: Box<AudioFrame>,
+        /// Implementation that actually reconstructed this track.
+        backend: AacDecodeBackend,
     },
     /// PCM reconstruction failed.
     Error {
@@ -111,26 +114,41 @@ pub enum AacPlaybackEvent {
     },
 }
 
+/// AAC reconstruction policy; external fallback is never part of the native codec itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AacDecodePolicy {
+    /// Use only our Rust decoder, including in baseline WebAssembly.
+    NativeOnly,
+    /// Restart unsupported tracks through the optional native-host `FFmpeg` bridge.
+    #[default]
+    NativeWithExternalFallback,
+}
+
+/// Decoder used for an AAC playback result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AacDecodeBackend {
+    /// `MMRecode`'s own Rust AAC-LC decoder.
+    Native,
+    /// Optional `FFmpeg` process, unavailable in WebAssembly.
+    External,
+}
+
 #[derive(Debug)]
 struct AacWorker {
-    #[cfg(not(target_arch = "wasm32"))]
     movie: IsoBmffFile,
-    #[cfg(not(target_arch = "wasm32"))]
     track_index: usize,
-    #[cfg(not(target_arch = "wasm32"))]
     configuration: AudioSpecificConfig,
-    #[cfg(not(target_arch = "wasm32"))]
     trim_start_samples: usize,
-    #[cfg(not(target_arch = "wasm32"))]
     decoded_samples_per_channel: usize,
+    policy: AacDecodePolicy,
 }
 
 /// Indexed AAC source scheduled through `MMRecode`'s shared decode executor.
 ///
 /// `MMRecode` owns ISO-BMFF demuxing, `esds`/ASC interpretation, timing, access-unit indexing, and
-/// ADTS adaptation. This first usable native slice delegates spectral reconstruction to an
-/// optional `FFmpeg` process while the native Rust AAC-LC decoder is built behind
-/// [`AudioDecoder`](mmrecode_core::AudioDecoder).
+/// ADTS adaptation. Reconstruction tries the native Rust decoder first. Unsupported tracks may
+/// restart through an optional `FFmpeg` process, unless [`AacDecodePolicy::NativeOnly`] is selected.
+/// Malformed input and invalid decoder state never trigger fallback.
 #[derive(Debug)]
 pub struct AacPlaybackSource {
     index: AacAudioIndex,
@@ -161,6 +179,19 @@ impl AacPlaybackSource {
         file_data: Vec<u8>,
         executor: Arc<dyn DecodeExecutor>,
     ) -> Result<Self, String> {
+        Self::with_executor_and_policy(file_data, executor, AacDecodePolicy::default())
+    }
+
+    /// Parses a source with explicit scheduling and native-only/fallback policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or unsupported track configuration/timing.
+    pub fn with_executor_and_policy(
+        file_data: Vec<u8>,
+        executor: Arc<dyn DecodeExecutor>,
+        policy: AacDecodePolicy,
+    ) -> Result<Self, String> {
         let movie = IsoBmffFile::parse(file_data).map_err(|error| error.to_string())?;
         let (track_index, track) = movie
             .tracks()
@@ -175,28 +206,16 @@ impl AacPlaybackSource {
         let trim_start_samples = index.trim_start_samples;
         let decoded_samples_per_channel = index.decoded_samples_per_channel;
         let (event_sender, events) = mpsc::channel();
-        #[cfg(target_arch = "wasm32")]
-        let _ = (
-            &movie,
-            track_index,
-            &configuration,
-            trim_start_samples,
-            decoded_samples_per_channel,
-        );
         Ok(Self {
             index,
             executor,
             worker: Arc::new(AacWorker {
-                #[cfg(not(target_arch = "wasm32"))]
                 movie,
-                #[cfg(not(target_arch = "wasm32"))]
                 track_index,
-                #[cfg(not(target_arch = "wasm32"))]
                 configuration,
-                #[cfg(not(target_arch = "wasm32"))]
                 trim_start_samples,
-                #[cfg(not(target_arch = "wasm32"))]
                 decoded_samples_per_channel,
+                policy,
             }),
             events,
             event_sender,
@@ -229,9 +248,10 @@ impl AacPlaybackSource {
                     return;
                 }
                 let event = match decode_worker(&worker) {
-                    Ok(audio) => AacPlaybackEvent::Decoded {
+                    Ok((audio, backend)) => AacPlaybackEvent::Decoded {
                         generation,
                         audio: Box::new(audio),
+                        backend,
                     },
                     Err(message) => AacPlaybackEvent::Error {
                         generation,
@@ -379,8 +399,54 @@ fn timestamp_duration(value: i64, time_base: Rational) -> Result<Duration, Strin
         .map_err(|_| "AAC timestamp exceeds platform duration".to_owned())
 }
 
+fn decode_worker(worker: &AacWorker) -> Result<(AudioFrame, AacDecodeBackend), String> {
+    match decode_native(worker) {
+        Ok(audio) => Ok((audio, AacDecodeBackend::Native)),
+        Err(error @ Error::Unsupported(_))
+            if worker.policy == AacDecodePolicy::NativeWithExternalFallback =>
+        {
+            decode_external(worker)
+                .map(|audio| (audio, AacDecodeBackend::External))
+                .map_err(|external| format!("{error}; external AAC fallback: {external}"))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn decode_native(worker: &AacWorker) -> mmrecode_core::Result<AudioFrame> {
+    let track = &worker.movie.tracks()[worker.track_index];
+    let mut decoder = AacLcDecoder::default();
+    decoder.configure(&track.descriptor.codec)?;
+    let mut samples = Vec::new();
+    for sample in &track.samples {
+        let timestamp = |value| {
+            Some(Timestamp {
+                value,
+                time_base: track.descriptor.time_base,
+            })
+        };
+        decoder.send_packet(Packet {
+            stream_id: track.descriptor.id,
+            data: worker.movie.sample_data(sample)?.to_vec(),
+            pts: timestamp(sample.pts),
+            dts: timestamp(sample.dts),
+            duration: timestamp(i64::from(sample.duration)),
+            flags: PacketFlags::empty(),
+            side_data: Vec::new(),
+        })?;
+        while let Some(frame) = decoder.receive_frame()? {
+            samples.extend(frame.samples);
+        }
+    }
+    decoder.flush()?;
+    while let Some(frame) = decoder.receive_frame()? {
+        samples.extend(frame.samples);
+    }
+    pcm_frame(worker, samples).map_err(Error::InvalidData)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn decode_worker(worker: &AacWorker) -> Result<AudioFrame, String> {
+fn decode_external(worker: &AacWorker) -> Result<AudioFrame, String> {
     let track = &worker.movie.tracks()[worker.track_index];
     let mut adts = Vec::new();
     for sample in &track.samples {
@@ -425,21 +491,35 @@ fn decode_worker(worker: &AacWorker) -> Result<AudioFrame, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("optional AAC decoder is unavailable ({error})"))?;
-    child
+    let mut input = child
         .stdin
         .take()
-        .ok_or_else(|| "cannot open AAC decoder input".to_owned())?
-        .write_all(&adts)
-        .map_err(|error| format!("cannot feed AAC decoder: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("AAC decoder failed: {error}"))?;
+        .ok_or_else(|| "cannot open AAC decoder input".to_owned())?;
+    // Drain stdout/stderr while feeding compressed input: sequential write_all followed by
+    // wait_with_output deadlocks once both input and PCM exceed their OS pipe capacities.
+    let feeder = std::thread::Builder::new()
+        .name("aac-input".into())
+        .spawn(move || input.write_all(&adts));
+    let feeder = match feeder {
+        Ok(feeder) => feeder,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("cannot start AAC input feeder: {error}"));
+        }
+    };
+    let output = child.wait_with_output();
+    let fed = feeder
+        .join()
+        .map_err(|_| "AAC input feeder panicked".to_owned())?;
+    let output = output.map_err(|error| format!("AAC decoder failed: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "AAC decoder failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    fed.map_err(|error| format!("cannot feed AAC decoder: {error}"))?;
     if !output
         .stdout
         .len()
@@ -456,6 +536,10 @@ fn decode_worker(worker: &AacWorker) -> Result<AudioFrame, String> {
     if samples.is_empty() {
         return Err("AAC decoder returned no PCM samples".into());
     }
+    pcm_frame(worker, samples)
+}
+
+fn pcm_frame(worker: &AacWorker, samples: Vec<i16>) -> Result<AudioFrame, String> {
     let samples = trim_decoded_samples(worker, samples)?;
     let channels = usize::from(worker.configuration.channels);
     let samples_per_channel = samples.len() / channels;
@@ -471,7 +555,6 @@ fn decode_worker(worker: &AacWorker) -> Result<AudioFrame, String> {
     Ok(frame)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn trim_decoded_samples(worker: &AacWorker, mut samples: Vec<i16>) -> Result<Vec<i16>, String> {
     let channels = usize::from(worker.configuration.channels);
     let trim_samples = worker
@@ -498,8 +581,8 @@ fn trim_decoded_samples(worker: &AacWorker, mut samples: Vec<i16>) -> Result<Vec
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_worker(_worker: &AacWorker) -> Result<AudioFrame, String> {
-    Err("native AAC-LC reconstruction is not implemented yet; external processes are unavailable in WebAssembly".into())
+fn decode_external(_worker: &AacWorker) -> Result<AudioFrame, String> {
+    Err("external processes are unavailable in WebAssembly; only the native AAC-LC subset is available".into())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -507,6 +590,109 @@ mod tests {
     use std::{process::Command, thread, time::Instant};
 
     use super::*;
+
+    #[test]
+    #[ignore = "requires the local projects/ipad2.MP4 acceptance file"]
+    fn decodes_local_ipad_audio_entirely_in_rust() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../projects/ipad2.MP4");
+        let mut source = AacPlaybackSource::with_executor_and_policy(
+            std::fs::read(path).unwrap(),
+            Arc::new(crate::InlineDecodeExecutor::new(8).unwrap()),
+            AacDecodePolicy::NativeOnly,
+        )
+        .unwrap();
+        let expected = source.index().decoded_samples_per_channel();
+        source.request_decode().unwrap();
+        match source.try_event().unwrap().unwrap() {
+            AacPlaybackEvent::Decoded { audio, backend, .. } => {
+                assert_eq!(backend, AacDecodeBackend::Native);
+                assert_eq!(audio.sample_rate, 44_100);
+                assert_eq!(audio.channels, 2);
+                assert_eq!(audio.samples_per_channel, expected);
+                assert!(audio.samples.iter().all(|sample| *sample == 0));
+            }
+            AacPlaybackEvent::Error { message, .. } => panic!("{message}"),
+        }
+    }
+
+    #[test]
+    fn generated_silence_uses_native_decoder_with_cooperative_scheduling() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("skipping AAC interoperability test: ffmpeg is unavailable");
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mmrecode-aac-silence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for rate in [44_100, 48_000] {
+            for layout in ["mono", "stereo"] {
+                let path = directory.join(format!("{rate}-{layout}.m4a"));
+                let status = Command::new("ffmpeg")
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("anullsrc=r={rate}:cl={layout}"),
+                        "-t",
+                        "0.15",
+                        "-c:a",
+                        "aac",
+                        "-profile:a",
+                        "aac_low",
+                        "-y",
+                    ])
+                    .arg(&path)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                let mut source = AacPlaybackSource::with_executor_and_policy(
+                    std::fs::read(&path).unwrap(),
+                    Arc::new(crate::InlineDecodeExecutor::new(8).unwrap()),
+                    AacDecodePolicy::NativeOnly,
+                )
+                .unwrap();
+                let expected = source.index().decoded_samples_per_channel();
+                let generation = source.request_decode().unwrap();
+                let AacPlaybackEvent::Decoded {
+                    audio,
+                    backend,
+                    generation: actual,
+                } = source.try_event().unwrap().unwrap()
+                else {
+                    panic!("native silence decoding failed");
+                };
+                assert_eq!(actual, generation);
+                assert_eq!(backend, AacDecodeBackend::Native);
+                assert_eq!(audio.sample_rate, rate);
+                assert_eq!(audio.channels, if layout == "mono" { 1 } else { 2 });
+                assert_eq!(audio.samples_per_channel, expected);
+                // Independent reference PCM. FFmpeg leaves terminal codec padding in its raw
+                // output; compare the edited presentation interval, not that extra tail.
+                let reference = Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&path)
+                    .args(["-f", "s16le", "pipe:1"])
+                    .output()
+                    .unwrap();
+                assert!(reference.status.success());
+                let reference: Vec<i16> = reference
+                    .stdout
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+                    .collect();
+                assert!(reference.len() >= audio.samples.len());
+                assert_eq!(audio.samples, reference[..audio.samples.len()]);
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn indexes_and_decodes_generated_aac_lc_mp4() {
@@ -529,11 +715,14 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "sine=frequency=440:sample_rate=48000:duration=0.1",
+                // Large enough that a sequential pipe feeder/drainer deadlocks on macOS.
+                "sine=frequency=440:sample_rate=48000:duration=10",
                 "-c:a",
                 "aac",
                 "-profile:a",
                 "aac_low",
+                "-ac",
+                "6",
                 "-y",
             ])
             .arg(&path)
@@ -542,8 +731,34 @@ mod tests {
         assert!(status.success());
         let mut source = AacPlaybackSource::new(std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(source.index().configuration().sample_rate, 48_000);
-        assert_eq!(source.index().configuration().channels, 1);
+        assert_eq!(source.index().configuration().channels, 6);
         assert!(!source.index().samples().is_empty());
+        assert!(
+            source
+                .index()
+                .samples()
+                .iter()
+                .map(|sample| sample.byte_length)
+                .sum::<usize>()
+                > 65_536
+        );
+        assert!(matches!(
+            decode_native(&source.worker),
+            Err(Error::Unsupported(_))
+        ));
+        // The very same unsupported multichannel stream must not invoke FFmpeg under
+        // native-only policy.
+        let native_source = AacPlaybackSource::with_executor_and_policy(
+            std::fs::read(&path).unwrap(),
+            Arc::new(crate::InlineDecodeExecutor::new(8).unwrap()),
+            AacDecodePolicy::NativeOnly,
+        )
+        .unwrap();
+        assert!(
+            decode_worker(&native_source.worker)
+                .unwrap_err()
+                .starts_with("unsupported:")
+        );
         let expected_samples = source.index().decoded_samples_per_channel();
         let generation = source.request_decode().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -553,10 +768,12 @@ mod tests {
                     AacPlaybackEvent::Decoded {
                         generation: event_generation,
                         audio,
+                        backend,
                     } => {
+                        assert_eq!(backend, AacDecodeBackend::External);
                         assert_eq!(event_generation, generation);
                         assert_eq!(audio.sample_rate, 48_000);
-                        assert_eq!(audio.channels, 1);
+                        assert_eq!(audio.channels, 6);
                         assert_eq!(audio.samples_per_channel, expected_samples);
                         assert!(
                             audio
@@ -574,5 +791,80 @@ mod tests {
         }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn nonzero_mp4_uses_native_pcm_and_presentation_trimming() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "mmrecode-aac-native-playback-{}.m4a",
+            std::process::id()
+        ));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.15",
+                "-ac",
+                "2",
+                "-c:a",
+                "aac",
+                "-aac_pns",
+                "0",
+                "-aac_tns",
+                "0",
+                "-aac_is",
+                "0",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut source = AacPlaybackSource::with_executor_and_policy(
+            std::fs::read(&path).unwrap(),
+            Arc::new(crate::InlineDecodeExecutor::new(8).unwrap()),
+            AacDecodePolicy::NativeOnly,
+        )
+        .unwrap();
+        source.request_decode().unwrap();
+        let AacPlaybackEvent::Decoded { audio, backend, .. } = source.try_event().unwrap().unwrap()
+        else {
+            panic!("native nonzero playback failed");
+        };
+        assert_eq!(backend, AacDecodeBackend::Native);
+        assert_eq!(
+            audio.samples_per_channel,
+            source.index().decoded_samples_per_channel()
+        );
+        assert!(audio.samples.iter().any(|v| v.unsigned_abs() > 100));
+        let reference = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-f", "s16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(reference.status.success());
+        let reference: Vec<i16> = reference
+            .stdout
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| i16::from_le_bytes(*v))
+            .collect();
+        assert!(reference.len() >= audio.samples.len());
+        assert!(
+            audio
+                .samples
+                .iter()
+                .zip(&reference)
+                .all(|(a, b)| (i32::from(*a) - i32::from(*b)).abs() <= 2)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

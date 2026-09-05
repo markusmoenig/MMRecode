@@ -11,21 +11,25 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 ## Suggested next milestones
 
+**Current codec path:** Validate representative iPhone/YouTube AAC-LC files, then add bounded audio
+buffering/seek preroll. Uncommon 960-sample, multichannel, and HE-AAC variants remain explicit
+fallback cases rather than native implementation targets. Strengthen H.264 arbitrary-cut dependency
+planning before starting a native edit-boundary encoder.
+
 1. Add media fingerprints, relinking, and collect/portable-copy behavior to the new versioned
-   project document, then extend timeline export recursively into nested media/effect content.
+   project document, then extend recursive timeline export beyond MPEG-2/MMFX into audio and later
+   effect kinds.
 2. Add dedicated interactive `in`/`out` adjustment modes while retaining canonical typed commands
    underneath them.
 3. Extend edit delivery to multi-clip audio selection, boundary policy, and MPEG-TS output.
-4. Extend the new typed MMFX `Scene`/`Group`/`Rect` boundary and scalar CPU renderer with text,
-   images, row/column layout, animation, project placements, and live editor preview before custom
-   kernels or third-party plugins.
+4. Extend the implemented MMFX Scene 0.2 image/layout/animation slice with media slots, intrinsic
+   sizing, parameters, and richer timing before custom kernels or third-party plugins.
 5. Extend the new indexed MPEG-2 preview path with incremental TS demux, streaming audio, buffering,
    and backpressure.
 6. Add a native MPEG-1 Layer II decoder when audio must move from pass-through/viewer support into
    the reusable codec layer.
-7. Extend the native H.264 decoder foundation from raw IDR macroblocks through intra prediction,
-   residual decoding, inter prediction, reference management, and deblocking; then extend the new
-   clean-GOP remuxer into dependency-aware arbitrary edit boundaries.
+7. Extend the existing native H.264 reconstruction/conformance coverage and the clean-GOP remuxer
+   into dependency-aware arbitrary edit boundaries; see the H.264 section for remaining breadth.
 
 ## Shared core and bitstream
 
@@ -125,14 +129,19 @@ PCM.
 
 ## AAC
 
-**Status:** The first AAC-LC playback vertical slice is implemented. ISO-BMFF unwraps `esds` into
+**Status:** The common iPhone/YouTube AAC-LC playback path and native nonzero spectral/synthesis
+subset are implemented; this is deliberately not a general AAC decoder. ISO-BMFF unwraps `esds` into
 decoder-specific bytes; the AAC crate validates `AudioSpecificConfig` and resolves object type,
 sample rate, channels, and frame length and can frame raw MP4 access units as ADTS. Playback indexes
 exact sample timing and
-schedules complete-track PCM reconstruction through the shared executor. Native terminal preview
-uses optional FFmpeg reconstruction and rendered audio as the H.264 master clock. The actual iPad
-acceptance file's 44.1 kHz stereo track decodes successfully; its HEVC video remains a separate
-codec slice.
+schedules complete-track PCM reconstruction through the shared executor. Playback tries our Rust
+decoder first and optionally restarts unsupported tracks through FFmpeg. Completion events and
+terminal preview identify the actual backend, and native-only policy prevents hidden fallback.
+The actual iPad acceptance file's **silent** 44.1 kHz stereo track now decodes entirely in Rust;
+its HEVC video remains a separate codec slice. Native Huffman decoding, inverse quantization,
+PNS, M/S and intensity stereo, pulse reconstruction, TNS, and sine/KBD synthesis now reconstruct
+nonzero mono/stereo audio. Uncommon 960-sample, multichannel, and HE-AAC files intentionally require
+fallback under the iPhone/YouTube-focused scope.
 
 - [x] Parse AAC-LC `AudioSpecificConfig`, standard channel configurations, explicit rates, and
   raw-access-unit ADTS headers.
@@ -143,12 +152,30 @@ codec slice.
   padding to the edited presentation interval.
 - [x] Schedule PCM decode through `DecodeExecutor` and synchronize terminal H.264 playback to the
   audio device clock across play, pause, seek, underflow, and loop operations.
-- [ ] Implement native Rust AAC-LC noiseless coding, inverse quantization, stereo tools, IMDCT,
+- [x] Implement native mono/stereo raw-data-block, ICS/window grouping, ZERO_HCB section, M/S mask,
+  bounded fill/data-element parsing, and zero-spectrum PCM behind `AudioDecoder` (1024 samples).
+- [x] Bound codec output to one pending frame, preserve packet timing, and require reset after
+  failed reconstruction so missing overlap history cannot be silently ignored.
+- [x] Verify the native subset with independent Apple packets, FFmpeg-generated mono/stereo silence,
+  native-only cooperative playback, malformed input, and unsupported-feature regressions.
+- [x] Recognize ASC sync-extension SBR/PS and reject it from plain-LC native/ADTS paths; reject
+  960-sample frames in the ADTS bridge instead of incorrectly signalling 1024 samples.
+- [x] Drain external PCM concurrently with compressed-input feeding to avoid pipe-capacity deadlock.
+- [x] Implement native Rust AAC-LC noiseless coding, inverse quantization, stereo tools, IMDCT,
   overlap/add, and conformance vectors behind `AudioDecoder`.
+  - [x] Add scalefactor/spectral Huffman tables, all eleven books, escape bounds, band offsets,
+    grouped-short deinterleaving, inverse quantization, and M/S stereo.
+  - [x] Add long/short sine/KBD synthesis, start/stop transitions, and persistent overlap with
+    nonzero reference PCM tests (13 standard mono rates, stereo M/S/independent spectra).
+  - [x] Verify native-only nonzero MP4 playback, presentation trimming, and overlap/reset behavior.
+  - [x] Add PNS, intensity stereo, pulse, TNS, and bounded gain-control syntax, with isolated and
+    combined independent PCM comparisons.
+  - [x] Replace the scalar O(N²) transform with an audited radix-2 FFT-backed transform.
+  - [ ] Validate a retained corpus of representative iPhone recordings and YouTube AAC-LC MP4s.
 - [ ] Replace eager complete-track PCM with bounded packet/PCM queues and sample-accurate seek
   preroll for long media.
 - [ ] Add browser audio-device output while preserving cooperative baseline WebAssembly decode.
-- [ ] Add implicit/explicit SBR and Parametric Stereo only after AAC-LC is complete.
+- [ ] Add implicit/explicit SBR and Parametric Stereo only if the retained target corpus requires it.
 - [ ] Add AAC encoding and ISO-BMFF audio muxing after decode and edit-boundary behavior stabilize.
 
 ## MPEG-2 Transport Stream
@@ -248,7 +275,7 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
 - [ ] Add an edit/full-screen-monitor view toggle over the same playback state and frame cache.
 - [x] Add a pixel-rendered 24-bit timeline layer for thumbnails, codec landmarks, smart-render
   state, and dense colored media regions while retaining terminal-native text and controls.
-- [ ] Project the current hierarchy level into separate ordered object rows, label the timeline
+- [x] Project the current hierarchy level into separate ordered object rows, label the timeline
   with its media-path breadcrumb and local time domain, and add a synthetic `self/source` context
   row. `cd` should replace the editable rows with the entered object's local children; a future
   explicit overview may show ancestors or flattened descendants.
@@ -292,16 +319,26 @@ versioned semantic values rather than internal Rust objects.
   placement, and nested rounded clipping.
 - [x] Add explicit module-relative `@font` resources and typed static `@text` with Parley shaping
   and wrapping plus Swash/Zeno glyph coverage; disable implicit system fonts for final rendering.
-- [x] Make generated `fx` media own embedded `.mmfx` source, create/place it through `add fx`, edit
+- [x] Make generated scene media own embedded `.mmfx` source, create/place it through `add scene`, edit
   it in hierarchical `cd` context, serialize it with the project, load external source as an embedded
-  copy with a retained resource base, extract it with `fx save as`, and provide multiline editing,
+  copy with a retained resource base, extract it with `scene save as`, and provide multiline editing,
   project undo/redo, debounced worker preview, diagnostics, last-good retention, and complete help.
-- [ ] Extend static text with fallback chains, color glyphs, decorations, and intrinsic sizing; add
-  typed images/media slots, row/column layout, timing, and animation.
-- [ ] Recursively composite persisted generated scene media into project preview and export.
+- [x] Use the custom-pixel timeline for FX-only projects, provide a text-bearing starter scene with
+  a bundled deterministic font, and composite active direct MMFX placements into timeline preview.
+- [x] Add typed decoded images, contain/cover/fill fitting, row/column layout, exact-frame
+  keyframes, scale/rotation, and cover-style scrolling.
+- [ ] Extend text with fallback chains, color glyphs, decorations, and intrinsic sizing; add media
+  slots, parameters, animation delay/repetition, and richer timing controls.
+- [x] Move direct MMFX preview/export into a reusable incremental CPU project compositor with
+  cached scene/resource rasterization, cached preview scaling, transparent bounds, and preconverted
+  in-place Yuv420p8 blending; export direct root FX layers and FX-only projects through MPEG-2/TS.
+- [x] Extend the shared compositor from direct hierarchy levels to recursive nested composition,
+  with exact per-frame path mapping, ancestor-trim clipping, shared video/FX composition order,
+  cached synchronization by project revision/context, and recursive MPEG-2/TS export.
 
-- [ ] Define typed scene objects for text, paths, rectangles, images, groups, transforms, layout,
-  timing, and animation without tying them to a renderer.
+- [x] Define typed scene objects for text, rectangles, images, groups, transforms, bounded layout,
+  exact timing, and keyframe animation without tying them to a renderer.
+- [ ] Add paths, media slots, intrinsic sizing, parameters, and reusable styles to Scene IR.
 - [ ] Define the safe, bounded MMFX language and typed portable IR, including color, sampling,
   coordinate, edge, precision, and time semantics.
 - [x] Implement the first scalar CPU reference backend with deterministic parser, layout,
@@ -374,8 +411,19 @@ MP4 writer exist. Each remaining item below should be its own crate and bounded 
 
 ## H.264 and future video codecs
 
-**Status:** The H.264 syntax/indexing, MP4/MOV editor import/playback, and video-only clean-GOP
-remux slices are implemented.
+**Status:** The H.264 syntax/indexing, MP4/MOV editor import/playback, video-only clean-GOP remux,
+and first deterministic encoder foundation are implemented. The encoder currently emits
+Baseline-profile, all-IDR lossless `I_PCM` pictures plus transform-coded Intra16 and Intra4
+pictures with CAVLC residuals and configurable picture/macroblock QP. Its bounded inter mode retains
+up to four references,
+emits every P partition down to 4x4 with quarter-pixel motion and P-skip, and optionally reorders up
+to three non-reference B pictures between anchors. B16x16, B16x8, B8x16, and all thirteen B8x8
+subtypes select list-0/list-1/bi/direct motion independently; nonzero spatial direct, colocated-zero
+handling, temporal direct with POC-scaled colocated motion, and B-skip are also encoded. Adaptive
+frame-level target-bitrate control now adjusts QP across all compressed picture types from packet
+size, frame duration, and a bounded virtual buffer. Optional activity-based macroblock AQ also
+redistributes each picture target between quiet and textured regions with normative QP-delta state.
+Normative HRD/VBV scheduling remains follow-on work.
 Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
 in-loop deblocking and default-list multiple-reference CAVLC P slices are also implemented, including skip,
@@ -538,8 +586,53 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Add explainable video-only clean-GOP MP4 remuxing: require IDR/sync boundaries, verify a
   contiguous dependency-closed decode range, preserve encoded sample bytes and display metadata,
   rebuild exact timing/sample tables, and reject rather than round an unsafe cut.
+- [x] Start the native H.264 encoder with a deterministic progressive 8-bit 4:2:0 Baseline path:
+  serialize SPS/PPS and `avcC`, emit cropped all-IDR `I_PCM` access units with emulation prevention,
+  preserve packet timing, expose exact reconstruction, and verify byte-determinism plus native
+  decoder pixel round trips.
+- [x] Add the first compressed Intra16 mode with reconstructed-neighbor DC/horizontal/vertical
+  prediction decisions, luma DC Hadamard plus 4x4 luma/chroma DC/AC transforms and quantization,
+  neighbor-derived CAVLC coefficient serialization, normative reconstruction, and independent
+  FFmpeg pixel verification.
+- [x] Add Intra4 macroblocks with all nine luma prediction modes, reconstructed-neighbor predicted
+  mode derivation, coded-block-pattern mapping, neighbor-derived CAVLC contexts, complete
+  luma/chroma residuals, constant QP 0 through 51, and native/FFmpeg pixel verification.
+- [x] Add the first reference-P encoder path: configurable IP GOPs, periodic Intra4 IDRs, one
+  reconstructed short-term reference, P16x16 integer-pixel motion search, predicted vector
+  differences, full luma/chroma CAVLC residuals, P-skip runs, frame-number wrap, cropped-canvas
+  handling, and native/FFmpeg sequence verification.
+- [x] Add adaptive P16x16/P16x8/P8x16 decisions with partition-specific searches, normative
+  neighbor predictors, chroma partition prediction, deterministic rate-aware tie-breaking, and
+  opt-in mean-luma scene-cut IDRs; force both split shapes through native and FFmpeg verification.
+- [x] Add P8x8 macroblocks with independently selected 8x8, 8x4, 4x8, and 4x4 subpartitions;
+  refine integer candidates to quarter-pixel luma motion with normative six-tap filtering and
+  eighth-sample chroma prediction, and force every subtype plus fractional motion through native
+  and FFmpeg verification.
+- [x] Add a bounded multiple-reference/B encoder milestone: retain up to four short-term pictures,
+  select older P references with matching reference-index motion prediction, and optionally reorder
+  one to three non-reference B pictures between anchors. Search list-0/list-1 motion at quarter-pixel
+  precision, select uni/bi prediction, preserve presentation PTS with decode-order DTS, drain
+  pending pictures as P at flush/GOP boundaries, and verify native plus FFmpeg reconstruction.
+- [x] Extend B coding through every B16x16, B16x8, and B8x16 list-direction combination with
+  partition-specific motion prediction/search and normative unavailable-list history; force both
+  split geometries and a three-B reorder through native plus FFmpeg reconstruction.
+- [x] Add every B8x8 sub-macroblock partition down to 4x4, including `B_Direct_8x8`, plus
+  macroblock-level spatial-direct and B-skip decisions. Retain future-anchor motion metadata for
+  per-8x8 colocated-zero overrides; force mixed direct/explicit subtypes, nonzero direct motion,
+  direct residuals, and a multi-macroblock skip run through native plus FFmpeg reconstruction.
+- [x] Add picture-wide temporal-direct encoder decisions with colocated-reference identity,
+  unwrapped POC-distance scaling, reference-availability fallback, direct residual/B-skip syntax,
+  and native plus FFmpeg verification of a nonzero-motion direct picture.
+- [x] Add deterministic frame-level target-bitrate control with duration-aware budgets, a bounded
+  eight-frame virtual buffer, QP adaptation across IDR/P/B pictures, reconfiguration reset, and
+  native plus FFmpeg verification that lower targets reduce size at the expected quality cost.
+- [x] Add opt-in activity-based macroblock AQ across Intra16, Intra4, P, and B pictures with
+  modulo-52 QP deltas, correct skipped/zero-residual state carry, and native plus FFmpeg pixel
+  verification of mixed quiet and textured regions.
+- [ ] Add normative HRD/VBV scheduling and signalling, and broader profile/tool support only after
+  the adaptive frame/macroblock controller is mature.
 - [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
-  Treat a production encoder as a later, separate decision.
+  Treat a production-quality encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.
 - [ ] **AV1:** evaluate as a separate modern-codec slice when it supports a real workflow.
 - [ ] **VVC:** defer until ecosystem demand and patent/licensing requirements justify the cost.

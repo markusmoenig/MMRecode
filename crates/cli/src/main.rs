@@ -131,11 +131,30 @@ fn run() -> Result<(), String> {
 fn render_mmfx_command(
     arguments: &mut impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<(), String> {
-    let usage = "usage: mmrecode render-mmfx <scene.mmfx> <output.png>";
+    let usage = "usage: mmrecode render-mmfx <scene.mmfx> <output.png> [--frame <index>] [--frames <count>]";
     let input = arguments.next().ok_or_else(|| usage.to_owned())?;
     let output = arguments.next().ok_or_else(|| usage.to_owned())?;
-    if arguments.next().is_some() {
-        return Err(usage.to_owned());
+    let mut frame = 0_u64;
+    let mut frame_count = None;
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("--frame") => {
+                frame = arguments
+                    .next()
+                    .and_then(|value| value.to_str().and_then(|value| value.parse().ok()))
+                    .ok_or_else(|| usage.to_owned())?;
+            }
+            Some("--frames") => {
+                frame_count = Some(
+                    arguments
+                        .next()
+                        .and_then(|value| value.to_str().and_then(|value| value.parse().ok()))
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| usage.to_owned())?,
+                );
+            }
+            _ => return Err(usage.to_owned()),
+        }
     }
     let input_path = std::path::Path::new(&input);
     let output_path = std::path::Path::new(&output);
@@ -158,30 +177,17 @@ fn render_mmfx_command(
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let mut resources = mmrecode_mmfx::RenderResources::new();
     let module_directory = input_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    for font in &scene.fonts {
-        let source = std::path::Path::new(&font.source);
-        if source.is_absolute() {
-            return Err(format!(
-                "font '{}' must use a module-relative source path",
-                font.name
-            ));
-        }
-        let resource_path = module_directory.join(source);
-        let data = std::fs::read(&resource_path).map_err(|error| {
-            format!(
-                "cannot read font '{}' at {}: {error}",
-                font.name,
-                resource_path.display()
-            )
-        })?;
-        resources.add_font(font.name.clone(), data);
-    }
-    let surface = mmrecode_mmfx::render_with_resources(&scene, &resources)
-        .map_err(|error| error.to_string())?;
+    let resources = load_mmfx_resources(&scene, module_directory)?;
+    let frame_count = frame_count.unwrap_or_else(|| frame.saturating_add(1).max(1));
+    let surface = mmrecode_mmfx::render_frame_with_resources(
+        &scene,
+        &resources,
+        mmrecode_mmfx::SceneTime::new(frame, frame_count),
+    )
+    .map_err(|error| error.to_string())?;
     image::save_buffer_with_format(
         output_path,
         &surface.to_rgba8(),
@@ -192,13 +198,70 @@ fn render_mmfx_command(
     )
     .map_err(|error| format!("cannot write {}: {error}", output_path.display()))?;
     println!(
-        "Rendered MMFX scene '{}' ({}x{}) to {}",
+        "Rendered MMFX scene '{}' frame {}/{} ({}x{}) to {}",
         scene.name,
+        frame.min(frame_count - 1),
+        frame_count,
         scene.width,
         scene.height,
         output_path.display()
     );
     Ok(())
+}
+
+const MMFX_BUILTIN_INTER: &str = "builtin:inter";
+
+fn load_mmfx_resources(
+    scene: &mmrecode_mmfx::Scene,
+    module_directory: &std::path::Path,
+) -> Result<mmrecode_mmfx::RenderResources, String> {
+    let mut resources = mmrecode_mmfx::RenderResources::new();
+    for font in &scene.fonts {
+        let data = if font.source.eq_ignore_ascii_case(MMFX_BUILTIN_INTER) {
+            include_bytes!("../../../assets/fonts/Inter.ttf").to_vec()
+        } else {
+            let source = std::path::Path::new(&font.source);
+            if source.is_absolute() {
+                return Err(format!(
+                    "font '{}' must use a module-relative or built-in source",
+                    font.name
+                ));
+            }
+            let resource_path = module_directory.join(source);
+            std::fs::read(&resource_path).map_err(|error| {
+                format!(
+                    "cannot read font '{}' at {}: {error}",
+                    font.name,
+                    resource_path.display()
+                )
+            })?
+        };
+        resources.add_font(font.name.clone(), data);
+    }
+    for source in scene
+        .image_sources()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let declared = std::path::Path::new(source);
+        if declared.is_absolute() {
+            return Err(format!(
+                "image '{source}' must use a module-relative source path"
+            ));
+        }
+        let resource_path = module_directory.join(declared);
+        let image = image::open(&resource_path).map_err(|error| {
+            format!(
+                "cannot decode image '{source}' at {}: {error}",
+                resource_path.display()
+            )
+        })?;
+        let image = image.to_rgba8();
+        resources
+            .add_image(source, image.width(), image.height(), image.into_raw())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(resources)
 }
 
 fn h264_remux_command(
@@ -2341,7 +2404,7 @@ fn print_help() {
          Usage: mmrecode [command] [arguments]\n\
          With no command, MMRecode starts the interactive editor.\n\n\
          Available commands:\n  edit [script]         Start the linked-media editor or execute a command script\n  \
-             Interactive editor: `add fx`, `cd`, then `fx edit`; project save embeds source\n  \
+             Interactive editor: `add scene`, `cd`, then `edit`; project save embeds source\n  \
          preview <media-file>  Preview MPEG-2 ES/TS or H.264 MP4/MOV inside this terminal\n  \
          inspect <media-file>  Inspect JPEG/MJPEG, DV, MPEG-2/TS, or H.264 MP4/MOV syntax\n  \
          extract-dv-audio <dv> <s16le>  Extract one DV stereo pair as raw PCM\n  \
@@ -2359,7 +2422,8 @@ fn print_help() {
              Validate and explain one MPEG-2 replacement render without writing a container\n  \
          render <m2v> <ts> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
              Smart-render one MPEG-2 replacement into MPEG-TS\n  \
-         render-mmfx <scene.mmfx> <output.png>  Render an MMFX scene with the CPU reference backend\n  \
+         render-mmfx <scene.mmfx> <output.png> [--frame N] [--frames N]\n  \
+             Render an exact local MMFX frame with the CPU reference backend\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \
          compare <reference.y4m> <candidate.y4m>  Compare decoded frame quality\n  \

@@ -11,29 +11,29 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use image::{DynamicImage, Rgb, RgbImage};
+use image::{DynamicImage, RgbImage};
 use mmrecode_core::{ColorRange, PixelFormat, Plane, Rational, VideoFrame};
 use mmrecode_edit::{
     CommandOutput, EditCommand, EditorSession, MediaId, MediaOrigin, MediaPath, MmfxSource,
-    format_compact_timecode,
+    MonitorTarget, format_compact_timecode,
 };
 use mmrecode_playback::{
-    AacPlaybackEvent, AacPlaybackSource, H264PlaybackEvent, H264PlaybackSource, Mpeg2PlaybackEvent,
-    Mpeg2PlaybackSource, PlaybackController, PlaybackEvent, PlaybackTimeline,
+    AacDecodeBackend, AacPlaybackEvent, AacPlaybackSource, H264PlaybackEvent, H264PlaybackSource,
+    Mpeg2PlaybackEvent, Mpeg2PlaybackSource, PlaybackController, PlaybackEvent, PlaybackTimeline,
 };
+use mmrecode_render::ProjectCompositor;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::{
-        ExecutableCommand as _, QueueableCommand as _,
-        cursor::{Hide, MoveTo, Show},
+        ExecutableCommand as _,
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
             KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
         },
     },
     layout::{Alignment, Constraint, Layout, Rect, Size},
-    style::{Color, Style},
-    text::{Line, Span},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::{
@@ -170,6 +170,9 @@ fn run_editor_initialized(
     let protocol = picker.protocol_type();
     let (resize_tx, complete_rx, resize_worker) = spawn_resize_worker()?;
     let mut app = None;
+    terminal
+        .hide_cursor()
+        .map_err(|error| format!("cannot hide terminal cursor in editor: {error}"))?;
     std::io::stdout()
         .execute(EnableMouseCapture)
         .map_err(|error| format!("cannot enable terminal timeline mouse input: {error}"))?;
@@ -177,6 +180,7 @@ fn run_editor_initialized(
         message: "Ready. Type import <media-file>, or use help / man <command>.".into(),
         inspector_focus: InspectorFocus::Help,
         timeline_image: Some(TimelineImageBuffer::new()?),
+        timeline_monitor_image: Some(TimelineImageBuffer::new()?),
         mmfx_image: Some(TimelineImageBuffer::new()?),
         mmfx_worker: Some(MmfxCompileWorker::spawn()?),
         ..EditorUi::default()
@@ -243,6 +247,13 @@ enum EditorPaneFocus {
     Command,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MonitorScope {
+    #[default]
+    Project,
+    Local,
+}
+
 impl EditorPaneFocus {
     const fn next(self, code_available: bool) -> Self {
         match (self, code_available) {
@@ -280,8 +291,18 @@ struct EditorUi {
     inspector_area: Rect,
     prompt_area: Rect,
     timeline: TimelineViewport,
+    /// Playhead in the project root timeline. The monitor always renders this time.
+    project_playhead: usize,
+    /// Playhead in the hierarchy level currently shown by the timeline pane.
+    timeline_playhead: usize,
     timeline_image: Option<TimelineImageBuffer>,
     timeline_raster_key: Option<TimelineRasterKey>,
+    timeline_monitor_image: Option<TimelineImageBuffer>,
+    timeline_monitor_key: Option<TimelineMonitorKey>,
+    project_compositor: ProjectCompositor,
+    project_compositor_state: Option<(u64, MediaId)>,
+    monitor_scope: MonitorScope,
+    timeline_context: Option<MediaId>,
     cursor_position: (u16, u16),
     pane_focus: EditorPaneFocus,
     inspector_scroll: u16,
@@ -431,25 +452,7 @@ fn compile_mmfx_preview(source: &str, base_directory: &Path) -> Result<DynamicIm
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let mut resources = mmrecode_mmfx::RenderResources::new();
-    for font in &scene.fonts {
-        let declared = Path::new(&font.source);
-        if declared.is_absolute() {
-            return Err(format!(
-                "font '{}' must use a module-relative source path",
-                font.name
-            ));
-        }
-        let path = base_directory.join(declared);
-        let data = std::fs::read(&path).map_err(|error| {
-            format!(
-                "cannot read font '{}' at {}: {error}",
-                font.name,
-                path.display()
-            )
-        })?;
-        resources.add_font(font.name.clone(), data);
-    }
+    let resources = crate::load_mmfx_resources(&scene, base_directory)?;
     let surface = mmrecode_mmfx::render_with_resources(&scene, &resources)
         .map_err(|error| error.to_string())?;
     let image = image::RgbaImage::from_raw(surface.width(), surface.height(), surface.to_rgba8())
@@ -589,6 +592,14 @@ struct TimelinePreviewMapping {
     source: Range<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TimelineMonitorKey {
+    canvas: (u32, u32),
+    scope: MonitorScope,
+    playhead: usize,
+    active_signature: u64,
+}
+
 struct EditorHost<'a> {
     resize_tx: &'a mpsc::Sender<ResizeRequest>,
     picker: &'a Picker,
@@ -612,26 +623,51 @@ fn editor_event_loop(
     let mut last_range = None;
     let mut last_thumbnail_revision = None;
     loop {
-        let mut redrawn = false;
-        let mmfx_changed = update_mmfx_preview(editor, session, host, Instant::now());
-        if editor.mmfx.is_none()
-            && let Some(app) = app.as_mut()
-        {
-            app.tick(Instant::now())?;
+        let now = Instant::now();
+        let mut mmfx_changed = update_mmfx_preview(editor, session, host, now);
+        mmfx_changed |= synchronize_project_compositor(editor, session, host);
+        if let Some(app) = app.as_mut() {
+            app.tick(now, false)?;
+            editor.project_playhead = project_timeline_playhead(session, app);
+            editor.timeline_playhead =
+                displayed_timeline_playhead(session, app, editor.project_playhead);
+            if monitor_uses_video(editor.monitor_scope, session, app) {
+                let monitor_frame = monitor_playhead(editor);
+                if editor
+                    .project_compositor
+                    .has_active_layers(timeline_frame_i64(monitor_frame))
+                {
+                    app.update_timeline_composition(&mut editor.project_compositor, monitor_frame)?;
+                } else {
+                    if app.composed_frame.take().is_some() {
+                        app.image_frame = None;
+                        if let Some(kitty) = &mut app.kitty {
+                            kitty.discard_queued();
+                        }
+                    }
+                    app.update_image(app.playback.frame_index())?;
+                }
+            } else {
+                if app.kitty.is_some() && app.image_frame.is_some() {
+                    app.clear_kitty()?;
+                    app.image_frame = None;
+                }
+                mmfx_changed |= update_compositor_only_monitor(editor, session, host.picker);
+            }
+        } else {
+            mmfx_changed |= synchronize_timeline_context(editor, session);
+            mmfx_changed |= update_compositor_only_monitor(editor, session, host.picker);
         }
-        let resized = editor.mmfx.is_none()
-            && app
-                .as_mut()
-                .is_some_and(|app| receive_resized_images(app, completed));
+        let resized = app
+            .as_mut()
+            .is_some_and(|app| receive_resized_images(app, completed));
         let timeline_resized = receive_timeline_resized_image(editor);
         let current = app.as_ref().map(|app| app.playback.frame_index());
-        if current != last_frame
-            && let Some(current) = current
-        {
+        if current != last_frame && current.is_some() {
             editor
                 .timeline
                 .sync_total_frames(local_timeline_frame_count(session));
-            editor.timeline.reveal(current);
+            editor.timeline.reveal(editor.timeline_playhead);
         }
         let status = app.as_ref().map_or("empty", PreviewApp::status);
         let range = app.as_ref().map(|app| app.playback_range.clone());
@@ -645,31 +681,17 @@ fn editor_event_loop(
             || range != last_range
             || thumbnail_revision != last_thumbnail_revision
         {
-            std::io::stdout()
-                .execute(Hide)
-                .map_err(|error| format!("cannot hide editor cursor while drawing: {error}"))?;
             terminal
-                .draw(|frame| draw_editor(frame, app.as_mut(), session, editor))
+                .draw(|frame| draw_editor(frame, app.as_mut(), session, editor, host.picker))
                 .map_err(|error| format!("cannot draw terminal editor: {error}"))?;
-            redrawn = true;
             last_frame = current;
             status.clone_into(&mut last_status);
             last_range = range;
             last_thumbnail_revision = thumbnail_revision;
             redraw = false;
         }
-        if editor.mmfx.is_none()
-            && let Some(app) = app.as_mut()
-        {
+        if let Some(app) = app.as_mut() {
             app.flush_kitty_frame()?;
-        }
-        if redrawn
-            && matches!(
-                editor.pane_focus,
-                EditorPaneFocus::Command | EditorPaneFocus::Code
-            )
-        {
-            restore_editor_cursor(editor.cursor_position)?;
         }
 
         if event::poll(EVENT_WAIT).map_err(|error| format!("cannot poll terminal: {error}"))? {
@@ -703,6 +725,8 @@ fn editor_event_loop(
                         handle_inspector_mouse(editor, mouse);
                         if let Some(app) = app.as_mut() {
                             handle_editor_mouse(app, session, editor, mouse, Instant::now())?;
+                        } else {
+                            handle_fx_only_timeline_mouse(session, editor, mouse);
                         }
                     }
                     _ => {}
@@ -792,6 +816,12 @@ fn update_mmfx_preview(
 }
 
 fn focus_editor_pane_from_mouse(editor: &mut EditorUi, mouse: MouseEvent) {
+    // Pointer motion must never steal keyboard focus. Besides making the command
+    // prompt unpredictable, changing focus here hides the MMFX source pane as
+    // soon as the pointer crosses its border.
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
     let position = (mouse.column, mouse.row).into();
     if editor.prompt_area.contains(position) {
         editor.pane_focus = EditorPaneFocus::Command;
@@ -832,17 +862,6 @@ fn scroll_inspector(editor: &mut EditorUi, amount: i32) {
             .saturating_add(u16::try_from(amount).unwrap_or(u16::MAX))
             .min(editor.inspector_max_scroll)
     };
-}
-
-fn restore_editor_cursor(position: (u16, u16)) -> Result<(), String> {
-    let mut stdout = std::io::stdout().lock();
-    stdout
-        .queue(MoveTo(position.0, position.1))
-        .and_then(|stdout| stdout.queue(Show))
-        .map_err(|error| format!("cannot restore editor prompt cursor: {error}"))?;
-    stdout
-        .flush()
-        .map_err(|error| format!("cannot restore editor prompt cursor: {error}"))
 }
 
 fn read_pending_editor_events() -> Result<Vec<Event>, String> {
@@ -938,16 +957,7 @@ fn handle_editor_key(
         if editor.pane_focus == EditorPaneFocus::Code {
             editor.inspector_focus = InspectorFocus::Mmfx;
         }
-        editor.message = format!(
-            "{} focused. Tab changes focus; {}.",
-            editor.pane_focus.label(),
-            match editor.pane_focus {
-                EditorPaneFocus::Command => "Ctrl-Space completes",
-                EditorPaneFocus::Timeline => "Ctrl-Space plays or pauses",
-                EditorPaneFocus::Inspector => "arrows and Page Up/Down scroll",
-                EditorPaneFocus::Code => "type to edit; Ctrl-S saves; Esc returns to commands",
-            }
-        );
+        editor.message = format!("{} focused.", editor.pane_focus.label());
         return Ok(false);
     }
 
@@ -985,18 +995,14 @@ fn handle_editor_key(
                 editor.input = "redo".into();
                 return execute_editor_input(app, session, history, editor, now, host);
             }
-            KeyCode::Left | KeyCode::Right => {
-                if editor.pane_focus == EditorPaneFocus::Timeline
-                    && let Some(app) = app.as_ref()
-                {
-                    editor
-                        .timeline
-                        .sync_total_frames(local_timeline_frame_count(session));
-                    editor
-                        .timeline
-                        .pan_half_page(matches!(key.code, KeyCode::Right));
-                    editor.message = timeline_view_message(app, &editor.timeline);
-                }
+            KeyCode::Left | KeyCode::Right if editor.pane_focus == EditorPaneFocus::Timeline => {
+                editor
+                    .timeline
+                    .sync_total_frames(local_timeline_frame_count(session));
+                editor
+                    .timeline
+                    .pan_half_page(matches!(key.code, KeyCode::Right));
+                editor.message = timeline_view_message_optional(app.as_ref(), &editor.timeline);
             }
             _ => {}
         }
@@ -1024,70 +1030,124 @@ fn handle_editor_key(
     if editor.pane_focus == EditorPaneFocus::Timeline {
         match key.code {
             KeyCode::Char('+' | '-') => {
-                if let Some(app) = app.as_ref() {
-                    editor
-                        .timeline
-                        .sync_total_frames(local_timeline_frame_count(session));
-                    let direction = if matches!(key.code, KeyCode::Char('+')) {
-                        TimelineZoom::In
-                    } else {
-                        TimelineZoom::Out
-                    };
-                    editor
-                        .timeline
-                        .zoom_around_frame(app.playback.frame_index(), direction);
-                    editor.message = timeline_view_message(app, &editor.timeline);
-                }
+                editor
+                    .timeline
+                    .sync_total_frames(local_timeline_frame_count(session));
+                let direction = if matches!(key.code, KeyCode::Char('+')) {
+                    TimelineZoom::In
+                } else {
+                    TimelineZoom::Out
+                };
+                let anchor = if local_timeline_frame_count(session) == 0 {
+                    let range = editor.timeline.visible_range();
+                    range.start + editor.timeline.visible_frame_count() / 2
+                } else {
+                    editor.timeline_playhead
+                };
+                editor.timeline.zoom_around_frame(anchor, direction);
+                editor.message = timeline_view_message_optional(app.as_ref(), &editor.timeline);
             }
             KeyCode::Char('0') => {
-                if let Some(app) = app.as_ref() {
-                    editor
-                        .timeline
-                        .sync_total_frames(local_timeline_frame_count(session));
-                    editor.timeline.fit();
-                    editor.message = timeline_view_message(app, &editor.timeline);
-                }
+                editor
+                    .timeline
+                    .sync_total_frames(local_timeline_frame_count(session));
+                editor.timeline.fit();
+                editor.message = timeline_view_message_optional(app.as_ref(), &editor.timeline);
+            }
+            KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                editor
+                    .timeline
+                    .sync_total_frames(local_timeline_frame_count(session));
+                editor
+                    .timeline
+                    .pan_half_page(matches!(key.code, KeyCode::Right));
+                editor.message = timeline_view_message_optional(app.as_ref(), &editor.timeline);
             }
             KeyCode::Left | KeyCode::Right => {
-                let amount = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    10
-                } else {
-                    1
-                };
+                let amount = 1_usize;
                 if let Some(app) = app.as_mut() {
-                    app.step(
-                        if matches!(key.code, KeyCode::Left) {
-                            -amount
-                        } else {
-                            amount
-                        },
-                        now,
-                    )?;
-                    editor.timeline.reveal(app.playback.frame_index());
-                    editor.message = format!("scrub: {}", app.timecode(app.playback.frame_index()));
+                    let local = if matches!(key.code, KeyCode::Left) {
+                        editor.timeline_playhead.saturating_sub(amount)
+                    } else {
+                        editor
+                            .timeline_playhead
+                            .saturating_add(amount)
+                            .min(local_timeline_frame_count(session).saturating_sub(1))
+                    };
+                    editor.project_playhead = seek_local_timeline_frame(app, session, local, now)?;
+                    editor.timeline_playhead =
+                        displayed_timeline_playhead(session, app, editor.project_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = project_scrub_message(session, editor.project_playhead);
+                } else {
+                    editor.timeline_playhead = if matches!(key.code, KeyCode::Left) {
+                        editor.timeline_playhead.saturating_sub(amount)
+                    } else {
+                        editor
+                            .timeline_playhead
+                            .saturating_add(amount)
+                            .min(local_timeline_frame_count(session).saturating_sub(1))
+                    };
+                    editor.project_playhead =
+                        project_frame_for_local_timeline(session, editor.timeline_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = format!("timeline frame {}", editor.timeline_playhead);
                 }
             }
             KeyCode::PageUp | KeyCode::PageDown => {
                 if let Some(app) = app.as_mut() {
-                    let amount =
-                        isize::try_from(app.nominal_frames_per_second()).unwrap_or(isize::MAX);
-                    app.step(
-                        if matches!(key.code, KeyCode::PageUp) {
-                            -amount
-                        } else {
-                            amount
-                        },
-                        now,
-                    )?;
-                    editor.timeline.reveal(app.playback.frame_index());
-                    editor.message = format!("scrub: {}", app.timecode(app.playback.frame_index()));
+                    let amount = project_nominal_frames_per_second(session);
+                    let local = if matches!(key.code, KeyCode::PageUp) {
+                        editor.timeline_playhead.saturating_sub(amount)
+                    } else {
+                        editor
+                            .timeline_playhead
+                            .saturating_add(amount)
+                            .min(local_timeline_frame_count(session).saturating_sub(1))
+                    };
+                    editor.project_playhead = seek_local_timeline_frame(app, session, local, now)?;
+                    editor.timeline_playhead =
+                        displayed_timeline_playhead(session, app, editor.project_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = project_scrub_message(session, editor.project_playhead);
+                } else {
+                    let amount = project_nominal_frames_per_second(session);
+                    editor.timeline_playhead = if matches!(key.code, KeyCode::PageUp) {
+                        editor.timeline_playhead.saturating_sub(amount)
+                    } else {
+                        editor
+                            .timeline_playhead
+                            .saturating_add(amount)
+                            .min(local_timeline_frame_count(session).saturating_sub(1))
+                    };
+                    editor.project_playhead =
+                        project_frame_for_local_timeline(session, editor.timeline_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = format!("timeline frame {}", editor.timeline_playhead);
                 }
             }
             KeyCode::Home | KeyCode::End => {
                 if let Some(app) = app.as_mut() {
-                    app.handle_key(key, now)?;
-                    editor.timeline.reveal(app.playback.frame_index());
-                    editor.message = format!("scrub: {}", app.timecode(app.playback.frame_index()));
+                    let local = if matches!(key.code, KeyCode::Home) {
+                        0
+                    } else {
+                        local_timeline_frame_count(session).saturating_sub(1)
+                    };
+                    editor.project_playhead = seek_local_timeline_frame(app, session, local, now)?;
+                    editor.timeline_playhead =
+                        displayed_timeline_playhead(session, app, editor.project_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = project_scrub_message(session, editor.project_playhead);
+                } else {
+                    editor.timeline_playhead = if matches!(key.code, KeyCode::Home) {
+                        0
+                    } else {
+                        local_timeline_frame_count(session).saturating_sub(1)
+                    };
+                    editor.project_playhead =
+                        project_frame_for_local_timeline(session, editor.timeline_playhead);
+                    editor.timeline.reveal(editor.timeline_playhead);
+                    editor.message = format!("timeline frame {}", editor.timeline_playhead);
                 }
             }
             KeyCode::Esc => {
@@ -1253,7 +1313,7 @@ fn refresh_open_mmfx_from_project(session: &EditorSession, editor: &mut EditorUi
         }
         editor.pane_focus = EditorPaneFocus::Command;
         editor.inspector_focus = InspectorFocus::Context;
-        editor.message = "Project history left the edited FX object; source editor closed.".into();
+        editor.message = "Project history left the edited scene; source editor closed.".into();
         return;
     };
     let Some(document) = editor.mmfx.as_mut() else {
@@ -1431,11 +1491,16 @@ fn handle_editor_mouse(
         .sync_total_frames(local_timeline_frame_count(session));
     let relative = usize::from(mouse.column.saturating_sub(editor.timeline_area.x));
     let width = usize::from(editor.timeline_area.width);
+    if width == 0 {
+        return Ok(());
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
-            let source_frame = editor.timeline.frame_at_column(relative, width);
-            app.seek_frame(source_frame, now)?;
-            editor.message = format!("scrub: {}", app.timecode(app.playback.frame_index()));
+            let local_frame = editor.timeline.frame_at_column(relative, width);
+            editor.project_playhead = seek_local_timeline_frame(app, session, local_frame, now)?;
+            editor.timeline_playhead =
+                displayed_timeline_playhead(session, app, editor.project_playhead);
+            editor.message = project_scrub_message(session, editor.project_playhead);
         }
         MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
             editor
@@ -1472,6 +1537,71 @@ fn handle_editor_mouse(
     Ok(())
 }
 
+fn handle_fx_only_timeline_mouse(
+    session: &EditorSession,
+    editor: &mut EditorUi,
+    mouse: MouseEvent,
+) {
+    if !editor
+        .timeline_area
+        .contains((mouse.column, mouse.row).into())
+    {
+        return;
+    }
+    editor
+        .timeline
+        .sync_total_frames(local_timeline_frame_count(session));
+    let relative = usize::from(mouse.column.saturating_sub(editor.timeline_area.x));
+    let width = usize::from(editor.timeline_area.width);
+    if width == 0 {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+            editor.timeline_playhead = editor.timeline.frame_at_column(relative, width);
+            editor.project_playhead =
+                project_frame_for_local_timeline(session, editor.timeline_playhead);
+            editor.message = format!("timeline frame {}", editor.timeline_playhead);
+        }
+        MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+            editor
+                .timeline
+                .zoom_at_column(relative, width, TimelineZoom::In);
+            editor.message = timeline_view_message_optional(None, &editor.timeline);
+        }
+        MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::CONTROL) => {
+            editor
+                .timeline
+                .zoom_at_column(relative, width, TimelineZoom::Out);
+            editor.message = timeline_view_message_optional(None, &editor.timeline);
+        }
+        MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+            editor.timeline.pan_half_page(false);
+            editor.message = timeline_view_message_optional(None, &editor.timeline);
+        }
+        MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+            editor.timeline.pan_half_page(true);
+            editor.message = timeline_view_message_optional(None, &editor.timeline);
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let amount = project_nominal_frames_per_second(session);
+            editor.timeline_playhead = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                editor.timeline_playhead.saturating_sub(amount)
+            } else {
+                editor
+                    .timeline_playhead
+                    .saturating_add(amount)
+                    .min(local_timeline_frame_count(session).saturating_sub(1))
+            };
+            editor.project_playhead =
+                project_frame_for_local_timeline(session, editor.timeline_playhead);
+            editor.timeline.reveal(editor.timeline_playhead);
+            editor.message = format!("timeline frame {}", editor.timeline_playhead);
+        }
+        _ => {}
+    }
+}
+
 fn timeline_view_message(app: &PreviewApp, timeline: &TimelineViewport) -> String {
     let range = timeline.visible_range();
     let mode = if timeline.is_fitted() { "fit" } else { "zoom" };
@@ -1480,6 +1610,22 @@ fn timeline_view_message(app: &PreviewApp, timeline: &TimelineViewport) -> Strin
         app.timecode(range.start),
         app.timecode(range.end),
         timeline.visible_frame_count(),
+    )
+}
+
+fn timeline_view_message_optional(app: Option<&PreviewApp>, timeline: &TimelineViewport) -> String {
+    app.map_or_else(
+        || {
+            let range = timeline.visible_range();
+            let mode = if timeline.is_fitted() { "fit" } else { "zoom" };
+            format!(
+                "timeline {mode}: {}..{} ({} frames)",
+                range.start,
+                range.end,
+                timeline.visible_frame_count(),
+            )
+        },
+        |app| timeline_view_message(app, timeline),
     )
 }
 
@@ -1556,6 +1702,37 @@ fn execute_editor_input(
                 Ok(()) => return Ok(true),
                 Err(error) => editor.message = format!("error: {error}"),
             }
+            return Ok(false);
+        }
+        CommandOutput::MonitorRequested { target } => {
+            let scope = match target {
+                MonitorTarget::Project => MonitorScope::Project,
+                MonitorTarget::Local => MonitorScope::Local,
+                MonitorTarget::Toggle => match editor.monitor_scope {
+                    MonitorScope::Project => MonitorScope::Local,
+                    MonitorScope::Local => MonitorScope::Project,
+                },
+                _ => editor.monitor_scope,
+            };
+            editor.monitor_scope = scope;
+            editor.project_compositor_state = None;
+            editor.timeline_monitor_key = None;
+            if let Some(image) = &mut editor.timeline_monitor_image {
+                image.empty();
+            }
+            if let Some(app) = app.as_mut() {
+                app.clear_kitty()?;
+                app.image_frame = None;
+                app.composed_frame = None;
+            }
+            let context = session
+                .project()
+                .display_path(session.path())
+                .unwrap_or_else(|_| "/".into());
+            editor.message = match scope {
+                MonitorScope::Project => "ok: Project Monitor selected".into(),
+                MonitorScope::Local => format!("ok: Local Monitor selected — {context}"),
+            };
             return Ok(false);
         }
         CommandOutput::ImportRequested { locator, alias } => {
@@ -1721,9 +1898,9 @@ fn execute_editor_input(
                 });
             match result {
                 Ok(path) => {
-                    open_current_mmfx_editor(app, session, editor)?;
+                    open_current_mmfx_editor(session, editor)?;
                     editor.message = format!(
-                        "ok: loaded {} into the focused FX object as embedded source",
+                        "ok: loaded {} into the focused scene as embedded source",
                         path.display()
                     );
                 }
@@ -1739,8 +1916,8 @@ fn execute_editor_input(
             return Ok(false);
         }
         CommandOutput::FxEditRequested => {
-            open_current_mmfx_editor(app, session, editor)?;
-            editor.message = "Editing the focused FX object's embedded MMFX source.".into();
+            open_current_mmfx_editor(session, editor)?;
+            editor.message = "Editing the focused scene's embedded MMFX source.".into();
             return Ok(false);
         }
         CommandOutput::FxCloseRequested => {
@@ -1809,7 +1986,7 @@ fn sync_open_mmfx_context(session: &EditorSession, editor: &mut EditorUi, now: I
         editor.inspector_focus = InspectorFocus::Context;
         editor
             .message
-            .push_str("  (MMFX editor closed: another FX object is focused)");
+            .push_str("  (MMFX editor closed: another scene is focused)");
         return;
     }
     if let Some(document) = editor.mmfx.as_mut()
@@ -1822,21 +1999,14 @@ fn sync_open_mmfx_context(session: &EditorSession, editor: &mut EditorUi, now: I
     }
 }
 
-fn open_current_mmfx_editor(
-    app: &mut Option<PreviewApp>,
-    session: &EditorSession,
-    editor: &mut EditorUi,
-) -> Result<(), String> {
+fn open_current_mmfx_editor(session: &EditorSession, editor: &mut EditorUi) -> Result<(), String> {
     let (media_id, payload) = session
         .current_mmfx_source()
         .map_err(|error| error.to_string())?;
     let media = session
         .project()
         .media(media_id)
-        .ok_or_else(|| "focused FX object disappeared".to_owned())?;
-    if let Some(media_preview) = app.as_mut() {
-        media_preview.clear_kitty()?;
-    }
+        .ok_or_else(|| "focused MMFX scene disappeared".to_owned())?;
     editor.mmfx_generation = editor.mmfx_generation.wrapping_add(1);
     editor.mmfx = Some(MmfxDocument::new(
         media_id,
@@ -2081,7 +2251,7 @@ fn event_loop(
     let mut last_frame = usize::MAX;
     let mut last_status = "";
     loop {
-        app.tick(Instant::now())?;
+        app.tick(Instant::now(), true)?;
         let resized = receive_resized_images(app, completed);
         let current = app.playback.frame_index();
         let status = app.status();
@@ -2155,7 +2325,7 @@ struct TimelineThumbnailer {
     commands: Option<mpsc::Sender<ThumbnailCommand>>,
     results: Receiver<ThumbnailResult>,
     worker: Option<JoinHandle<()>>,
-    requested: Vec<usize>,
+    pending: BTreeSet<usize>,
 }
 
 impl TimelineThumbnailer {
@@ -2170,18 +2340,23 @@ impl TimelineThumbnailer {
             commands: Some(command_tx),
             results: result_rx,
             worker: Some(worker),
-            requested: Vec::new(),
+            pending: BTreeSet::new(),
         })
     }
 
     fn request(&mut self, frames: Vec<usize>) {
-        if self.requested == frames {
+        let pending = frames.iter().copied().collect::<BTreeSet<_>>();
+        if self.pending == pending {
             return;
         }
-        self.requested.clone_from(&frames);
+        self.pending = pending;
         if let Some(commands) = &self.commands {
             let _ = commands.send(ThumbnailCommand::Request(frames));
         }
+    }
+
+    fn completed(&mut self, frame_index: usize) {
+        self.pending.remove(&frame_index);
     }
 }
 
@@ -2478,6 +2653,7 @@ fn load_aac_source(
                 source,
                 generation,
                 audio_minus_video,
+                backend: None,
             }),
             None,
         ),
@@ -2500,6 +2676,7 @@ struct PreviewApp {
     image_state: Option<ThreadProtocol>,
     kitty: Option<KittyStreamer>,
     image_frame: Option<usize>,
+    composed_frame: Option<(usize, u64)>,
     thumbnailer: Option<TimelineThumbnailer>,
     thumbnails: BTreeMap<usize, RgbImage>,
     timeline_thumbnail_frames: Vec<usize>,
@@ -2516,6 +2693,7 @@ struct AacPlaybackState {
     source: AacPlaybackSource,
     generation: u64,
     audio_minus_video: f64,
+    backend: Option<AacDecodeBackend>,
 }
 
 impl PreviewApp {
@@ -2551,6 +2729,7 @@ impl PreviewApp {
             kitty: direct_kitty.then(KittyStreamer::new).transpose()?,
             picker,
             image_frame: None,
+            composed_frame: None,
             thumbnailer,
             thumbnails: BTreeMap::new(),
             timeline_thumbnail_frames: Vec::new(),
@@ -2568,7 +2747,7 @@ impl PreviewApp {
         })
     }
 
-    fn tick(&mut self, now: Instant) -> Result<(), String> {
+    fn tick(&mut self, now: Instant, update_image: bool) -> Result<(), String> {
         self.poll_decoder()?;
         self.poll_audio(now);
         self.poll_timeline_thumbnails();
@@ -2617,7 +2796,11 @@ impl PreviewApp {
             self.resume_when_buffered = false;
             self.play_playback(now);
         }
-        self.update_image(current)
+        if update_image {
+            self.update_image(current)
+        } else {
+            Ok(())
+        }
     }
 
     fn thumbnail_revision(&self) -> u64 {
@@ -2664,6 +2847,7 @@ impl PreviewApp {
         while let Ok(result) = thumbnailer.results.try_recv() {
             match result {
                 ThumbnailResult::Ready { frame_index, image } => {
+                    thumbnailer.completed(frame_index);
                     self.thumbnails.insert(frame_index, image);
                     changed = true;
                 }
@@ -2827,7 +3011,12 @@ impl PreviewApp {
                 }
             };
             match event {
-                AacPlaybackEvent::Decoded { generation, audio } if generation == aac.generation => {
+                AacPlaybackEvent::Decoded {
+                    generation,
+                    audio,
+                    backend,
+                } if generation == aac.generation => {
+                    aac.backend = Some(backend);
                     match AudioOutput::open(*audio, aac.audio_minus_video) {
                         Ok(output) => {
                             if let Err(error) = output.seek(self.playback.position()) {
@@ -2932,11 +3121,12 @@ impl PreviewApp {
         let Some(video_frame) = self.frames.get(&frame_index) else {
             return Ok(());
         };
-        let bounds = if self.kitty.is_some() {
-            native_pixel_bounds(video_frame)?
-        } else {
-            fallback_pixel_bounds(self.terminal_size, self.picker.font_size())
-        };
+        let bounds = monitor_pixel_bounds(
+            self.preview_area,
+            self.picker.font_size(),
+            (video_frame.width, video_frame.height),
+            self.kitty.is_some(),
+        );
         let image = video_frame_image(video_frame, bounds)?;
         if let Some(kitty) = &mut self.kitty {
             kitty.queue(frame_index, image.into_rgb8());
@@ -2947,9 +3137,70 @@ impl PreviewApp {
         Ok(())
     }
 
+    fn update_image_with_compositor(
+        &mut self,
+        frame_index: usize,
+        timeline_frame: usize,
+        compositor: &mut ProjectCompositor,
+    ) -> Result<(), String> {
+        if self.image_frame == Some(frame_index)
+            || self
+                .kitty
+                .as_ref()
+                .is_some_and(|kitty| kitty.queued_frame() == Some(frame_index))
+        {
+            return Ok(());
+        }
+        let Some(video_frame) = self.frames.get(&frame_index) else {
+            return Ok(());
+        };
+        let bounds = monitor_pixel_bounds(
+            self.preview_area,
+            self.picker.font_size(),
+            (video_frame.width, video_frame.height),
+            self.kitty.is_some(),
+        );
+        let mut image = video_frame_image(video_frame, bounds)?.to_rgba8();
+        compositor
+            .composite_rgba8_preview(timeline_frame_i64(timeline_frame), &mut image)
+            .map_err(|error| error.to_string())?;
+        let image = DynamicImage::ImageRgba8(image);
+        if let Some(kitty) = &mut self.kitty {
+            kitty.queue(frame_index, image.into_rgb8());
+        } else if let Some(image_state) = &mut self.image_state {
+            image_state.replace_protocol(self.picker.new_resize_protocol(image));
+            self.image_frame = Some(frame_index);
+        }
+        Ok(())
+    }
+
+    fn update_timeline_composition(
+        &mut self,
+        compositor: &mut ProjectCompositor,
+        timeline_frame: usize,
+    ) -> Result<(), String> {
+        let frame_index = self.playback.frame_index();
+        let signature = compositor.active_signature(timeline_frame_i64(timeline_frame));
+        if self.composed_frame == Some((frame_index, signature)) {
+            return Ok(());
+        }
+        if !self.frames.contains_key(&frame_index) {
+            self.composed_frame = None;
+            return Ok(());
+        }
+        self.image_frame = None;
+        if let Some(kitty) = &mut self.kitty {
+            kitty.discard_queued();
+        }
+        self.update_image_with_compositor(frame_index, timeline_frame, compositor)?;
+        self.composed_frame = Some((frame_index, signature));
+        Ok(())
+    }
+
     fn set_terminal_size(&mut self, size: Size) {
         if self.terminal_size != size {
             self.terminal_size = size;
+            self.composed_frame = None;
             if self.kitty.is_none() {
                 self.image_frame = None;
             }
@@ -2979,6 +3230,7 @@ impl PreviewApp {
         }
         self.playback_range = range;
         self.image_frame = None;
+        self.composed_frame = None;
         self.seek_frame(target, now)
     }
 
@@ -3047,6 +3299,9 @@ impl PreviewApp {
 
 fn reset_editor_timeline(editor: &mut EditorUi, total_frames: usize) {
     editor.timeline.reset(total_frames);
+    editor.project_playhead = 0;
+    editor.timeline_playhead = 0;
+    editor.timeline_context = None;
     editor.timeline_raster_key = None;
     if let Some(image) = &mut editor.timeline_image {
         image.empty();
@@ -3061,6 +3316,140 @@ fn local_timeline_frame_count(session: &EditorSession) -> usize {
         .and_then(|media_id| session.project().media(media_id))
         .and_then(|media| usize::try_from(media.duration.value).ok())
         .unwrap_or(0)
+}
+
+fn project_nominal_frames_per_second(session: &EditorSession) -> usize {
+    let rate = session.project().settings().frame_rate;
+    let numerator = usize::try_from(rate.numerator()).unwrap_or(1);
+    let denominator = usize::try_from(rate.denominator()).unwrap_or(1).max(1);
+    numerator.div_ceil(denominator).max(1)
+}
+
+fn timeline_frame_i64(frame: usize) -> i64 {
+    i64::try_from(frame).unwrap_or(i64::MAX)
+}
+
+fn synchronize_project_compositor(
+    editor: &mut EditorUi,
+    session: &EditorSession,
+    host: &EditorHost<'_>,
+) -> bool {
+    // Source edits are already debounced for the worker preview. Do not make the
+    // project compositor synchronously parse every intermediate keystroke too.
+    if editor
+        .mmfx
+        .as_ref()
+        .is_some_and(|document| document.compile_due.is_some())
+    {
+        return false;
+    }
+    let context = monitor_context(session, editor.monitor_scope);
+    let state = (session.revision(), context);
+    if editor.project_compositor_state == Some(state) {
+        return false;
+    }
+    let project_directory = session.project_file().and_then(Path::parent);
+    let sync =
+        editor
+            .project_compositor
+            .synchronize(session.project(), context, |_, source, scene| {
+                let base_directory = source
+                    .resource_base
+                    .as_deref()
+                    .or(project_directory)
+                    .unwrap_or(host.base_directory);
+                crate::load_mmfx_resources(scene, base_directory)
+            });
+    if let Some(diagnostic) = sync.diagnostics.last() {
+        editor.message = format!(
+            "error: MMFX {} (last valid timeline preview retained)",
+            diagnostic.message
+        );
+    }
+    editor.project_compositor_state = Some(state);
+    sync.changed
+}
+
+fn update_compositor_only_monitor(
+    editor: &mut EditorUi,
+    session: &EditorSession,
+    picker: &Picker,
+) -> bool {
+    let mut changed = false;
+    if editor.project_compositor.has_layers() {
+        let settings = session.project().settings();
+        let playhead = monitor_playhead(editor);
+        let key = TimelineMonitorKey {
+            canvas: (settings.width, settings.height),
+            scope: editor.monitor_scope,
+            playhead,
+            active_signature: editor
+                .project_compositor
+                .active_signature(timeline_frame_i64(playhead)),
+        };
+        if editor.timeline_monitor_key.as_ref() != Some(&key) {
+            let mut composed =
+                monitor_background(settings.width, settings.height, editor.monitor_scope);
+            if let Err(error) = editor
+                .project_compositor
+                .composite_rgba8(timeline_frame_i64(playhead), &mut composed)
+            {
+                editor.message = format!("error: cannot compose MMFX monitor: {error}");
+            }
+            if let Some(buffer) = &mut editor.timeline_monitor_image {
+                buffer.replace_protocol(
+                    picker.new_resize_protocol(DynamicImage::ImageRgba8(composed)),
+                );
+            }
+            editor.timeline_monitor_key = Some(key);
+            changed = true;
+        }
+    } else if editor.timeline_monitor_key.take().is_some() {
+        if let Some(image) = &mut editor.timeline_monitor_image {
+            image.empty();
+        }
+        changed = true;
+    }
+    if let Some(buffer) = &mut editor.timeline_monitor_image {
+        let (received, error) = buffer.poll();
+        changed |= received;
+        if let Some(error) = error {
+            editor.message = format!("error: cannot resize MMFX timeline preview: {error}");
+        }
+    }
+    changed
+}
+
+fn monitor_context(session: &EditorSession, scope: MonitorScope) -> MediaId {
+    match scope {
+        MonitorScope::Project => session.project().root_id(),
+        MonitorScope::Local => session
+            .project()
+            .resolve_path(session.path())
+            .unwrap_or_else(|_| session.project().root_id()),
+    }
+}
+
+const fn monitor_playhead(editor: &EditorUi) -> usize {
+    match editor.monitor_scope {
+        MonitorScope::Project => editor.project_playhead,
+        MonitorScope::Local => editor.timeline_playhead,
+    }
+}
+
+fn monitor_uses_video(scope: MonitorScope, session: &EditorSession, app: &PreviewApp) -> bool {
+    scope == MonitorScope::Project || timeline_preview_mapping(session, app).is_some()
+}
+
+fn monitor_background(width: u32, height: u32, scope: MonitorScope) -> image::RgbaImage {
+    if scope == MonitorScope::Project {
+        return image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]));
+    }
+    image::RgbaImage::from_fn(width, height, |x, y| {
+        let light = ((x / 24) + (y / 24)).is_multiple_of(2);
+        let value = if light { 58 } else { 38 };
+        image::Rgba([value, value, value, 255])
+    })
 }
 
 fn timeline_object_lanes(
@@ -3121,31 +3510,196 @@ fn timeline_preview_mapping(
     app: &PreviewApp,
 ) -> Option<TimelinePreviewMapping> {
     let project = session.project();
-    if let Some(link_id) = session.path().current_link()
-        && let Some(link) = project.link(link_id)
-        && let Some(media) = project.media(link.media_id)
-        && media_matches_preview(media, app)
-    {
-        let end = usize::try_from(media.duration.value).ok()?;
-        return Some(TimelinePreviewMapping {
-            timeline: 0..end,
-            source: 0..app.frame_count(),
-        });
-    }
-    for entry in project.list(session.path()).ok()? {
-        let link = project.link(entry.link_id)?;
-        let media = project.media(link.media_id)?;
+    let context = project.resolve_path(session.path()).ok()?;
+    for placement in mmrecode_render::flatten_project_timeline(project, context).ok()? {
+        let media = project.media(placement.media_id)?;
         if !media_matches_preview(media, app) {
             continue;
         }
         return Some(TimelinePreviewMapping {
-            timeline: usize::try_from(link.timeline_range.start.value).ok()?
-                ..usize::try_from(link.timeline_range.end.value).ok()?,
-            source: usize::try_from(link.source_range.start.value).ok()?
-                ..usize::try_from(link.source_range.end.value).ok()?,
+            timeline: usize::try_from(placement.timeline_range.start).ok()?
+                ..usize::try_from(placement.timeline_range.end).ok()?,
+            source: usize::try_from(placement.source_range.start).ok()?
+                ..usize::try_from(placement.source_range.end).ok()?,
         });
     }
     None
+}
+
+fn project_preview_mapping(
+    session: &EditorSession,
+    app: &PreviewApp,
+) -> Option<TimelinePreviewMapping> {
+    let project = session.project();
+    for placement in mmrecode_render::flatten_project_timeline(project, project.root_id()).ok()? {
+        let media = project.media(placement.media_id)?;
+        if !media_matches_preview(media, app) {
+            continue;
+        }
+        return Some(TimelinePreviewMapping {
+            timeline: usize::try_from(placement.timeline_range.start).ok()?
+                ..usize::try_from(placement.timeline_range.end).ok()?,
+            source: usize::try_from(placement.source_range.start).ok()?
+                ..usize::try_from(placement.source_range.end).ok()?,
+        });
+    }
+    None
+}
+
+fn current_context_project_mapping(session: &EditorSession) -> Option<TimelinePreviewMapping> {
+    if session.path().links().is_empty() {
+        return None;
+    }
+    let project = session.project();
+    mmrecode_render::flatten_project_timeline(project, project.root_id())
+        .ok()?
+        .into_iter()
+        .find(|placement| placement.link_path == session.path().links())
+        .and_then(|placement| {
+            Some(TimelinePreviewMapping {
+                timeline: usize::try_from(placement.timeline_range.start).ok()?
+                    ..usize::try_from(placement.timeline_range.end).ok()?,
+                source: usize::try_from(placement.source_range.start).ok()?
+                    ..usize::try_from(placement.source_range.end).ok()?,
+            })
+        })
+}
+
+fn project_timeline_playhead(session: &EditorSession, app: &PreviewApp) -> usize {
+    let source_frame = app.playback.frame_index();
+    let Some(mapping) = project_preview_mapping(session, app) else {
+        return source_frame;
+    };
+    timeline_frame_for_source(&mapping, source_frame)
+}
+
+fn local_timeline_playhead(session: &EditorSession, project_frame: usize) -> usize {
+    current_context_project_mapping(session).map_or(project_frame, |mapping| {
+        source_frame_for_timeline(&mapping, project_frame)
+    })
+}
+
+fn displayed_timeline_playhead(
+    session: &EditorSession,
+    app: &PreviewApp,
+    project_frame: usize,
+) -> usize {
+    let focused_is_preview = session
+        .project()
+        .resolve_path(session.path())
+        .ok()
+        .and_then(|media_id| session.project().media(media_id))
+        .is_some_and(|media| media_matches_preview(media, app));
+    if focused_is_preview {
+        app.playback.frame_index()
+    } else {
+        local_timeline_playhead(session, project_frame)
+    }
+}
+
+fn project_frame_for_local_timeline(session: &EditorSession, local_frame: usize) -> usize {
+    current_context_project_mapping(session).map_or(local_frame, |mapping| {
+        timeline_frame_for_source(&mapping, local_frame)
+    })
+}
+
+fn seek_local_timeline_frame(
+    app: &mut PreviewApp,
+    session: &EditorSession,
+    local_frame: usize,
+    now: Instant,
+) -> Result<usize, String> {
+    let project_frame = project_frame_for_local_timeline(session, local_frame);
+    let focused_is_preview = session
+        .project()
+        .resolve_path(session.path())
+        .ok()
+        .and_then(|media_id| session.project().media(media_id))
+        .is_some_and(|media| media_matches_preview(media, app));
+    let source_frame = if focused_is_preview {
+        local_frame.clamp(
+            app.playback_range.start,
+            app.playback_range.end.saturating_sub(1),
+        )
+    } else {
+        project_preview_mapping(session, app).map_or(project_frame, |mapping| {
+            source_frame_for_timeline(&mapping, project_frame)
+        })
+    };
+    app.seek_frame(source_frame, now)?;
+    Ok(project_timeline_playhead(session, app))
+}
+
+fn project_scrub_message(session: &EditorSession, project_frame: usize) -> String {
+    format!(
+        "project scrub: {}",
+        project_timecode(session, project_frame)
+    )
+}
+
+fn project_timecode(session: &EditorSession, project_frame: usize) -> String {
+    let project = session.project();
+    project
+        .media(project.root_id())
+        .and_then(|root| {
+            i64::try_from(project_frame)
+                .ok()
+                .and_then(|frame| format_compact_timecode(frame, root.time_base).ok())
+        })
+        .unwrap_or_else(|| format!("frame {project_frame}"))
+}
+
+fn synchronize_timeline_context(editor: &mut EditorUi, session: &EditorSession) -> bool {
+    let Ok(context) = session.project().resolve_path(session.path()) else {
+        return false;
+    };
+    if editor.timeline_context == Some(context) {
+        return false;
+    }
+    editor.timeline_context = Some(context);
+    editor.timeline_playhead = local_timeline_playhead(session, editor.project_playhead);
+    editor.timeline.reset(local_timeline_frame_count(session));
+    editor.timeline.reveal(editor.timeline_playhead);
+    editor.timeline_raster_key = None;
+    true
+}
+
+fn source_frame_for_timeline(mapping: &TimelinePreviewMapping, timeline_frame: usize) -> usize {
+    let timeline_length = mapping.timeline.end.saturating_sub(mapping.timeline.start);
+    let source_length = mapping.source.end.saturating_sub(mapping.source.start);
+    if timeline_length == 0 || source_length == 0 {
+        return mapping.source.start;
+    }
+    let offset = timeline_frame
+        .saturating_sub(mapping.timeline.start)
+        .min(timeline_length.saturating_sub(1));
+    let source_offset =
+        usize::try_from(offset as u128 * source_length as u128 / timeline_length as u128)
+            .unwrap_or(source_length.saturating_sub(1));
+    mapping
+        .source
+        .start
+        .saturating_add(source_offset)
+        .min(mapping.source.end.saturating_sub(1))
+}
+
+fn timeline_frame_for_source(mapping: &TimelinePreviewMapping, source_frame: usize) -> usize {
+    let timeline_length = mapping.timeline.end.saturating_sub(mapping.timeline.start);
+    let source_length = mapping.source.end.saturating_sub(mapping.source.start);
+    if timeline_length == 0 || source_length == 0 {
+        return mapping.timeline.start;
+    }
+    let offset = source_frame
+        .saturating_sub(mapping.source.start)
+        .min(source_length.saturating_sub(1));
+    let timeline_offset =
+        usize::try_from(offset as u128 * timeline_length as u128 / source_length as u128)
+            .unwrap_or(timeline_length.saturating_sub(1));
+    mapping
+        .timeline
+        .start
+        .saturating_add(timeline_offset)
+        .min(mapping.timeline.end.saturating_sub(1))
 }
 
 fn visible_thumbnail_source_range(
@@ -3300,6 +3854,10 @@ impl KittyStreamer {
         self.queued.as_ref().map(|frame| frame.frame_index)
     }
 
+    fn discard_queued(&mut self) {
+        self.queued = None;
+    }
+
     fn flush(
         &mut self,
         preview_area: Rect,
@@ -3401,6 +3959,7 @@ impl KittyStreamer {
     }
 
     fn clear(&mut self) -> Result<(), String> {
+        self.queued = None;
         if self.active_slot.is_some() {
             let command = format!(
                 "\x1b_Ga=d,d=I,q=2,i={}\x1b\\\x1b_Ga=d,d=I,q=2,i={}\x1b\\",
@@ -3422,13 +3981,13 @@ impl KittyStreamer {
             // Best effort: the terminal normally deletes `t=t` transfers itself.
             let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_dir(&self.temp_directory);
     }
 }
 
 impl Drop for KittyStreamer {
     fn drop(&mut self) {
         self.clean_transfer_files();
+        let _ = std::fs::remove_dir(&self.temp_directory);
     }
 }
 
@@ -3509,7 +4068,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut PreviewApp) {
     let rate = app.playback.timeline().frame_rate();
     let protocol = app.protocol_label();
     let title = format!(
-        " {} | {} | {} / {} | {}/{} fps | {} ",
+        " {} | {} | Playhead {} | Duration {} | {}/{} fps | {} ",
         app.path,
         protocol,
         app.timecode(current),
@@ -3558,13 +4117,20 @@ fn draw_editor(
     app: Option<&mut PreviewApp>,
     session: &EditorSession,
     editor: &mut EditorUi,
+    picker: &Picker,
 ) {
     let mut app = app;
+    let timeline_objects = timeline_object_lanes(session, app.as_deref());
+    let maximum_timeline_height = frame.area().height.saturating_mul(2) / 5;
+    let timeline_height =
+        u16::try_from(10_usize.saturating_add(timeline_objects.len().saturating_mul(3)))
+            .unwrap_or(u16::MAX)
+            .clamp(10, maximum_timeline_height.max(10));
     let [header, workspace, timeline, result, prompt] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Percentage(55),
         Constraint::Min(10),
-        Constraint::Length(3),
+        Constraint::Length(timeline_height),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -3576,12 +4142,11 @@ fn draw_editor(
     let title = app.as_deref().map_or_else(
         || format!(" MMRecode | {breadcrumb}{dirty} | no media | editing "),
         |app| {
-            let current = app.playback.frame_index();
             let rate = app.playback.timeline().frame_rate();
             format!(
-                " MMRecode | {} | {} / {} | {}/{} fps | {} | {} ",
+                " MMRecode | {} | Playhead {} | Duration {} | {}/{} fps | {} | {} ",
                 format_args!("{breadcrumb}{dirty}"),
-                app.timecode(current),
+                project_timecode(session, editor.project_playhead),
                 app.timecode(app.frame_count()),
                 rate.numerator(),
                 rate.denominator(),
@@ -3592,25 +4157,54 @@ fn draw_editor(
     );
     frame.render_widget(Paragraph::new(title), header);
 
-    let monitor_title = editor.mmfx.as_ref().map_or_else(
-        || "Monitor".into(),
-        |document| {
+    let monitor_context = session
+        .project()
+        .display_path(session.path())
+        .unwrap_or_else(|_| "/".into());
+    let monitor_name = match editor.monitor_scope {
+        MonitorScope::Project => "Project Monitor".into(),
+        MonitorScope::Local => format!("Local Monitor — {monitor_context}"),
+    };
+    let monitor_title = editor
+        .mmfx
+        .as_ref()
+        .map_or(monitor_name.clone(), |document| {
             format!(
-                "MMFX Preview — {}{}",
+                "{monitor_name} — editing MMFX {}{}",
                 document.display_name(),
                 if session.is_dirty() { "*" } else { "" }
             )
-        },
-    );
+        });
     let image_block = Block::default().borders(Borders::ALL).title(monitor_title);
     let image_area = image_block.inner(preview);
-    if editor.mmfx.is_none()
-        && let Some(app) = app.as_deref_mut()
-    {
+    if let Some(app) = app.as_deref_mut() {
         app.preview_area = image_area;
     }
     frame.render_widget(image_block, preview);
-    if editor.mmfx.is_some() {
+    let monitor_video = app
+        .as_deref()
+        .is_some_and(|app| monitor_uses_video(editor.monitor_scope, session, app));
+    if let Some(image_state) = monitor_video
+        .then(|| app.as_deref_mut().and_then(|app| app.image_state.as_mut()))
+        .flatten()
+    {
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Fit(Some(FilterType::Triangle))),
+            image_area,
+            image_state,
+        );
+    } else if monitor_video && app.as_deref().is_some_and(|app| app.image_frame.is_none()) {
+        frame.render_widget(
+            Paragraph::new("Decoding edited frame…")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Yellow)),
+            image_area,
+        );
+    } else if !monitor_video && editor.project_compositor.has_layers() {
+        if let Some(state) = &mut editor.timeline_monitor_image {
+            state.render(frame, image_area);
+        }
+    } else if editor.mmfx.is_some() {
         if let Some(state) = &mut editor.mmfx_image {
             state.render(frame, image_area);
         }
@@ -3636,23 +4230,10 @@ fn draw_editor(
                 image_area,
             );
         }
-    } else if let Some(image_state) = app.as_deref_mut().and_then(|app| app.image_state.as_mut()) {
-        frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Fit(Some(FilterType::Triangle))),
-            image_area,
-            image_state,
-        );
-    } else if app.as_deref().is_some_and(|app| app.image_frame.is_none()) {
-        frame.render_widget(
-            Paragraph::new("Decoding edited frame…")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Yellow)),
-            image_area,
-        );
     } else if app.is_none() {
         frame.render_widget(
             Paragraph::new(
-                "No media loaded\n\nimport <media-file> [as <alias>]\n\nType help for commands",
+                "No preview open\n\nimport <media-file> [as <alias>]\nor add scene <name> <duration>\n\nType help for commands",
             )
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
@@ -3675,7 +4256,12 @@ fn draw_editor(
             editor_context_title(session, editor)
         );
         let inspector_text = editor_context_text(app.as_deref(), session, editor);
-        let inspector = Paragraph::new(inspector_text.as_str())
+        let inspector_content = if editor.inspector_focus == InspectorFocus::Help {
+            quick_help_rich_text(session)
+        } else {
+            Text::raw(inspector_text.as_str())
+        };
+        let inspector = Paragraph::new(inspector_content)
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -3698,10 +4284,11 @@ fn draw_editor(
         frame.render_widget(inspector.scroll((editor.inspector_scroll, 0)), context);
     }
 
-    editor
-        .timeline
-        .sync_total_frames(local_timeline_frame_count(session));
-    let timeline_objects = timeline_object_lanes(session, app.as_deref());
+    let local_frame_count = local_timeline_frame_count(session);
+    editor.timeline.sync_total_frames(local_frame_count);
+    editor.timeline_playhead = editor
+        .timeline_playhead
+        .min(local_frame_count.saturating_sub(1));
     let timeline_label = if editor.pane_focus == EditorPaneFocus::Timeline {
         "▶ Timeline"
     } else {
@@ -3724,9 +4311,22 @@ fn draw_editor(
                 )
             },
         );
-        format!(" {timeline_label} • {breadcrumb} • {mode} {view} • drag scrub • +/- zoom • 0 fit ")
-    } else {
+        let playhead = project_timecode(session, editor.project_playhead);
+        format!(" {timeline_label} • {breadcrumb} • Playhead {playhead} • {mode} {view} ")
+    } else if timeline_objects.is_empty() {
         format!(" {timeline_label} • {breadcrumb} • empty project ")
+    } else {
+        let mode = if editor.timeline.is_fitted() {
+            "fit"
+        } else {
+            "zoom"
+        };
+        format!(
+            " {timeline_label} • {breadcrumb} • Frame {} • {mode} • {} object{} ",
+            editor.timeline_playhead,
+            timeline_objects.len(),
+            if timeline_objects.len() == 1 { "" } else { "s" }
+        )
     };
     let timeline_block = Block::default()
         .borders(Borders::ALL)
@@ -3767,7 +4367,7 @@ fn draw_editor(
             height: pixel_height,
             visible: editor.timeline.visible_range(),
             retained: app.playback_range.clone(),
-            playhead: app.playback.frame_index(),
+            playhead: editor.timeline_playhead,
             thumbnail_revision: app.thumbnail_revision(),
             thumbnail_frames: app.timeline_thumbnail_frames.clone(),
             smart_render: smart_render.clone(),
@@ -3780,7 +4380,7 @@ fn draw_editor(
             let image = render_timeline(
                 &TimelineRasterInput {
                     viewport: &editor.timeline,
-                    playhead: app.playback.frame_index(),
+                    playhead: editor.timeline_playhead,
                     retained: app.playback_range.clone(),
                     thumbnail_frames: &app.timeline_thumbnail_frames,
                     thumbnails: &app.thumbnails,
@@ -3806,32 +4406,73 @@ fn draw_editor(
         }
         frame.render_widget(Paragraph::new(timeline_legend(app)), legend_area);
     } else {
-        editor.timeline_area = timeline_inner;
+        let raster_area = timeline_inner;
+        let label_width = raster_area.width.saturating_sub(1).min(20);
+        let [labels_area, image_area] =
+            Layout::horizontal([Constraint::Length(label_width), Constraint::Min(1)])
+                .areas(raster_area);
+        editor.timeline_area = image_area;
         frame.render_widget(
-            Paragraph::new(editor_timeline_text(
-                None,
-                &editor.timeline,
-                timeline_inner.width,
-            )),
-            timeline_inner,
+            Paragraph::new(timeline_object_labels(&timeline_objects)),
+            labels_area,
         );
+        let font_size = picker.font_size();
+        let (pixel_width, pixel_height) = timeline_pixel_dimensions(image_area, font_size);
+        let retained = 0..local_timeline_frame_count(session);
+        let key = TimelineRasterKey {
+            width: pixel_width,
+            height: pixel_height,
+            visible: editor.timeline.visible_range(),
+            retained: retained.clone(),
+            playhead: editor.timeline_playhead,
+            thumbnail_revision: 0,
+            thumbnail_frames: Vec::new(),
+            smart_render: Vec::new(),
+            objects: timeline_objects.clone(),
+        };
+        if editor.timeline_raster_key.as_ref() != Some(&key) {
+            let image = render_timeline(
+                &TimelineRasterInput {
+                    viewport: &editor.timeline,
+                    playhead: editor.timeline_playhead,
+                    retained,
+                    thumbnail_frames: &[],
+                    thumbnails: &BTreeMap::new(),
+                    pictures: &[],
+                    smart_render: &[],
+                    objects: &timeline_objects,
+                    ruler_height: u32::from(font_size.height),
+                    object_row_height: u32::from(font_size.height).saturating_mul(3),
+                },
+                pixel_width,
+                pixel_height,
+            );
+            if let Some(state) = &mut editor.timeline_image {
+                state.replace_protocol(picker.new_resize_protocol(DynamicImage::ImageRgb8(image)));
+            }
+            editor.timeline_raster_key = Some(key);
+        }
+        if let Some(state) = &mut editor.timeline_image {
+            state.render(frame, image_area);
+        }
     }
 
-    let result_style = if editor.message.starts_with("error:")
-        || app.as_deref().is_some_and(|app| app.error.is_some())
-    {
-        Style::default().fg(Color::Red)
+    let app_error = app.as_deref().and_then(|app| app.error.as_deref());
+    let message = app_error.unwrap_or(&editor.message);
+    let (marker, message, status_style) = if app_error.is_some() {
+        (" × ", message, Style::default().fg(Color::Red))
+    } else if let Some(message) = message.strip_prefix("error: ") {
+        (" × ", message, Style::default().fg(Color::Red))
+    } else if let Some(message) = message.strip_prefix("ok: ") {
+        (" ✓ ", message, Style::default().fg(Color::Green))
     } else {
-        Style::default()
+        (" · ", message, Style::default().fg(Color::DarkGray))
     };
-    let message = app
-        .as_deref()
-        .and_then(|app| app.error.as_deref())
-        .unwrap_or(&editor.message);
     frame.render_widget(
-        Paragraph::new(message)
-            .style(result_style)
-            .block(Block::default().borders(Borders::ALL).title("Result")),
+        Paragraph::new(Line::from(vec![
+            Span::styled(marker, status_style.add_modifier(Modifier::BOLD)),
+            Span::raw(message),
+        ])),
         result,
     );
     editor.prompt_area = prompt;
@@ -3857,6 +4498,13 @@ fn draw_editor(
         .min(prompt.right().saturating_sub(1));
     if command_focused {
         editor.cursor_position = (cursor_x, prompt.y);
+    }
+    if matches!(
+        editor.pane_focus,
+        EditorPaneFocus::Command | EditorPaneFocus::Code
+    ) && let Some(cell) = frame.buffer_mut().cell_mut(editor.cursor_position)
+    {
+        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -4010,6 +4658,12 @@ fn timeline_legend(app: &PreviewApp) -> Line<'static> {
             "   audio unavailable",
             Style::default().fg(Color::Red),
         ));
+    } else if let Some(aac) = &app.aac {
+        spans.push(Span::raw(match aac.backend {
+            Some(AacDecodeBackend::Native) => "   AAC: native Rust",
+            Some(AacDecodeBackend::External) => "   AAC: FFmpeg fallback",
+            None => "   AAC: decoding",
+        }));
     }
     Line::from(spans)
 }
@@ -4018,7 +4672,13 @@ fn editor_context_title(session: &EditorSession, editor: &EditorUi) -> String {
     match editor.inspector_focus {
         InspectorFocus::InPoint => "Inspector — In point".into(),
         InspectorFocus::OutPoint => "Inspector — Out point".into(),
-        InspectorFocus::Help => "Help — Commands".into(),
+        InspectorFocus::Help => format!(
+            "Help — {}",
+            session
+                .project()
+                .display_path(session.path())
+                .unwrap_or_else(|_| "/".into())
+        ),
         InspectorFocus::Manual => editor.last_command.as_deref().map_or_else(
             || "Manual".into(),
             |command| {
@@ -4075,10 +4735,10 @@ fn editor_context_text(
     }
     if matches!(editor.inspector_focus, InspectorFocus::Mmfx) {
         return editor.mmfx.as_ref().map_or_else(
-            || "No MMFX source pane is open.\n\nCreate one with `add fx <name> <duration>`, enter it with `cd <name>`, then use `fx edit`.".into(),
+            || "No MMFX source pane is open.\n\nCreate one with `add scene <name> <duration>`, focus it with `cd <name>`, then use `edit`.".into(),
             |document| {
                 format!(
-                    "MMFX SOURCE\n\nObject     {}\nOwnership  embedded in project\nResources  {}\nProject    {}\nPreview    {}\n\n`save` persists the project and source.\n`fx save as <file>` extracts a copy.\nUse `man fx` for the complete workflow.",
+                    "MMFX SCENE SOURCE\n\nObject     {}\nOwnership  embedded in project\nResources  {}\nProject    {}\nPreview    {}\n\n`save` persists the project and source.\n`scene save as <file>` extracts a copy.\nUse `man scene` for the complete workflow.",
                     document.name,
                     document.resource_base.as_ref().map_or_else(
                         || "project directory".into(),
@@ -4240,9 +4900,9 @@ fn editor_context_text(
         );
     }
     if project_focus || media.kind.as_str() == "project" {
-        text.push_str("\n\nAvailable here\nimport <file>   save   export plan\nproject info|match|preset|set   ls   cd <alias>");
-    } else if media.kind.as_str() == "fx" {
-        text.push_str("\n\nAvailable here\nfx edit   fx load <scene.mmfx>   fx save as <file>\nfx close   save   cd ..   help   man fx");
+        text.push_str("\n\nAvailable here\nimport <file>   add scene <name> <duration>   save   export plan\nproject info|match|preset|set   ls   cd <alias>");
+    } else if media.kind.is_mmfx_scene() {
+        text.push_str("\n\nAvailable here\nedit   scene load <scene.mmfx>   scene save as <file>\nscene close   save   cd ..   help   man edit");
     } else {
         text.push_str("\n\nAvailable here\nin <time>   out <time>   scale <mode>   project match\nls   cd ..   info video   info source   help");
     }
@@ -4283,18 +4943,197 @@ fn trim_inspector_text(
 }
 
 fn quick_help_text(session: &EditorSession) -> String {
-    let context = session
-        .project()
-        .display_path(session.path())
-        .unwrap_or_else(|_| "/".into());
     let local = if session.path().current_link().is_some() {
-        "After trim: left/right <time>"
+        "CURRENT OBJECT\n  left <time>   right <time>        Adjust trim"
     } else {
-        "Project root: import adds media"
+        "CURRENT LEVEL\n  import adds media at the project root"
     };
     format!(
-        "QUICK HELP — {context}\nnew <name> [using <preset>]\nopen <project>   save [as <project>]\nimport <file> [as <name>]\nadd fx <name> <duration> [at <start>]\ncd <name> • fx edit • fx load <scene.mmfx>\nfx save as <file> • fx close\nproject info|match|presets|preset|set\nscale fit|fill|stretch|native\nexport plan | export <file>\npwd  ls  cd <path>\nin <time>  out <time>\nundo  redo  help  man <cmd>  quit\n{local}\nTab/Shift-Tab focus • Ctrl-Space complete/play\nMMFX: embedded in project • Ctrl-S project save • Ctrl-Z/Y project undo/redo\nInspector ↑/↓/PgUp/PgDn • Timeline +/- zoom • 0 fit\nTime S:FF/M:SS:FF"
+        "PROJECT\n  new <name> [using <preset>]\n  open <project>   save [as <project>]\n  project info | match | presets | preset | set\n\nHIERARCHY & MEDIA\n  import <file> [as <name>]\n  pwd   ls   cd <path>\n  in <time>   out <time>   scale <mode>\n\nMMFX SCENES\n  add scene <name> <duration> [at <start>]\n  edit   scene load <scene.mmfx>\n  scene save as <file>   scene close\n  monitor project|local|toggle\n\nOUTPUT & HISTORY\n  export plan   export <file>\n  undo   redo   help   man <cmd>   quit\n\n{local}\n\nKEYS\n  Tab / Shift-Tab                 Move focus\n  Ctrl-Space                      Complete / play\n  Ctrl-S                          Save project\n  Ctrl-Z / Ctrl-Y                 Undo / redo\n  Inspector ↑/↓/PgUp/PgDn        Scroll\n  Timeline +/-   Shift-←/→   0    Zoom / pan / fit\n\nTime: S:FF or M:SS:FF"
     )
+}
+
+#[allow(clippy::too_many_lines)]
+fn quick_help_rich_text(session: &EditorSession) -> Text<'static> {
+    let section = |name: &'static str| -> Line<'static> {
+        Line::from(Span::styled(
+            name,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let command = |name: &'static str| -> Span<'static> {
+        Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
+    };
+    let args = |value: &'static str| -> Span<'static> {
+        Span::styled(value, Style::default().fg(Color::Gray))
+    };
+    let description = |value: &'static str| -> Span<'static> {
+        Span::styled(value, Style::default().fg(Color::DarkGray))
+    };
+
+    let mut lines = vec![
+        section("PROJECT"),
+        Line::from(vec![
+            Span::raw("  "),
+            command("new"),
+            args(" <name> [using <preset>]"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("open"),
+            args(" <project>   "),
+            command("save"),
+            args(" [as <project>]"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("project"),
+            args(" info | match | presets | preset | set"),
+        ]),
+        Line::default(),
+        section("HIERARCHY & MEDIA"),
+        Line::from(vec![
+            Span::raw("  "),
+            command("import"),
+            args(" <file> [as <name>]"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("pwd"),
+            Span::raw("   "),
+            command("ls"),
+            Span::raw("   "),
+            command("cd"),
+            args(" <path>"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("in"),
+            args(" <time>   "),
+            command("out"),
+            args(" <time>   "),
+            command("scale"),
+            args(" <mode>"),
+        ]),
+        Line::default(),
+        section("MMFX SCENES"),
+        Line::from(vec![
+            Span::raw("  "),
+            command("add scene"),
+            args(" <name> <duration> [at <start>]"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("edit"),
+            Span::raw("   "),
+            command("scene load"),
+            args(" <scene.mmfx>"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("scene save as"),
+            args(" <file>   "),
+            command("scene close"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("monitor"),
+            args(" project | local | toggle"),
+        ]),
+        Line::default(),
+        section("OUTPUT & HISTORY"),
+        Line::from(vec![
+            Span::raw("  "),
+            command("export plan"),
+            Span::raw("   "),
+            command("export"),
+            args(" <file>"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("undo"),
+            Span::raw("   "),
+            command("redo"),
+            Span::raw("   "),
+            command("help"),
+            Span::raw("   "),
+            command("man"),
+            args(" <cmd>   "),
+            command("quit"),
+        ]),
+        Line::default(),
+    ];
+
+    if session.path().current_link().is_some() {
+        lines.extend([
+            section("CURRENT OBJECT"),
+            Line::from(vec![
+                Span::raw("  "),
+                command("left"),
+                args(" <time>   "),
+                command("right"),
+                args(" <time>        "),
+                description("Adjust trim"),
+            ]),
+        ]);
+    } else {
+        lines.extend([
+            section("CURRENT LEVEL"),
+            Line::from(vec![
+                Span::raw("  "),
+                command("import"),
+                description(" adds media at the project root"),
+            ]),
+        ]);
+    }
+
+    lines.extend([
+        Line::default(),
+        section("KEYS"),
+        Line::from(vec![
+            Span::raw("  "),
+            command("Tab / Shift-Tab"),
+            description("                 Move focus"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("Ctrl-Space"),
+            description("                      Complete / play"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("Ctrl-S"),
+            description("                          Save project"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("Ctrl-Z / Ctrl-Y"),
+            description("                 Undo / redo"),
+        ]),
+        Line::from(vec![
+            Span::raw("  Inspector "),
+            command("↑/↓/PgUp/PgDn"),
+            description("        Scroll"),
+        ]),
+        Line::from(vec![
+            Span::raw("  Timeline "),
+            command("+/-"),
+            Span::raw("   "),
+            command("Shift-←/→"),
+            Span::raw("   "),
+            command("0"),
+            description("    Zoom / pan / fit"),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("Time: ", Style::default().add_modifier(Modifier::BOLD)),
+            args("S:FF or M:SS:FF"),
+        ]),
+    ]);
+
+    Text::from(lines)
 }
 
 fn source_inspector_text(media: &mmrecode_edit::MediaNode) -> String {
@@ -4404,23 +5243,39 @@ fn timecode_or_unknown(frame: i64, time_base: Rational) -> String {
     format_compact_timecode(frame, time_base).unwrap_or_else(|_| "?:??".into())
 }
 
+#[cfg(test)]
 fn editor_timeline_text(
     app: Option<&PreviewApp>,
     timeline: &TimelineViewport,
     width: u16,
+    objects: &[TimelineObjectLane],
 ) -> String {
     let Some(app) = app else {
         let width = usize::from(width);
-        return format!(
-            "{}\n{}\n{}\n\nType import <media-file> to create the first timeline placement.",
-            timeline_label_row(None, width),
-            timeline_ruler(width),
-            "░".repeat(width),
-        );
+        if objects.is_empty() {
+            return format!(
+                "{}\n{}\n{}\n\nType import <media-file> or add scene <name> <duration>.",
+                timeline_label_row(None, width),
+                timeline_ruler(width),
+                "░".repeat(width),
+            );
+        }
+        let mut lines = vec![timeline_label_row(None, width), timeline_ruler(width)];
+        for object in objects {
+            lines.push(format!(
+                "{}{} [{}]",
+                if object.current { "▸ " } else { "  " },
+                object.name,
+                object.kind
+            ));
+            lines.push(timeline_object_text_bar(object, timeline, width));
+        }
+        lines.push("cd <name> focuses an object • edit opens a focused MMFX scene".into());
+        return lines.join("\n");
     };
     let current = app.playback.frame_index();
     format!(
-        "{}\n{}\n{}\n{}\nIN {}   PLAY {}   OUT {}   VIEW {}..{}\n←/→ scrub  Ctrl-←/→ pan  +/- zoom  0 fit  Ctrl-Space play  Tab focus",
+        "{}\n{}\n{}\n{}\nIN {}   PLAY {}   OUT {}   VIEW {}..{}",
         timeline_label_row(Some((app, timeline)), usize::from(width)),
         timeline_ruler(usize::from(width)),
         timeline_bar(app, timeline, usize::from(width)),
@@ -4433,6 +5288,39 @@ fn editor_timeline_text(
     )
 }
 
+#[cfg(test)]
+fn timeline_object_text_bar(
+    object: &TimelineObjectLane,
+    timeline: &TimelineViewport,
+    width: usize,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut cells = (0..width)
+        .map(|column| {
+            let frame = timeline.frame_at_column(column, width);
+            if object.frames.contains(&frame) {
+                '━'
+            } else {
+                '·'
+            }
+        })
+        .collect::<Vec<_>>();
+    if timeline.visible_range().contains(&object.frames.start) {
+        let start = timeline.column_for_frame(object.frames.start, width);
+        cells[start] = '┣';
+    }
+    if let Some(end) = object.frames.end.checked_sub(1)
+        && timeline.visible_range().contains(&end)
+    {
+        let end = timeline.column_for_frame(end, width);
+        cells[end] = '┫';
+    }
+    cells.into_iter().collect()
+}
+
+#[cfg(test)]
 fn timeline_label_row(app: Option<(&PreviewApp, &TimelineViewport)>, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -4467,6 +5355,7 @@ fn timeline_label_row(app: Option<(&PreviewApp, &TimelineViewport)>, width: usiz
     cells.into_iter().collect()
 }
 
+#[cfg(test)]
 fn timeline_ruler(width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -4490,6 +5379,7 @@ fn timeline_ruler(width: usize) -> String {
     cells.into_iter().collect()
 }
 
+#[cfg(test)]
 fn timeline_picture_row(app: &PreviewApp, timeline: &TimelineViewport, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -4511,6 +5401,7 @@ fn timeline_picture_row(app: &PreviewApp, timeline: &TimelineViewport, width: us
     cells.into_iter().collect()
 }
 
+#[cfg(test)]
 fn timeline_bar(app: &PreviewApp, timeline: &TimelineViewport, width: usize) -> String {
     if width == 0 || app.frame_count() == 0 {
         return String::new();
@@ -4546,39 +5437,105 @@ fn timeline_bar(app: &PreviewApp, timeline: &TimelineViewport, width: usize) -> 
     cells.into_iter().collect()
 }
 
-fn fallback_pixel_bounds(terminal: Size, font: ratatui_image::FontSize) -> (u32, u32) {
-    let width = u32::from(terminal.width.saturating_sub(2)) * u32::from(font.width);
-    let height = u32::from(terminal.height.saturating_sub(5)) * u32::from(font.height);
-    (width.clamp(1, 1_280), height.clamp(1, 720))
-}
-
-fn native_pixel_bounds(frame: &VideoFrame) -> Result<(u32, u32), String> {
-    Ok((
-        u32::try_from(frame.width)
-            .map_err(|_| "video width exceeds Kitty image limits".to_owned())?,
-        u32::try_from(frame.height)
-            .map_err(|_| "video height exceeds Kitty image limits".to_owned())?,
-    ))
+fn monitor_pixel_bounds(
+    area: Rect,
+    font: ratatui_image::FontSize,
+    source: (usize, usize),
+    kitty: bool,
+) -> (u32, u32) {
+    let width = u32::from(area.width.max(1)) * u32::from(font.width);
+    let height = u32::from(area.height.max(1)) * u32::from(font.height);
+    let protocol_cap = if kitty {
+        (u32::MAX, u32::MAX)
+    } else {
+        (1_280, 720)
+    };
+    let source_width = u32::try_from(source.0).unwrap_or(u32::MAX);
+    let source_height = u32::try_from(source.1).unwrap_or(u32::MAX);
+    (
+        width.min(source_width).min(protocol_cap.0).max(1),
+        height.min(source_height).min(protocol_cap.1).max(1),
+    )
 }
 
 fn video_frame_image(frame: &VideoFrame, bounds: (u32, u32)) -> Result<DynamicImage, String> {
     validate_frame(frame)?;
     let (width, height) = fitted_dimensions(frame.width, frame.height, bounds)?;
-    let mut image = RgbImage::new(width, height);
-    for target_y in 0..height {
-        let source_y = usize::try_from(target_y)
-            .expect("u32 fits usize")
-            .saturating_mul(frame.height)
-            / usize::try_from(height).expect("u32 fits usize");
-        for target_x in 0..width {
-            let source_x = usize::try_from(target_x)
-                .expect("u32 fits usize")
-                .saturating_mul(frame.width)
-                / usize::try_from(width).expect("u32 fits usize");
-            let rgb = sample_rgb(frame, source_x, source_y);
-            image.put_pixel(target_x, target_y, Rgb(rgb));
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let source_x = (0..width_usize)
+        .map(|x| x.saturating_mul(frame.width) / width_usize)
+        .collect::<Vec<_>>();
+    let source_y = (0..height_usize)
+        .map(|y| y.saturating_mul(frame.height) / height_usize)
+        .collect::<Vec<_>>();
+    let mut pixels = vec![0_u8; width_usize.saturating_mul(height_usize).saturating_mul(3)];
+    match frame.format {
+        PixelFormat::Gray8 => {
+            let plane = &frame.planes[0];
+            for (target_y, &source_y) in source_y.iter().enumerate() {
+                let source_row = source_y * plane.stride;
+                let output_row = target_y * width_usize * 3;
+                for (target_x, &source_x) in source_x.iter().enumerate() {
+                    let value = plane.data[source_row + source_x];
+                    let output = output_row + target_x * 3;
+                    pixels[output..output + 3].fill(value);
+                }
+            }
         }
+        PixelFormat::Yuv420p8
+        | PixelFormat::Yuv411p8
+        | PixelFormat::Yuv422p8
+        | PixelFormat::Yuv444p8 => {
+            let luma = &frame.planes[0];
+            let blue_chroma = &frame.planes[1];
+            let red_chroma = &frame.planes[2];
+            let blue_chroma_x = source_x
+                .iter()
+                .map(|&x| (x * blue_chroma.width / frame.width).min(blue_chroma.width - 1))
+                .collect::<Vec<_>>();
+            let red_chroma_x = source_x
+                .iter()
+                .map(|&x| (x * red_chroma.width / frame.width).min(red_chroma.width - 1))
+                .collect::<Vec<_>>();
+            for (target_y, &source_y) in source_y.iter().enumerate() {
+                let luma_row =
+                    (source_y * luma.height / frame.height).min(luma.height - 1) * luma.stride;
+                let blue_chroma_row = (source_y * blue_chroma.height / frame.height)
+                    .min(blue_chroma.height - 1)
+                    * blue_chroma.stride;
+                let red_chroma_row = (source_y * red_chroma.height / frame.height)
+                    .min(red_chroma.height - 1)
+                    * red_chroma.stride;
+                let output_row = target_y * width_usize * 3;
+                for target_x in 0..width_usize {
+                    let rgb = ycbcr_to_rgb(
+                        luma.data[luma_row + source_x[target_x]],
+                        blue_chroma.data[blue_chroma_row + blue_chroma_x[target_x]],
+                        red_chroma.data[red_chroma_row + red_chroma_x[target_x]],
+                        frame.color.range,
+                    );
+                    let output = output_row + target_x * 3;
+                    pixels[output..output + 3].copy_from_slice(&rgb);
+                }
+            }
+        }
+        PixelFormat::Rgb24 => {
+            let plane = &frame.planes[0];
+            for (target_y, &source_y) in source_y.iter().enumerate() {
+                let source_row = source_y * plane.stride;
+                let output_row = target_y * width_usize * 3;
+                for (target_x, &source_x) in source_x.iter().enumerate() {
+                    let source = source_row + source_x * 3;
+                    let output = output_row + target_x * 3;
+                    pixels[output..output + 3].copy_from_slice(&plane.data[source..source + 3]);
+                }
+            }
+        }
+        _ => unreachable!("validated terminal preview pixel format"),
     }
+    let image = RgbImage::from_raw(width, height, pixels)
+        .ok_or_else(|| "terminal preview RGB buffer has invalid dimensions".to_owned())?;
     Ok(DynamicImage::ImageRgb8(image))
 }
 
@@ -4650,67 +5607,28 @@ fn validate_plane(planes: &[Plane], index: usize, name: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn sample_rgb(frame: &VideoFrame, x: usize, y: usize) -> [u8; 3] {
-    match frame.format {
-        PixelFormat::Gray8 => {
-            let value = sample(&frame.planes[0], x, y);
-            [value, value, value]
-        }
-        PixelFormat::Yuv420p8
-        | PixelFormat::Yuv411p8
-        | PixelFormat::Yuv422p8
-        | PixelFormat::Yuv444p8 => {
-            let luma = sample_scaled(&frame.planes[0], x, y, frame.width, frame.height);
-            let cb = sample_scaled(&frame.planes[1], x, y, frame.width, frame.height);
-            let cr = sample_scaled(&frame.planes[2], x, y, frame.width, frame.height);
-            ycbcr_to_rgb(luma, cb, cr, frame.color.range)
-        }
-        PixelFormat::Rgb24 => {
-            let plane = &frame.planes[0];
-            let offset = y * plane.stride + x * 3;
-            [
-                plane.data[offset],
-                plane.data[offset + 1],
-                plane.data[offset + 2],
-            ]
-        }
-        _ => [0, 0, 0],
-    }
-}
-
-fn sample(plane: &Plane, x: usize, y: usize) -> u8 {
-    plane.data[y * plane.stride + x]
-}
-
-fn sample_scaled(
-    plane: &Plane,
-    x: usize,
-    y: usize,
-    source_width: usize,
-    source_height: usize,
-) -> u8 {
-    let plane_x = (x * plane.width / source_width).min(plane.width - 1);
-    let plane_y = (y * plane.height / source_height).min(plane.height - 1);
-    sample(plane, plane_x, plane_y)
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8, range: ColorRange) -> [u8; 3] {
-    let (luma, blue_difference, red_difference) = if range == ColorRange::Limited {
+    let cb = i32::from(cb) - 128;
+    let cr = i32::from(cr) - 128;
+    let (red, green, blue) = if range == ColorRange::Limited {
+        let y = (i32::from(y) - 16).max(0);
         (
-            (f32::from(y) - 16.0) * (255.0 / 219.0),
-            (f32::from(cb) - 128.0) * (255.0 / 224.0),
-            (f32::from(cr) - 128.0) * (255.0 / 224.0),
+            (298 * y + 409 * cr + 128) >> 8,
+            (298 * y - 100 * cb - 208 * cr + 128) >> 8,
+            (298 * y + 516 * cb + 128) >> 8,
         )
     } else {
-        (f32::from(y), f32::from(cb) - 128.0, f32::from(cr) - 128.0)
+        let y = i32::from(y);
+        (
+            y + ((359 * cr + 128) >> 8),
+            y - ((88 * cb + 183 * cr + 128) >> 8),
+            y + ((454 * cb + 128) >> 8),
+        )
     };
     [
-        (luma + 1.402 * red_difference).round().clamp(0.0, 255.0) as u8,
-        (luma - 0.344_136 * blue_difference - 0.714_136 * red_difference)
-            .round()
-            .clamp(0.0, 255.0) as u8,
-        (luma + 1.772 * blue_difference).round().clamp(0.0, 255.0) as u8,
+        u8::try_from(red.clamp(0, 255)).expect("clamped preview red"),
+        u8::try_from(green.clamp(0, 255)).expect("clamped preview green"),
+        u8::try_from(blue.clamp(0, 255)).expect("clamped preview blue"),
     ]
 }
 
@@ -4730,6 +5648,43 @@ mod tests {
     use ratatui::crossterm::event::KeyModifiers;
 
     use super::*;
+
+    #[test]
+    fn pointer_motion_does_not_steal_mmfx_source_focus() {
+        let mut editor = EditorUi {
+            pane_focus: EditorPaneFocus::Code,
+            inspector_focus: InspectorFocus::Mmfx,
+            code_area: Rect::new(40, 2, 30, 20),
+            inspector_area: Rect::new(39, 1, 32, 22),
+            ..EditorUi::default()
+        };
+        focus_editor_pane_from_mouse(
+            &mut editor,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 39,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(editor.pane_focus, EditorPaneFocus::Code);
+        assert_eq!(editor.inspector_focus, InspectorFocus::Mmfx);
+    }
+
+    #[test]
+    fn clearing_kitty_keeps_its_transfer_directory_reusable() {
+        let mut streamer = KittyStreamer::new().unwrap();
+        let directory = streamer.temp_directory.clone();
+        let first = streamer.write_transfer_file(&[1, 2, 3]).unwrap();
+        assert!(first.is_file());
+        streamer.clear().unwrap();
+        assert!(directory.is_dir());
+        assert!(!first.exists());
+        let second = streamer.write_transfer_file(&[4, 5, 6]).unwrap();
+        assert!(second.is_file());
+        drop(streamer);
+        assert!(!directory.exists());
+    }
 
     #[test]
     fn coalesces_each_burst_of_queued_scrub_events_to_its_latest_position() {
@@ -4824,6 +5779,29 @@ mod tests {
             visible_thumbnail_source_range(&viewport, Some(&mapping), 0..300),
             26..64
         );
+    }
+
+    #[test]
+    fn completed_thumbnail_does_not_restart_the_remaining_batch() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        let mut thumbnailer = TimelineThumbnailer {
+            commands: Some(command_tx),
+            results: result_rx,
+            worker: None,
+            pending: BTreeSet::new(),
+        };
+        thumbnailer.request(vec![10, 20, 30]);
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ThumbnailCommand::Request(frames)) if frames == vec![10, 20, 30]
+        ));
+        thumbnailer.completed(10);
+        thumbnailer.request(vec![20, 30]);
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -4929,7 +5907,7 @@ mod tests {
         app.request_frame(0).expect("request initial window");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !app.has_buffer(0) {
-            app.tick(Instant::now()).expect("poll decoder");
+            app.tick(Instant::now(), true).expect("poll decoder");
             assert!(Instant::now() < deadline, "preview preroll timed out");
             thread::sleep(Duration::from_millis(1));
         }
@@ -4938,7 +5916,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), start)
             .expect("start playback");
         assert!(app.playback.is_playing());
-        app.tick(start + Duration::from_millis(200))
+        app.tick(start + Duration::from_millis(200), true)
             .expect("advance preview");
         assert!(app.playback.frame_index() >= 4);
     }
@@ -5021,7 +5999,7 @@ mod tests {
         editor
             .timeline
             .sync_total_frames(app.as_ref().unwrap().frame_count());
-        let timeline = editor_timeline_text(app.as_ref(), &editor.timeline, 80);
+        let timeline = editor_timeline_text(app.as_ref(), &editor.timeline, 80, &[]);
         assert!(timeline.contains("IN 0:02"));
         assert!(timeline.contains("OUT 0:09"));
         assert!(!timeline.contains("2f"));
@@ -5123,7 +6101,7 @@ mod tests {
             &mut session,
             &mut history,
             &mut editor,
-            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
             now,
             &host,
         )
@@ -5142,6 +6120,29 @@ mod tests {
         .unwrap();
         assert_eq!(editor.timeline.visible_frame_count(), 6);
         assert_eq!(editor.timeline.visible_range(), 5..11);
+        handle_editor_key(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            now,
+            &host,
+        )
+        .unwrap();
+        assert_eq!(app.as_ref().unwrap().playback.frame_index(), 8);
+        assert_eq!(editor.timeline.visible_range(), 6..12);
+        handle_editor_key(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            now,
+            &host,
+        )
+        .unwrap();
+        assert_eq!(editor.timeline.visible_range(), 3..9);
         handle_editor_key(
             &mut app,
             &mut session,
@@ -5254,11 +6255,15 @@ mod tests {
         };
 
         let help = editor_context_text(None, &session, &editor);
-        assert!(help.contains("QUICK HELP — /"));
+        assert!(help.starts_with("PROJECT\n"));
+        assert!(help.contains("HIERARCHY & MEDIA"));
+        assert!(help.contains("MMFX SCENES"));
+        assert!(help.contains("OUTPUT & HISTORY"));
+        assert!(help.contains("KEYS"));
         assert!(help.contains("open <project>"));
         assert!(help.contains("import <file>"));
         assert!(help.contains("man <cmd>"));
-        let timeline = editor_timeline_text(None, &editor.timeline, 40);
+        let timeline = editor_timeline_text(None, &editor.timeline, 40, &[]);
         assert!(timeline.contains("PROJECT"));
         assert!(timeline.contains("import <media-file>"));
     }
@@ -5324,6 +6329,86 @@ mod tests {
     }
 
     #[test]
+    fn scene_editing_keeps_the_monitor_on_the_project_timeline() {
+        let (resize_tx, _resize_rx) = mpsc::channel();
+        let picker = Picker::halfblocks();
+        let host = EditorHost {
+            resize_tx: &resize_tx,
+            picker: &picker,
+            base_directory: Path::new("."),
+            terminal_size: Size::new(80, 24),
+        };
+        let mut session =
+            EditorSession::new(MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap());
+        session
+            .apply(EditCommand::Add {
+                kind: MediaKind::new("scene").unwrap(),
+                alias: "Overlay".into(),
+                duration: mmrecode_edit::FrameValue::Frames {
+                    frames: 60,
+                    relative: false,
+                },
+                start: mmrecode_edit::FrameValue::Frames {
+                    frames: 30,
+                    relative: false,
+                },
+            })
+            .unwrap();
+        session
+            .apply(EditCommand::Cd {
+                path: "Overlay".into(),
+            })
+            .unwrap();
+
+        assert_eq!(local_timeline_playhead(&session, 45), 15);
+        assert_eq!(project_frame_for_local_timeline(&session, 20), 50);
+
+        let mut editor = EditorUi {
+            project_playhead: 45,
+            ..EditorUi::default()
+        };
+        assert!(synchronize_timeline_context(&mut editor, &session));
+        assert_eq!(editor.timeline_playhead, 15);
+        assert!(synchronize_project_compositor(&mut editor, &session, &host));
+        assert!(!editor.project_compositor.has_active_layers(15));
+        assert!(editor.project_compositor.has_active_layers(45));
+
+        let mut app = None;
+        let mut history = CommandHistory::default();
+        editor.input = "monitor local".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            Instant::now(),
+            &host,
+        )
+        .unwrap();
+        assert_eq!(editor.monitor_scope, MonitorScope::Local);
+        assert!(editor.message.contains("Local Monitor selected"));
+        assert!(synchronize_project_compositor(&mut editor, &session, &host));
+        assert!(editor.project_compositor.has_active_layers(15));
+
+        let checker = monitor_background(48, 24, MonitorScope::Local);
+        assert_ne!(checker.get_pixel(0, 0), checker.get_pixel(24, 0));
+
+        editor.input = "monitor toggle".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            Instant::now(),
+            &host,
+        )
+        .unwrap();
+        assert_eq!(editor.monitor_scope, MonitorScope::Project);
+        assert_eq!(editor.project_playhead, 45);
+        assert_eq!(editor.timeline_playhead, 15);
+    }
+
+    #[test]
     fn mmfx_starter_and_file_resources_compile_for_live_preview() {
         let mut session =
             EditorSession::new(MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap());
@@ -5347,6 +6432,9 @@ mod tests {
             })
             .unwrap();
         let starter = &session.current_mmfx_source().unwrap().1.source;
+        assert!(starter.contains("@font Inter"));
+        assert!(starter.contains("@text title"));
+        assert!(starter.contains("content: \"LivePreview\""));
         let starter_image = compile_mmfx_preview(starter, Path::new("."))
             .expect("compile the internal starter scene");
         assert_eq!(
@@ -5360,6 +6448,33 @@ mod tests {
         let image = compile_mmfx_preview(&source, module.parent().unwrap())
             .expect("compile file-backed scene with relative font");
         assert_eq!((image.width(), image.height()), (1_280, 720));
+
+        let motion =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mmfx/motion-layout.mmfx");
+        let source = std::fs::read_to_string(&motion).expect("read Scene 0.2 example");
+        let scene = mmrecode_mmfx::parse_scene(&source).expect("parse Scene 0.2 example");
+        let resources = crate::load_mmfx_resources(&scene, motion.parent().unwrap())
+            .expect("load example image and built-in font");
+        let rendered = mmrecode_mmfx::render_frame_with_resources(
+            &scene,
+            &resources,
+            mmrecode_mmfx::SceneTime::new(23, 60),
+        )
+        .expect("render documented animation frame");
+        assert_eq!((rendered.width(), rendered.height()), (960, 540));
+        assert!(
+            rendered
+                .to_rgba8()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0)
+        );
+        let documented = image::open(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/static/img/mmfx/motion-layout-023.png"),
+        )
+        .expect("open documented CPU reference output")
+        .to_rgba8();
+        assert_eq!(documented.into_raw(), rendered.to_rgba8());
     }
 
     #[test]
@@ -5376,7 +6491,7 @@ mod tests {
         let mut session =
             EditorSession::new(MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap());
         let mut editor = EditorUi {
-            input: "add fx LowerThird 2:00".into(),
+            input: "add scene LowerThird 2:00".into(),
             ..EditorUi::default()
         };
         let mut history = CommandHistory::default();
@@ -5392,6 +6507,31 @@ mod tests {
         )
         .unwrap();
         assert!(editor.mmfx.is_none());
+        editor
+            .timeline
+            .sync_total_frames(local_timeline_frame_count(&session));
+        let root_objects = timeline_object_lanes(&session, None);
+        let root_timeline = editor_timeline_text(None, &editor.timeline, 80, &root_objects);
+        assert!(root_timeline.contains("LowerThird [scene/mmfx]"));
+        assert!(synchronize_project_compositor(&mut editor, &session, &host));
+        assert!(!synchronize_project_compositor(
+            &mut editor,
+            &session,
+            &host
+        ));
+        assert!(editor.project_compositor.has_active_layers(0));
+        assert!(update_compositor_only_monitor(
+            &mut editor,
+            &session,
+            &picker
+        ));
+        assert_eq!(
+            editor
+                .timeline_monitor_key
+                .as_ref()
+                .map(|key| key.active_signature),
+            Some(editor.project_compositor.active_signature(0))
+        );
         editor.input = "cd LowerThird".into();
         execute_editor_input(
             &mut app,
@@ -5402,7 +6542,20 @@ mod tests {
             &host,
         )
         .unwrap();
-        editor.input = "fx edit".into();
+        assert_eq!(
+            session.project().display_path(session.path()).unwrap(),
+            "/LowerThird"
+        );
+        // Hierarchy navigation does not change the root project monitor composition.
+        assert!(!synchronize_project_compositor(
+            &mut editor,
+            &session,
+            &host
+        ));
+        let focused_objects = timeline_object_lanes(&session, None);
+        let focused_timeline = editor_timeline_text(None, &editor.timeline, 80, &focused_objects);
+        assert!(focused_timeline.contains("▸ LowerThird [scene/mmfx]"));
+        editor.input = "edit".into();
         execute_editor_input(
             &mut app,
             &mut session,
@@ -5446,7 +6599,7 @@ mod tests {
         assert!(session.is_dirty());
 
         editor.pane_focus = EditorPaneFocus::Command;
-        editor.input = "fx close".into();
+        editor.input = "scene close".into();
         execute_editor_input(
             &mut app,
             &mut session,
@@ -5468,7 +6621,7 @@ mod tests {
 
         let destination =
             std::env::temp_dir().join(format!("mmrecode-live-mmfx-{}", std::process::id()));
-        editor.input = format!("fx save as {}", destination.display());
+        editor.input = format!("scene save as {}", destination.display());
         execute_editor_input(
             &mut app,
             &mut session,

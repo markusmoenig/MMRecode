@@ -2054,6 +2054,7 @@ dependencies = [
  "mmrecode-h264",
  "mmrecode-isobmff",
  "mmrecode-mjpeg",
+ "mmrecode-mmfx",
  "mmrecode-mpeg2",
  "mmrecode-mpegaudio",
  "mmrecode-mpegts",

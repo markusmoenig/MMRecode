@@ -1,10 +1,12 @@
 //! Strict parser and semantic validation for the initial MMFX scene subset.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    Color, FontResource, Length, Node, NodeKind, Overflow, Scene, Style, TextAlign, TextContent,
-    TextLineHeight, TextWrap, Transform,
+    AlignItems, AnimatedStyle, Animation, AnimationDuration, Color, Display, FontResource,
+    ImageContent, JustifyContent, Keyframe, Keyframes, Length, Node, NodeKind, ObjectFit, Overflow,
+    Position, Scene, Scroll, ScrollDirection, Style, TextAlign, TextContent, TextLineHeight,
+    TextWrap, TimingFunction, Transform,
 };
 
 /// Half-open byte range in MMFX source text.
@@ -73,14 +75,14 @@ pub fn parse_scene(source: &str) -> Result<Scene, Vec<Diagnostic>> {
         return Err(parser.diagnostics);
     }
 
-    let Some(raw) = raw else {
+    if raw.is_empty() {
         return Err(vec![Diagnostic::new(
             "expected an @scene block",
             SourceSpan::default(),
         )]);
-    };
+    }
     let mut diagnostics = Vec::new();
-    let scene = lower_scene(raw, &mut diagnostics);
+    let scene = lower_document(raw, &mut diagnostics);
     if !diagnostics.is_empty() {
         Err(diagnostics)
     } else if let Some(scene) = scene {
@@ -125,20 +127,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_document(&mut self) -> Option<RawBlock> {
+    fn parse_document(&mut self) -> Vec<RawBlock> {
+        let mut blocks = Vec::new();
         self.skip_trivia();
-        if self.at_end() {
-            return None;
+        while !self.at_end() {
+            if let Some(block) = self.parse_block() {
+                blocks.push(block);
+            }
+            self.skip_trivia();
         }
-        let root = self.parse_block();
-        self.skip_trivia();
-        if !self.at_end() {
-            self.diagnostics.push(Diagnostic::new(
-                "only one top-level @scene block is allowed",
-                self.span_at_cursor(),
-            ));
-        }
-        root
+        blocks
     }
 
     fn parse_block(&mut self) -> Option<RawBlock> {
@@ -176,7 +174,11 @@ impl<'a> Parser<'a> {
                 ));
                 break;
             }
-            if self.peek() == Some('@') {
+            if kind == "keyframes" && self.peek() != Some('@') {
+                if let Some(child) = self.parse_keyframe_stop() {
+                    children.push(child);
+                }
+            } else if self.peek() == Some('@') {
                 if let Some(child) = self.parse_block() {
                     children.push(child);
                 }
@@ -194,6 +196,65 @@ impl<'a> Parser<'a> {
             },
             properties,
             children,
+        })
+    }
+
+    fn parse_keyframe_stop(&mut self) -> Option<RawBlock> {
+        let start = self.cursor;
+        while self
+            .peek()
+            .is_some_and(|character| !character.is_whitespace() && character != '{')
+        {
+            self.bump();
+        }
+        if start == self.cursor {
+            self.diagnostics.push(Diagnostic::new(
+                "expected a keyframe selector such as from, 50%, or to",
+                self.span_at_cursor(),
+            ));
+            self.recover_to_block_boundary();
+            return None;
+        }
+        let name = self.source[start..self.cursor].to_owned();
+        self.skip_trivia();
+        if !self.expect('{', "expected '{' after the keyframe selector") {
+            return None;
+        }
+        let mut properties = Vec::new();
+        loop {
+            self.skip_trivia();
+            if self.consume('}') {
+                break;
+            }
+            if self.at_end() {
+                self.diagnostics.push(Diagnostic::new(
+                    "unterminated keyframe stop; expected '}'",
+                    SourceSpan {
+                        start,
+                        end: self.cursor,
+                    },
+                ));
+                break;
+            }
+            if self.peek() == Some('@') {
+                self.diagnostics.push(Diagnostic::new(
+                    "keyframe stops cannot contain objects",
+                    self.span_at_cursor(),
+                ));
+                let _ = self.parse_block();
+            } else if let Some(property) = self.parse_property() {
+                properties.push(property);
+            }
+        }
+        Some(RawBlock {
+            kind: "keyframe-stop".into(),
+            name,
+            span: SourceSpan {
+                start,
+                end: self.cursor,
+            },
+            properties,
+            children: Vec::new(),
         })
     }
 
@@ -394,17 +455,58 @@ fn is_ident_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
-fn lower_scene(raw: RawBlock, diagnostics: &mut Vec<Diagnostic>) -> Option<Scene> {
-    if raw.kind != "scene" {
-        diagnostics.push(
-            Diagnostic::new(
-                format!("top-level object must be @scene, not @{}", raw.kind),
-                raw.span,
-            )
-            .with_help("wrap scene objects in an @scene name { ... } block"),
-        );
-        return None;
+fn lower_document(raw: Vec<RawBlock>, diagnostics: &mut Vec<Diagnostic>) -> Option<Scene> {
+    let mut scene = None;
+    let mut keyframe_blocks = Vec::new();
+    for block in raw {
+        match block.kind.as_str() {
+            "scene" if scene.is_none() => scene = Some(block),
+            "scene" => diagnostics.push(Diagnostic::new(
+                "only one top-level @scene block is allowed",
+                block.span,
+            )),
+            "keyframes" => keyframe_blocks.push(block),
+            _ => diagnostics.push(
+                Diagnostic::new(
+                    format!(
+                        "top-level object must be @scene or @keyframes, not @{}",
+                        block.kind
+                    ),
+                    block.span,
+                )
+                .with_help("wrap visual objects in an @scene name { ... } block"),
+            ),
+        }
     }
+    let animations = keyframe_blocks
+        .into_iter()
+        .filter_map(|block| lower_keyframes(block, diagnostics))
+        .collect::<Vec<_>>();
+    let mut animation_names = BTreeSet::new();
+    for animation in &animations {
+        if !animation_names.insert(animation.name.clone()) {
+            diagnostics.push(Diagnostic::new(
+                format!("duplicate @keyframes definition '{}'", animation.name),
+                SourceSpan::default(),
+            ));
+        }
+    }
+    let Some(scene) = scene else {
+        diagnostics.push(Diagnostic::new(
+            "expected one top-level @scene block",
+            SourceSpan::default(),
+        ));
+        return None;
+    };
+    lower_scene(scene, animations, &animation_names, diagnostics)
+}
+
+fn lower_scene(
+    raw: RawBlock,
+    animations: Vec<Keyframes>,
+    animation_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Scene> {
     let properties = collect_properties(raw.properties, diagnostics);
     let width = required_scene_dimension("width", &properties, raw.span, diagnostics);
     let height = required_scene_dimension("height", &properties, raw.span, diagnostics);
@@ -439,7 +541,7 @@ fn lower_scene(raw: RawBlock, diagnostics: &mut Vec<Diagnostic>) -> Option<Scene
     }
     let children = node_blocks
         .into_iter()
-        .filter_map(|child| lower_node(child, &font_names, diagnostics))
+        .filter_map(|child| lower_node(child, &font_names, animation_names, diagnostics))
         .collect();
     let fonts = fonts_with_spans.into_iter().map(|(font, _)| font).collect();
     match (width, height) {
@@ -449,6 +551,7 @@ fn lower_scene(raw: RawBlock, diagnostics: &mut Vec<Diagnostic>) -> Option<Scene
             height,
             background,
             fonts,
+            animations,
             children,
         }),
         _ => None,
@@ -481,20 +584,135 @@ fn lower_font(
     ))
 }
 
-fn lower_node(
-    raw: RawBlock,
-    font_names: &BTreeMap<String, SourceSpan>,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<Node> {
-    let kind_name = raw.kind.as_str();
-    if !matches!(kind_name, "group" | "rect" | "text") {
+fn lower_keyframes(raw: RawBlock, diagnostics: &mut Vec<Diagnostic>) -> Option<Keyframes> {
+    if !raw.properties.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            "@keyframes may contain only keyframe stops",
+            raw.span,
+        ));
+    }
+    let mut stops = raw
+        .children
+        .into_iter()
+        .filter_map(|stop| {
+            let offset = parse_keyframe_offset(&stop.name, stop.span, diagnostics)?;
+            let properties = collect_properties(stop.properties, diagnostics);
+            let allowed = [
+                "left",
+                "top",
+                "width",
+                "height",
+                "background",
+                "color",
+                "opacity",
+                "transform",
+            ];
+            reject_unknown(&properties, &allowed, diagnostics);
+            let style = AnimatedStyle {
+                left: properties
+                    .get("left")
+                    .and_then(|property| parse_signed_length(property, diagnostics)),
+                top: properties
+                    .get("top")
+                    .and_then(|property| parse_signed_length(property, diagnostics)),
+                width: properties
+                    .get("width")
+                    .and_then(|property| parse_length(property, diagnostics)),
+                height: properties
+                    .get("height")
+                    .and_then(|property| parse_length(property, diagnostics)),
+                background: properties
+                    .get("background")
+                    .and_then(|property| parse_color(property, diagnostics)),
+                color: properties
+                    .get("color")
+                    .and_then(|property| parse_color(property, diagnostics)),
+                opacity: properties
+                    .get("opacity")
+                    .and_then(|property| parse_opacity(property, diagnostics)),
+                transform: properties
+                    .get("transform")
+                    .and_then(|property| parse_transform(property, diagnostics)),
+            };
+            Some(Keyframe { offset, style })
+        })
+        .collect::<Vec<_>>();
+    stops.sort_by(|left, right| left.offset.total_cmp(&right.offset));
+    if stops.len() < 2 {
         diagnostics.push(
-            Diagnostic::new(format!("unknown object type '@{}'", raw.kind), raw.span)
-                .with_help("supported scene objects are @group, @rect, and @text"),
+            Diagnostic::new(
+                format!("@keyframes {} requires at least two stops", raw.name),
+                raw.span,
+            )
+            .with_help("add from { ... } and to { ... } stops"),
         );
         return None;
     }
-    if matches!(kind_name, "rect" | "text") && !raw.children.is_empty() {
+    for pair in stops.windows(2) {
+        if (pair[0].offset - pair[1].offset).abs() < f32::EPSILON {
+            diagnostics.push(Diagnostic::new(
+                format!(
+                    "@keyframes {} contains duplicate {}% stops",
+                    raw.name,
+                    pair[0].offset * 100.0
+                ),
+                raw.span,
+            ));
+        }
+    }
+    Some(Keyframes {
+        name: raw.name,
+        stops,
+    })
+}
+
+fn parse_keyframe_offset(
+    value: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<f32> {
+    match value {
+        "from" => Some(0.0),
+        "to" => Some(1.0),
+        _ => {
+            let Some(percent) = value.strip_suffix('%') else {
+                diagnostics.push(
+                    Diagnostic::new("keyframe selectors must be from, to, or a percentage", span)
+                        .with_help("examples: from, 50%, or to"),
+                );
+                return None;
+            };
+            match percent.parse::<f32>() {
+                Ok(value) if value.is_finite() && (0.0..=100.0).contains(&value) => {
+                    Some(value / 100.0)
+                }
+                _ => {
+                    diagnostics.push(Diagnostic::new(
+                        "keyframe percentage must be from 0% through 100%",
+                        span,
+                    ));
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn lower_node(
+    raw: RawBlock,
+    font_names: &BTreeMap<String, SourceSpan>,
+    animation_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Node> {
+    let kind_name = raw.kind.as_str();
+    if !matches!(kind_name, "group" | "rect" | "text" | "image") {
+        diagnostics.push(
+            Diagnostic::new(format!("unknown object type '@{}'", raw.kind), raw.span)
+                .with_help("supported scene objects are @group, @rect, @text, and @image"),
+        );
+        return None;
+    }
+    if matches!(kind_name, "rect" | "text" | "image") && !raw.children.is_empty() {
         diagnostics.push(
             Diagnostic::new(
                 format!("@{kind_name} objects cannot contain children"),
@@ -517,17 +735,20 @@ fn lower_node(
     let mut allowed = COMMON_STYLE_PROPERTIES.to_vec();
     if kind_name == "text" {
         allowed.extend(text_allowed);
+    } else if kind_name == "image" {
+        allowed.extend(["src", "object-fit"]);
     }
     reject_unknown(&properties, &allowed, diagnostics);
-    let style = lower_style(&properties, diagnostics);
+    let style = lower_style(&properties, animation_names, diagnostics);
     let kind = match kind_name {
         "group" => NodeKind::Group,
         "rect" => NodeKind::Rect,
         "text" => NodeKind::Text(lower_text(&properties, font_names, raw.span, diagnostics)?),
+        "image" => NodeKind::Image(lower_image(&properties, raw.span, diagnostics)?),
         other => {
             diagnostics.push(
                 Diagnostic::new(format!("unknown object type '@{other}'"), raw.span)
-                    .with_help("supported scene objects are @group, @rect, and @text"),
+                    .with_help("supported scene objects are @group, @rect, @text, and @image"),
             );
             return None;
         }
@@ -535,7 +756,7 @@ fn lower_node(
     let children = raw
         .children
         .into_iter()
-        .filter_map(|child| lower_node(child, font_names, diagnostics))
+        .filter_map(|child| lower_node(child, font_names, animation_names, diagnostics))
         .collect();
     Some(Node {
         name: raw.name,
@@ -548,17 +769,26 @@ fn lower_node(
 const COMMON_STYLE_PROPERTIES: &[&str] = &[
     "position",
     "display",
+    "flex-direction",
     "left",
     "top",
     "right",
     "bottom",
     "width",
     "height",
+    "padding",
+    "gap",
+    "align-items",
+    "justify-content",
     "background",
     "opacity",
     "overflow",
     "border-radius",
     "transform",
+    "animation",
+    "mm-scroll-direction",
+    "mm-scroll-range",
+    "mm-scroll-duration",
 ];
 
 fn collect_properties(
@@ -586,26 +816,41 @@ fn collect_properties(
     collected
 }
 
+#[allow(clippy::too_many_lines)]
 fn lower_style(
     properties: &BTreeMap<String, RawProperty>,
+    animation_names: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Style {
-    validate_keyword(properties.get("position"), "absolute", diagnostics);
-    validate_keyword(properties.get("display"), "overlay", diagnostics);
-
     let mut style = Style {
+        position: match properties
+            .get("position")
+            .map(|property| property.value.as_str())
+        {
+            None => Position::Flow,
+            Some("absolute") => Position::Absolute,
+            Some(_) => {
+                let property = &properties["position"];
+                diagnostics.push(Diagnostic::new(
+                    "position must be 'absolute' when specified",
+                    property.value_span,
+                ));
+                Position::Flow
+            }
+        },
+        display: parse_display(properties, diagnostics),
         left: properties
             .get("left")
-            .and_then(|property| parse_length(property, diagnostics)),
+            .and_then(|property| parse_signed_length(property, diagnostics)),
         top: properties
             .get("top")
-            .and_then(|property| parse_length(property, diagnostics)),
+            .and_then(|property| parse_signed_length(property, diagnostics)),
         right: properties
             .get("right")
-            .and_then(|property| parse_length(property, diagnostics)),
+            .and_then(|property| parse_signed_length(property, diagnostics)),
         bottom: properties
             .get("bottom")
-            .and_then(|property| parse_length(property, diagnostics)),
+            .and_then(|property| parse_signed_length(property, diagnostics)),
         ..Style::default()
     };
     if properties.contains_key("left") && properties.contains_key("right") {
@@ -629,6 +874,46 @@ fn lower_style(
         && let Some(value) = parse_length(property, diagnostics)
     {
         style.height = value;
+    }
+    if let Some(property) = properties.get("padding")
+        && let Some(value) = parse_length(property, diagnostics)
+    {
+        style.padding = value;
+    }
+    if let Some(property) = properties.get("gap")
+        && let Some(value) = parse_length(property, diagnostics)
+    {
+        style.gap = value;
+    }
+    if let Some(property) = properties.get("align-items") {
+        style.align_items = match property.value.as_str() {
+            "start" | "flex-start" => AlignItems::Start,
+            "center" => AlignItems::Center,
+            "end" | "flex-end" => AlignItems::End,
+            "stretch" => AlignItems::Stretch,
+            _ => {
+                diagnostics.push(Diagnostic::new(
+                    "align-items must be start, center, end, or stretch",
+                    property.value_span,
+                ));
+                AlignItems::Start
+            }
+        };
+    }
+    if let Some(property) = properties.get("justify-content") {
+        style.justify_content = match property.value.as_str() {
+            "start" | "flex-start" => JustifyContent::Start,
+            "center" => JustifyContent::Center,
+            "end" | "flex-end" => JustifyContent::End,
+            "space-between" => JustifyContent::SpaceBetween,
+            _ => {
+                diagnostics.push(Diagnostic::new(
+                    "justify-content must be start, center, end, or space-between",
+                    property.value_span,
+                ));
+                JustifyContent::Start
+            }
+        };
     }
     if let Some(property) = properties.get("background")
         && let Some(value) = parse_color(property, diagnostics)
@@ -666,7 +951,44 @@ fn lower_style(
     {
         style.transform = value;
     }
+    if let Some(property) = properties.get("animation") {
+        style.animation = parse_animation(property, animation_names, diagnostics);
+    }
+    style.scroll = parse_scroll(properties, diagnostics);
     style
+}
+
+fn parse_display(
+    properties: &BTreeMap<String, RawProperty>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Display {
+    let display = properties
+        .get("display")
+        .map(|property| property.value.as_str());
+    let direction = properties
+        .get("flex-direction")
+        .map(|property| property.value.as_str());
+    match (display, direction) {
+        (None | Some("overlay"), None) => Display::Overlay,
+        (Some("row"), None) | (Some("flex"), Some("row") | None) => Display::Row,
+        (Some("column"), None) | (Some("flex"), Some("column")) => Display::Column,
+        (None | Some("overlay" | "row" | "column"), Some(_)) => {
+            let property = &properties["flex-direction"];
+            diagnostics.push(Diagnostic::new(
+                "flex-direction requires display: flex",
+                property.value_span,
+            ));
+            Display::Overlay
+        }
+        (Some(_), _) => {
+            let property = &properties["display"];
+            diagnostics.push(Diagnostic::new(
+                "display must be overlay, row, column, or flex",
+                property.value_span,
+            ));
+            Display::Overlay
+        }
+    }
 }
 
 fn lower_text(
@@ -761,6 +1083,181 @@ fn lower_text(
         align,
         wrap,
     })
+}
+
+fn lower_image(
+    properties: &BTreeMap<String, RawProperty>,
+    fallback_span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<ImageContent> {
+    let Some(source_property) = properties.get("src") else {
+        diagnostics.push(Diagnostic::new(
+            "@image requires a 'src' property",
+            fallback_span,
+        ));
+        return None;
+    };
+    let source = parse_string(source_property, diagnostics)?;
+    let fit = match properties
+        .get("object-fit")
+        .map(|property| property.value.as_str())
+    {
+        None | Some("contain") => ObjectFit::Contain,
+        Some("cover") => ObjectFit::Cover,
+        Some("fill" | "stretch") => ObjectFit::Fill,
+        Some(_) => {
+            diagnostics.push(Diagnostic::new(
+                "object-fit must be contain, cover, or fill",
+                properties["object-fit"].value_span,
+            ));
+            ObjectFit::Contain
+        }
+    };
+    Some(ImageContent { source, fit })
+}
+
+fn parse_animation(
+    property: &RawProperty,
+    animation_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Animation> {
+    let parts = property.value.split_whitespace().collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) {
+        diagnostics.push(
+            Diagnostic::new(
+                "animation requires a name, duration, and optional timing function",
+                property.value_span,
+            )
+            .with_help("example: animation: enter 12f ease-out;"),
+        );
+        return None;
+    }
+    let name = parts[0].to_owned();
+    if !animation_names.contains(&name) {
+        diagnostics.push(
+            Diagnostic::new(
+                format!("animation references unknown @keyframes '{name}'"),
+                property.value_span,
+            )
+            .with_help(format!(
+                "add @keyframes {name} {{ from {{ ... }} to {{ ... }} }}"
+            )),
+        );
+    }
+    let duration = parse_duration(parts[1], property.value_span, diagnostics)?;
+    let timing = parts.get(2).map_or(Some(TimingFunction::Ease), |value| {
+        parse_timing(value, property.value_span, diagnostics)
+    })?;
+    Some(Animation {
+        name,
+        duration,
+        timing,
+    })
+}
+
+fn parse_scroll(
+    properties: &BTreeMap<String, RawProperty>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Scroll> {
+    let direction = properties.get("mm-scroll-direction");
+    let duration = properties.get("mm-scroll-duration");
+    let range = properties.get("mm-scroll-range");
+    if direction.is_none() && duration.is_none() && range.is_none() {
+        return None;
+    }
+    if range.is_some_and(|property| property.value != "cover") {
+        diagnostics.push(Diagnostic::new(
+            "the initial mm-scroll-range must be 'cover'",
+            range.expect("checked").value_span,
+        ));
+    }
+    let Some(direction) = direction else {
+        diagnostics.push(Diagnostic::new(
+            "mm-scroll-direction is required when scrolling",
+            range
+                .or(duration)
+                .map_or(SourceSpan::default(), |property| property.name_span),
+        ));
+        return None;
+    };
+    let direction = match direction.value.as_str() {
+        "block-start" => ScrollDirection::BlockStart,
+        "block-end" => ScrollDirection::BlockEnd,
+        "inline-start" => ScrollDirection::InlineStart,
+        "inline-end" => ScrollDirection::InlineEnd,
+        _ => {
+            diagnostics.push(Diagnostic::new(
+                "mm-scroll-direction must be block-start, block-end, inline-start, or inline-end",
+                direction.value_span,
+            ));
+            return None;
+        }
+    };
+    let Some(duration) = duration else {
+        diagnostics.push(Diagnostic::new(
+            "mm-scroll-duration is required when scrolling",
+            direction_span(properties),
+        ));
+        return None;
+    };
+    Some(Scroll {
+        direction,
+        duration: parse_duration(&duration.value, duration.value_span, diagnostics)?,
+    })
+}
+
+fn direction_span(properties: &BTreeMap<String, RawProperty>) -> SourceSpan {
+    properties
+        .get("mm-scroll-direction")
+        .map_or(SourceSpan::default(), |property| property.name_span)
+}
+
+fn parse_duration(
+    value: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<AnimationDuration> {
+    if value == "scene" {
+        return Some(AnimationDuration::Scene);
+    }
+    let Some(frames) = value.strip_suffix('f') else {
+        diagnostics.push(
+            Diagnostic::new("animation durations must use frames or 'scene'", span)
+                .with_help("examples: 12f or scene"),
+        );
+        return None;
+    };
+    match frames.parse::<u32>() {
+        Ok(frames) if frames > 0 => Some(AnimationDuration::Frames(frames)),
+        _ => {
+            diagnostics.push(Diagnostic::new(
+                "frame duration must be a positive whole number",
+                span,
+            ));
+            None
+        }
+    }
+}
+
+fn parse_timing(
+    value: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<TimingFunction> {
+    match value {
+        "linear" => Some(TimingFunction::Linear),
+        "ease" => Some(TimingFunction::Ease),
+        "ease-in" => Some(TimingFunction::EaseIn),
+        "ease-out" => Some(TimingFunction::EaseOut),
+        "ease-in-out" => Some(TimingFunction::EaseInOut),
+        _ => {
+            diagnostics.push(Diagnostic::new(
+                "timing must be linear, ease, ease-in, ease-out, or ease-in-out",
+                span,
+            ));
+            None
+        }
+    }
 }
 
 fn parse_string(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Option<String> {
@@ -929,6 +1426,21 @@ fn required_scene_dimension(
 }
 
 fn parse_length(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Option<Length> {
+    parse_length_value(property, false, diagnostics)
+}
+
+fn parse_signed_length(
+    property: &RawProperty,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Length> {
+    parse_length_value(property, true, diagnostics)
+}
+
+fn parse_length_value(
+    property: &RawProperty,
+    signed: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Length> {
     let value = property.value.trim();
     let (number, unit) = if let Some(number) = value.strip_suffix("px") {
         (number, "px")
@@ -944,14 +1456,18 @@ fn parse_length(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Op
         return None;
     };
     match number.trim().parse::<f32>() {
-        Ok(number) if number.is_finite() && number >= 0.0 => Some(if unit == "px" {
+        Ok(number) if number.is_finite() && (signed || number >= 0.0) => Some(if unit == "px" {
             Length::Pixels(number)
         } else {
             Length::Percent(number)
         }),
         _ => {
             diagnostics.push(Diagnostic::new(
-                "length must be a finite non-negative number",
+                if signed {
+                    "length must be a finite number"
+                } else {
+                    "length must be a finite non-negative number"
+                },
                 property.value_span,
             ));
             None
@@ -1020,64 +1536,114 @@ fn parse_opacity(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> O
 }
 
 fn parse_transform(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Option<Transform> {
-    let Some(arguments) = property
-        .value
-        .strip_prefix("translate(")
-        .and_then(|value| value.strip_suffix(')'))
-    else {
-        diagnostics.push(
-            Diagnostic::new(
-                "the initial transform subset supports translate(x, y)",
-                property.value_span,
-            )
-            .with_help("example: transform: translate(12px, 5%);"),
-        );
-        return None;
-    };
-    let Some((x, y)) = arguments.split_once(',') else {
-        diagnostics.push(Diagnostic::new(
-            "translate requires two comma-separated lengths",
-            property.value_span,
-        ));
-        return None;
-    };
-    let x_property = RawProperty {
-        name: "transform".to_owned(),
-        name_span: property.name_span,
-        value: x.trim().to_owned(),
-        value_span: property.value_span,
-    };
-    let y_property = RawProperty {
-        name: "transform".to_owned(),
-        name_span: property.name_span,
-        value: y.trim().to_owned(),
-        value_span: property.value_span,
-    };
-    Some(Transform {
-        translate_x: parse_length(&x_property, diagnostics)?,
-        translate_y: parse_length(&y_property, diagnostics)?,
-    })
+    let mut transform = Transform::default();
+    let mut remaining = property.value.trim();
+    while !remaining.is_empty() {
+        let Some(open) = remaining.find('(') else {
+            return invalid_transform(property, diagnostics);
+        };
+        let name = remaining[..open].trim();
+        let arguments_and_tail = &remaining[open + 1..];
+        let Some(close) = arguments_and_tail.find(')') else {
+            return invalid_transform(property, diagnostics);
+        };
+        let arguments = arguments_and_tail[..close].trim();
+        remaining = arguments_and_tail[close + 1..].trim();
+        match name {
+            "translate" => {
+                let Some((x, y)) = arguments.split_once(',') else {
+                    diagnostics.push(Diagnostic::new(
+                        "translate requires two comma-separated lengths",
+                        property.value_span,
+                    ));
+                    return None;
+                };
+                transform.translate_x = parse_transform_length(x, property, diagnostics)?;
+                transform.translate_y = parse_transform_length(y, property, diagnostics)?;
+            }
+            "translateX" => {
+                transform.translate_x = parse_transform_length(arguments, property, diagnostics)?;
+            }
+            "translateY" => {
+                transform.translate_y = parse_transform_length(arguments, property, diagnostics)?;
+            }
+            "scale" => {
+                let (x, y) = arguments
+                    .split_once(',')
+                    .map_or((arguments, arguments), |(x, y)| (x, y));
+                transform.scale_x = parse_scale(x, property, diagnostics)?;
+                transform.scale_y = parse_scale(y, property, diagnostics)?;
+            }
+            "rotate" => {
+                let Some(degrees) = arguments.strip_suffix("deg") else {
+                    diagnostics.push(Diagnostic::new(
+                        "rotate angles require deg units",
+                        property.value_span,
+                    ));
+                    return None;
+                };
+                transform.rotate_degrees = match degrees.trim().parse::<f32>() {
+                    Ok(value) if value.is_finite() => value,
+                    _ => {
+                        diagnostics.push(Diagnostic::new(
+                            "rotate angle must be finite",
+                            property.value_span,
+                        ));
+                        return None;
+                    }
+                };
+            }
+            _ => return invalid_transform(property, diagnostics),
+        }
+    }
+    Some(transform)
 }
 
-fn validate_keyword(
-    property: Option<&RawProperty>,
-    expected: &str,
+fn parse_transform_length(
+    value: &str,
+    property: &RawProperty,
     diagnostics: &mut Vec<Diagnostic>,
-) {
-    if let Some(property) = property
-        && property.value != expected
-    {
-        diagnostics.push(
-            Diagnostic::new(
-                format!(
-                    "'{}' must be '{expected}' in the initial subset",
-                    property.name
-                ),
+) -> Option<Length> {
+    parse_signed_length(
+        &RawProperty {
+            name: "transform".to_owned(),
+            name_span: property.name_span,
+            value: value.trim().to_owned(),
+            value_span: property.value_span,
+        },
+        diagnostics,
+    )
+}
+
+fn parse_scale(
+    value: &str,
+    property: &RawProperty,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<f32> {
+    match value.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Some(value),
+        _ => {
+            diagnostics.push(Diagnostic::new(
+                "scale must be a finite non-negative number",
                 property.value_span,
-            )
-            .with_help(format!("try {}: {expected};", property.name)),
-        );
+            ));
+            None
+        }
     }
+}
+
+fn invalid_transform(
+    property: &RawProperty,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Transform> {
+    diagnostics.push(
+        Diagnostic::new(
+            "transform supports translate, translateX, translateY, scale, and rotate",
+            property.value_span,
+        )
+        .with_help("example: transform: translateY(12px) scale(0.9) rotate(3deg);"),
+    );
+    None
 }
 
 fn reject_unknown(
@@ -1135,7 +1701,10 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::parse_scene;
-    use crate::{Color, Length, NodeKind, Overflow, TextAlign, TextLineHeight, TextWrap};
+    use crate::{
+        AlignItems, AnimationDuration, Color, Display, Length, NodeKind, ObjectFit, Overflow,
+        ScrollDirection, TextAlign, TextLineHeight, TextWrap, TimingFunction,
+    };
 
     const SOURCE: &str = r"
         @scene title-card {
@@ -1259,5 +1828,61 @@ mod tests {
                 .iter()
                 .any(|error| error.message.contains("has not been declared"))
         );
+    }
+
+    #[test]
+    fn parses_flow_images_keyframes_and_scrolling() {
+        let source = r#"
+            @scene motion {
+                width: 320px;
+                height: 180px;
+                @group row {
+                    display: flex;
+                    flex-direction: row;
+                    padding: 12px;
+                    gap: 8px;
+                    align-items: center;
+                    justify-content: space-between;
+                    animation: enter 12f ease-out;
+                    @image logo {
+                        width: 80px;
+                        height: 60px;
+                        src: "logo.png";
+                        object-fit: contain;
+                    }
+                    @rect ticker {
+                        width: 40px;
+                        height: 20px;
+                        mm-scroll-direction: inline-start;
+                        mm-scroll-range: cover;
+                        mm-scroll-duration: scene;
+                    }
+                }
+            }
+            @keyframes enter {
+                from { opacity: 0; transform: translateY(20px) scale(0.9) rotate(-2deg); }
+                50% { opacity: 0.8; }
+                to { opacity: 1; transform: translateY(0) scale(1) rotate(0deg); }
+            }
+        "#;
+        let scene = parse_scene(source).expect("Scene 0.2 syntax");
+        let row = &scene.children[0];
+        assert_eq!(row.style.display, Display::Row);
+        assert_eq!(row.style.align_items, AlignItems::Center);
+        let animation = row.style.animation.as_ref().expect("animation");
+        assert_eq!(animation.duration, AnimationDuration::Frames(12));
+        assert_eq!(animation.timing, TimingFunction::EaseOut);
+        assert_eq!(scene.animations[0].stops.len(), 3);
+        let NodeKind::Image(image) = &row.children[0].kind else {
+            panic!("expected image");
+        };
+        assert_eq!(image.source, "logo.png");
+        assert_eq!(image.fit, ObjectFit::Contain);
+        assert_eq!(
+            row.children[1].style.scroll.expect("scroll").direction,
+            ScrollDirection::InlineStart
+        );
+        assert!(scene.is_animated());
+        assert_eq!(scene.image_sources(), vec!["logo.png"]);
     }
 }

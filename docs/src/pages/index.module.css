@@ -1,0 +1,247 @@
+.wrap {
+  width: min(1080px, calc(100% - 3rem));
+  margin: 0 auto;
+}
+
+.hero {
+  padding: clamp(6rem, 12vw, 10rem) 0 clamp(5rem, 9vw, 8rem);
+  color: var(--mm-hero-text);
+  background: var(--mm-hero-bg);
+}
+
+.heroBrand {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 2.4rem;
+  color: var(--mm-hero-text);
+  font-size: clamp(1.55rem, 3vw, 2.15rem);
+  font-weight: 720;
+  letter-spacing: -0.045em;
+}
+
+.heroBrand img {
+  width: clamp(4rem, 8vw, 5.6rem);
+  height: clamp(4rem, 8vw, 5.6rem);
+  object-fit: contain;
+}
+
+.kicker {
+  margin: 0 0 1.3rem;
+  color: #55dac8;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.hero h1 {
+  max-width: 62rem;
+  margin: 0;
+  color: var(--mm-hero-text);
+  font-size: clamp(3.4rem, 8vw, 7.2rem);
+  font-weight: 720;
+  letter-spacing: -0.07em;
+  line-height: 0.94;
+}
+
+.heroText {
+  max-width: 43rem;
+  margin: 2rem 0 0;
+  color: var(--mm-hero-muted);
+  font-size: clamp(1.15rem, 2.2vw, 1.45rem);
+  line-height: 1.6;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.4rem;
+  align-items: center;
+  margin-top: 2.4rem;
+}
+
+.actions > a:not(:global(.button)) {
+  color: var(--mm-hero-link);
+  font-weight: 650;
+}
+
+.install {
+  display: block;
+  width: fit-content;
+  margin-top: 1.7rem;
+  padding: 0;
+  color: var(--mm-hero-muted);
+  background: transparent;
+  font-size: 0.9rem;
+}
+
+.introduction {
+  padding: clamp(5rem, 10vw, 8rem) 0;
+}
+
+.introduction > p:not(.founder) {
+  max-width: 56rem;
+  margin: 0 0 1.35rem;
+  font-size: clamp(1.35rem, 2.8vw, 1.95rem);
+  letter-spacing: -0.025em;
+  line-height: 1.45;
+}
+
+.founder {
+  margin: 3rem 0 0;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--mm-border);
+  font-weight: 680;
+}
+
+.section {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.65fr) minmax(0, 1.35fr);
+  gap: clamp(3rem, 8vw, 8rem);
+  padding: clamp(4.5rem, 9vw, 7rem) 0;
+  border-top: 1px solid var(--mm-border);
+}
+
+.headingColumn h2,
+.codecSection h2,
+.license h2 {
+  margin: 0;
+  font-size: clamp(2.2rem, 4.5vw, 3.8rem);
+  letter-spacing: -0.055em;
+  line-height: 1.05;
+}
+
+.bodyColumn {
+  max-width: 45rem;
+}
+
+.bodyColumn p {
+  color: var(--mm-muted);
+  font-size: 1.04rem;
+  line-height: 1.75;
+}
+
+.bodyColumn .lead {
+  margin-top: 0;
+  color: var(--ifm-font-color-base);
+  font-size: clamp(1.25rem, 2.4vw, 1.65rem);
+  letter-spacing: -0.02em;
+  line-height: 1.5;
+}
+
+.behaviorList {
+  margin: 2.2rem 0;
+  border-top: 1px solid var(--mm-border);
+}
+
+.behaviorList div {
+  display: grid;
+  grid-template-columns: 12rem 1fr;
+  gap: 1.5rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--mm-border);
+}
+
+.behaviorList dt {
+  font-weight: 680;
+}
+
+.behaviorList dd {
+  margin: 0;
+  color: var(--mm-muted);
+}
+
+.codecSection {
+  padding: clamp(5rem, 10vw, 8rem) 0;
+  border-top: 1px solid var(--mm-border);
+}
+
+.codecIntro {
+  max-width: 46rem;
+  margin: 1.4rem 0 3rem;
+  color: var(--mm-muted);
+  font-size: 1.08rem;
+  line-height: 1.7;
+}
+
+.codecRows {
+  border-top: 1px solid var(--mm-border);
+}
+
+.codecRows > div {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.6fr) minmax(0, 1.4fr);
+  gap: 2rem;
+  padding: 1.25rem 0;
+  border-bottom: 1px solid var(--mm-border);
+}
+
+.codecRows h3,
+.codecRows p {
+  margin: 0;
+}
+
+.codecRows h3 {
+  font-size: 1.08rem;
+}
+
+.codecRows p,
+.containerNote {
+  color: var(--mm-muted);
+}
+
+.containerNote {
+  margin: 1.5rem 0;
+}
+
+.license {
+  color: var(--mm-license-text);
+  background: var(--mm-license-bg);
+}
+
+.licenseInner {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.65fr) minmax(0, 1.35fr);
+  gap: clamp(3rem, 8vw, 8rem);
+  padding: clamp(5rem, 10vw, 8rem) 0;
+}
+
+.license h2 {
+  color: var(--mm-license-text);
+}
+
+.license p {
+  max-width: 44rem;
+  color: var(--mm-license-muted);
+  line-height: 1.75;
+}
+
+.license a {
+  font-weight: 650;
+}
+
+@media (max-width: 720px) {
+  .section,
+  .licenseInner {
+    grid-template-columns: 1fr;
+    gap: 2rem;
+  }
+
+  .behaviorList div,
+  .codecRows > div {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+}
+
+@media (max-width: 520px) {
+  .wrap {
+    width: calc(100% - 2rem);
+  }
+
+  .hero h1 {
+    font-size: clamp(3rem, 15vw, 4.5rem);
+  }
+}

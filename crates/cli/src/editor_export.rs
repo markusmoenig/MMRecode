@@ -16,6 +16,7 @@ use mmrecode_edit::{
     TimeRange, Track, TrackId, VisualScaleMode,
 };
 use mmrecode_mpeg2::{FrameRate, Mpeg2EncodeOptions, Mpeg2PictureDecoder, PictureType};
+use mmrecode_render::FlattenedProjectPlacement;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn export_project(
@@ -40,8 +41,15 @@ pub(crate) fn export_project(
     if entries.is_empty() {
         return Err("the project timeline is empty; there is nothing to export".into());
     }
-    if entries.len() != 1 || entries[0].timeline_range.start.value != 0 {
-        return export_root_timeline(session, &entries, output);
+    let flattened =
+        mmrecode_render::flatten_project_timeline(session.project(), session.project().root_id())
+            .map_err(|error| error.to_string())?;
+    if flattened.len() != 1
+        || entries.len() != 1
+        || entries[0].timeline_range.start.value != 0
+        || entries[0].kind.as_str() != "video/mpeg2"
+    {
+        return export_root_timeline(session, &flattened, output);
     }
     let link = session
         .project()
@@ -208,8 +216,8 @@ pub(crate) fn export_project(
 }
 
 struct TimelinePlacement {
-    alias: String,
-    link: mmrecode_edit::MediaLink,
+    path: String,
+    mapping: FlattenedProjectPlacement,
     media: mmrecode_edit::MediaNode,
     source_path: PathBuf,
     elementary: Vec<u8>,
@@ -226,7 +234,7 @@ struct TimelineDecodeState {
 #[allow(clippy::too_many_lines)]
 fn export_root_timeline(
     session: &mmrecode_edit::EditorSession,
-    entries: &[mmrecode_edit::MediaListing],
+    flattened: &[FlattenedProjectPlacement],
     output: Option<&Path>,
 ) -> Result<String, String> {
     let settings = session.project().settings();
@@ -246,31 +254,30 @@ fn export_root_timeline(
     validate_render_canvas(canvas_width, canvas_height)?;
     let project_time_base = settings.time_base().map_err(|error| error.to_string())?;
     let frame_rate = mpeg_frame_rate(project_time_base)?;
-    let output_frames = entries
-        .iter()
-        .map(|entry| entry.timeline_range.end.value)
-        .max()
-        .ok_or_else(|| "the project timeline is empty".to_owned())?;
+    let output_frames = session
+        .project()
+        .media(session.project().root_id())
+        .ok_or_else(|| "project root disappeared".to_owned())?
+        .duration
+        .value;
     if output_frames <= 0 {
         return Err("the project timeline has no frames to export".into());
     }
 
-    let mut placements = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let link = session
-            .project()
-            .link(entry.link_id)
-            .ok_or_else(|| "root media placement disappeared".to_owned())?
-            .clone();
+    let mut placements = Vec::with_capacity(flattened.len());
+    for mapping in flattened {
         let media = session
             .project()
-            .media(link.media_id)
-            .ok_or_else(|| "root media definition disappeared".to_owned())?
+            .media(mapping.media_id)
+            .ok_or_else(|| "flattened media definition disappeared".to_owned())?
             .clone();
+        if media.kind.is_mmfx_scene() {
+            continue;
+        }
         if media.kind.as_str() != "video/mpeg2" {
             return Err(format!(
-                "timeline placement '{}' is {}; the current mpeg2-ts timeline renderer supports video/mpeg2 placements only",
-                entry.alias,
+                "timeline placement '{}' is {}; the current mpeg2-ts timeline renderer supports video/mpeg2 and generated MMFX scene placements",
+                mapping.display_path,
                 media.kind.as_str()
             ));
         }
@@ -278,12 +285,34 @@ fn export_root_timeline(
             resolve_media_path(&media.origin, session.project_file().and_then(Path::parent))?;
         let elementary = read_elementary_video(&source_path)?;
         placements.push(TimelinePlacement {
-            alias: entry.alias.clone(),
-            link,
+            path: mapping.display_path.clone(),
+            mapping: mapping.clone(),
             media,
             source_path,
             elementary,
         });
+    }
+    let project_directory = session.project_file().and_then(Path::parent);
+    let mut compositor = mmrecode_render::ProjectCompositor::new();
+    let compositor_sync = compositor.synchronize(
+        session.project(),
+        session.project().root_id(),
+        |_, source, scene| {
+            let base_directory = source
+                .resource_base
+                .as_deref()
+                .or(project_directory)
+                .unwrap_or_else(|| Path::new("."));
+            crate::load_mmfx_resources(scene, base_directory)
+        },
+    );
+    if !compositor_sync.diagnostics.is_empty() {
+        return Err(compositor_sync
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| format!("MMFX {:?}: {}", diagnostic.media_id, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("\n"));
     }
     let streams = placements
         .iter()
@@ -298,21 +327,21 @@ fn export_root_timeline(
         if stream.pictures().is_empty() {
             return Err(format!(
                 "timeline placement '{}' contains no MPEG-2 pictures",
-                placement.alias
+                placement.path
             ));
         }
         if !stream.pictures()[0].sequence.progressive_sequence {
             return Err(format!(
                 "timeline placement '{}' is interlaced; full timeline rendering currently supports progressive MPEG-2 sources",
-                placement.alias
+                placement.path
             ));
         }
-        if placement.link.source_range.start.value < 0
-            || placement.link.source_range.end.value > picture_count
+        if placement.mapping.source_range.start < 0
+            || placement.mapping.source_range.end > picture_count
         {
             return Err(format!(
                 "timeline placement '{}' source range exceeds its MPEG-2 picture count",
-                placement.alias
+                placement.path
             ));
         }
     }
@@ -326,28 +355,49 @@ fn export_root_timeline(
     let timeline_end = mmrecode_edit::format_compact_timecode(output_frames, project_time_base)
         .map_err(|error| error.to_string())?;
     let mut report = format!(
-        "Export preset: mpeg2-ts\nTimeline: 0:00..{timeline_end}\nPath: full project-timeline render\nPlacements: {} in project composition order",
-        placements.len()
+        "Export preset: mpeg2-ts\nTimeline: 0:00..{timeline_end}\nPath: full project-timeline render\nPlacements: {} object(s) in project composition order; {} cached MMFX asset(s)",
+        flattened.len(),
+        compositor_sync.compiled_assets,
     );
     for placement in &placements {
         let timeline_start = mmrecode_edit::format_compact_timecode(
-            placement.link.timeline_range.start.value,
+            placement.mapping.timeline_range.start,
             project_time_base,
         )
         .map_err(|error| error.to_string())?;
         let timeline_end = mmrecode_edit::format_compact_timecode(
-            placement.link.timeline_range.end.value,
+            placement.mapping.timeline_range.end,
             project_time_base,
         )
         .map_err(|error| error.to_string())?;
         let _ = write!(
             report,
             "\n  {}: {timeline_start}..{timeline_end}, {}/{} fps, scale {}, source {}",
-            placement.alias,
+            placement.path,
             placement.media.time_base.denominator(),
             placement.media.time_base.numerator(),
-            placement.link.scale_mode.as_str(),
+            placement.mapping.scale_mode.as_str(),
             placement.source_path.display()
+        );
+    }
+    for mapping in flattened {
+        let Some(media) = session.project().media(mapping.media_id) else {
+            continue;
+        };
+        if !media.kind.is_mmfx_scene() {
+            continue;
+        }
+        let timeline_start =
+            mmrecode_edit::format_compact_timecode(mapping.timeline_range.start, project_time_base)
+                .map_err(|error| error.to_string())?;
+        let timeline_end =
+            mmrecode_edit::format_compact_timecode(mapping.timeline_range.end, project_time_base)
+                .map_err(|error| error.to_string())?;
+        let _ = write!(
+            report,
+            "\n  {}: {timeline_start}..{timeline_end}, MMFX scene, scale {}",
+            mapping.display_path,
+            mapping.scale_mode.as_str(),
         );
     }
     let _ = write!(
@@ -367,6 +417,8 @@ fn export_root_timeline(
         canvas_width,
         canvas_height,
         frame_rate,
+        &mut compositor,
+        session.project(),
     )?;
     let rendered = mux_mpeg2(&encoded, project_time_base)?;
     std::fs::write(output, &rendered)
@@ -390,6 +442,8 @@ fn render_timeline_and_encode(
     canvas_width: usize,
     canvas_height: usize,
     frame_rate: FrameRate,
+    compositor: &mut mmrecode_render::ProjectCompositor,
+    project: &mmrecode_edit::MediaProject,
 ) -> Result<(Vec<u8>, usize), String> {
     let output_frames_usize = usize::try_from(output_frames)
         .map_err(|_| "output frame count exceeds platform limits".to_owned())?;
@@ -403,28 +457,27 @@ fn render_timeline_and_encode(
     for output_index in 0..output_frames_usize {
         let output_index_i64 = i64::try_from(output_index)
             .map_err(|_| "output frame index exceeds editor limits".to_owned())?;
-        let active = placements.iter().rposition(|placement| {
-            output_index_i64 >= placement.link.timeline_range.start.value
-                && output_index_i64 < placement.link.timeline_range.end.value
+        let active = placements
+            .iter()
+            .rposition(|placement| placement.mapping.timeline_range.contains(&output_index_i64));
+        let first_overlay_order = active.map_or(0, |index| {
+            placements[index]
+                .mapping
+                .composition_order
+                .saturating_add(1)
         });
         let mut frame = if let Some(index) = active {
             let placement = &placements[index];
-            let local_timeline = output_index_i64 - placement.link.timeline_range.start.value;
-            let local_source = Timestamp {
-                value: local_timeline,
-                time_base: project_time_base,
-            }
-            .rescale(placement.media.time_base, TimestampRounding::Floor)
-            .map_err(|error| error.to_string())?
-            .value;
             let source_index = placement
-                .link
-                .source_range
-                .start
-                .value
-                .checked_add(local_source)
-                .ok_or_else(|| "source frame index overflows".to_owned())?
-                .min(placement.link.source_range.end.value - 1);
+                .mapping
+                .source_frame_at(project, output_index_i64)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "active timeline placement '{}' has no source frame at {output_index_i64}",
+                        placement.path
+                    )
+                })?;
             let state = &mut states[index];
             let source_frame = if let Some((last_index, frame)) = &state.last_source {
                 if *last_index == source_index {
@@ -457,13 +510,16 @@ fn render_timeline_and_encode(
                     &source_frame,
                     canvas_width,
                     canvas_height,
-                    placement.link.scale_mode,
+                    placement.mapping.scale_mode,
                 )
                 .map_err(|error| error.to_string())?
             }
         } else {
             black_project_frame(canvas_width, canvas_height)
         };
+        compositor
+            .composite_yuv420_from(output_index_i64, &mut frame, first_overlay_order)
+            .map_err(|error| error.to_string())?;
         frame.timing.pts = Some(Timestamp {
             value: output_index_i64,
             time_base: project_time_base,
@@ -969,4 +1025,222 @@ fn time_range(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use mmrecode_edit::{EditorSession, MediaKind, MediaProject, MmfxSource, ProjectSettings};
+
+    use super::*;
+
+    fn fx_only_session(source: &str) -> EditorSession {
+        let settings = ProjectSettings {
+            width: 16,
+            height: 16,
+            ..ProjectSettings::default()
+        };
+        let mut project = MediaProject::with_settings("FX export", settings).unwrap();
+        let link_id = project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("fx").unwrap(),
+                "Card",
+                0,
+                2,
+            )
+            .unwrap();
+        let media_id = project.link(link_id).unwrap().media_id;
+        project
+            .set_mmfx_source(
+                media_id,
+                MmfxSource {
+                    source: source.into(),
+                    resource_base: None,
+                },
+            )
+            .unwrap();
+        EditorSession::new(project)
+    }
+
+    fn nested_fx_session(source: &str) -> (EditorSession, PathBuf) {
+        let settings = ProjectSettings {
+            width: 16,
+            height: 16,
+            ..ProjectSettings::default()
+        };
+        let time_base = settings.time_base().unwrap();
+        let frames = vec![black_project_frame(16, 16), black_project_frame(16, 16)];
+        let encoded = mmrecode_mpeg2::encode_stream(
+            &frames,
+            Mpeg2EncodeOptions {
+                frame_rate: mpeg_frame_rate(time_base).unwrap(),
+                gop_size: 2,
+                b_frames: 0,
+                ..Mpeg2EncodeOptions::default()
+            },
+        )
+        .unwrap();
+        let source_path = std::env::temp_dir().join(format!(
+            "mmrecode-nested-fx-source-{}.m2v",
+            std::process::id()
+        ));
+        std::fs::write(&source_path, encoded.data).unwrap();
+
+        let mut project = MediaProject::with_settings("Nested FX export", settings).unwrap();
+        let video = project
+            .create_media(
+                "clip",
+                MediaKind::new("video/mpeg2").unwrap(),
+                time_base,
+                2,
+                MediaOrigin::External {
+                    path: source_path.clone(),
+                },
+            )
+            .unwrap();
+        project
+            .link_media(
+                project.root_id(),
+                video,
+                "Clip",
+                time_range(0, 2, time_base).unwrap(),
+                time_range(0, 2, time_base).unwrap(),
+            )
+            .unwrap();
+        let nested_video = project
+            .create_media(
+                "nested clip",
+                MediaKind::new("video/mpeg2").unwrap(),
+                time_base,
+                2,
+                MediaOrigin::External {
+                    path: source_path.clone(),
+                },
+            )
+            .unwrap();
+        project
+            .link_media(
+                video,
+                nested_video,
+                "Nested",
+                time_range(0, 1, time_base).unwrap(),
+                time_range(1, 2, time_base).unwrap(),
+            )
+            .unwrap();
+        let fx_link = project
+            .add_generated(nested_video, MediaKind::new("fx").unwrap(), "Card", 0, 1)
+            .unwrap();
+        let fx = project.link(fx_link).unwrap().media_id;
+        project
+            .set_mmfx_source(
+                fx,
+                MmfxSource {
+                    source: source.into(),
+                    resource_base: None,
+                },
+            )
+            .unwrap();
+        (EditorSession::new(project), source_path)
+    }
+
+    #[test]
+    fn export_plan_accepts_an_fx_only_root_timeline() {
+        let session =
+            fx_only_session("@scene card { width: 16px; height: 16px; background: #336699; }");
+        let report = export_project(&session, None, None).unwrap();
+        assert!(report.contains("full project-timeline render"));
+        assert!(report.contains("1 cached MMFX asset(s)"));
+    }
+
+    #[test]
+    fn fx_only_timeline_writes_a_decodable_transport_stream() {
+        let session =
+            fx_only_session("@scene card { width: 16px; height: 16px; background: #336699; }");
+        let output =
+            std::env::temp_dir().join(format!("mmrecode-fx-only-export-{}.ts", std::process::id()));
+        let report = export_project(&session, Some(&output), None).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        let _ = std::fs::remove_file(&output);
+        assert!(report.contains("Wrote"));
+        assert_eq!(bytes.first(), Some(&0x47));
+        let demuxed = mmrecode_mpegts::demux_transport_stream(&bytes).unwrap();
+        let video = demuxed.mpeg2_video_bytes().unwrap();
+        assert_eq!(
+            mmrecode_mpeg2::parse_stream(&video)
+                .unwrap()
+                .pictures()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn nested_fx_forces_recursive_full_render_and_is_reported_by_path() {
+        let (session, source_path) =
+            nested_fx_session("@scene card { width: 16px; height: 16px; background: #336699; }");
+        let output_path = std::env::temp_dir().join(format!(
+            "mmrecode-nested-fx-export-{}.ts",
+            std::process::id()
+        ));
+        let report = export_project(&session, Some(&output_path), None).unwrap();
+        let bytes = std::fs::read(&output_path).unwrap();
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(output_path);
+        assert!(report.contains("full project-timeline render"));
+        assert!(report.contains("3 object(s)"));
+        assert!(report.contains("1 cached MMFX asset(s)"));
+        assert!(report.contains("/Clip/Nested"));
+        assert!(report.contains("/Clip/Nested/Card"));
+        let demuxed = mmrecode_mpegts::demux_transport_stream(&bytes).unwrap();
+        let video = demuxed.mpeg2_video_bytes().unwrap();
+        let stream = mmrecode_mpeg2::parse_stream(&video).unwrap();
+        assert_eq!(stream.pictures().len(), 2);
+        let dependencies = mmrecode_mpeg2::analyze_dependencies(&stream).unwrap();
+        let mut decoder = Mpeg2PictureDecoder::default();
+        let mut decode_cursor = 0;
+        let mut presentation_frames = BTreeMap::new();
+        let mut decoded_pictures = 0;
+        let first = decode_source_frame(
+            &video,
+            &stream,
+            &dependencies,
+            &mut decoder,
+            &mut decode_cursor,
+            &mut presentation_frames,
+            0,
+            &mut decoded_pictures,
+        );
+        let second = decode_source_frame(
+            &video,
+            &stream,
+            &dependencies,
+            &mut decoder,
+            &mut decode_cursor,
+            &mut presentation_frames,
+            1,
+            &mut decoded_pictures,
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(
+            second.planes[0]
+                .data
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum::<u64>()
+                > first.planes[0]
+                    .data
+                    .iter()
+                    .map(|value| u64::from(*value))
+                    .sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn export_plan_rejects_invalid_mmfx_instead_of_using_stale_pixels() {
+        let session = fx_only_session("not an MMFX scene");
+        let error = export_project(&session, None, None).unwrap_err();
+        assert!(error.contains("MMFX"));
+        assert!(error.contains("1:1"));
+    }
 }

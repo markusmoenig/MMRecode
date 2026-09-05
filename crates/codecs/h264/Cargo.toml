@@ -1,6 +1,6 @@
 [package]
 name = "mmrecode-h264"
-description = "H.264/AVC syntax, access-unit, and dependency analysis for MMRecode"
+description = "H.264/AVC coding, syntax, access-unit, and dependency analysis for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

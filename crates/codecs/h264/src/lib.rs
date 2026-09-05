@@ -1,17 +1,19 @@
-//! H.264/AVC elementary-stream syntax and dependency inspection.
+//! H.264/AVC elementary-stream coding, syntax, and dependency inspection.
 //!
-//! This crate deliberately stops at syntax and picture relationships. Containers remain
-//! responsible for sample timing and framing, and pixel reconstruction stays behind the shared
-//! decoder interface.
+//! Containers remain responsible for sample timing and framing. Pixel reconstruction and the
+//! deterministic `I_PCM`, Intra16, Intra4, multiple-reference P, and bounded reordered B encoding
+//! stay behind the shared codec interfaces.
 
 mod cabac;
 mod cavlc;
 mod deblock;
 mod decoder;
+mod encoder;
 mod nal;
 mod syntax;
 
 pub use decoder::H264Decoder;
+pub use encoder::H264Encoder;
 
 pub use nal::{
     AvcDecoderConfigurationRecord, NalUnit, NalUnitHeader, NalUnitType, annex_b_nal_units,

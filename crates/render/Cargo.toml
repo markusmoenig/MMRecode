@@ -13,6 +13,7 @@ default = []
 mpeg2 = ["dep:mmrecode-mpeg2"]
 mpegts = ["mpeg2", "dep:mmrecode-mpegaudio", "dep:mmrecode-mpegts"]
 h264 = ["dep:mmrecode-h264", "dep:mmrecode-isobmff"]
+mmfx = ["dep:mmrecode-mmfx"]
 
 [dependencies]
 image.workspace = true
@@ -23,6 +24,7 @@ mmrecode-isobmff = { workspace = true, optional = true }
 mmrecode-mpegaudio = { workspace = true, optional = true }
 mmrecode-mpeg2 = { workspace = true, optional = true }
 mmrecode-mpegts = { workspace = true, optional = true }
+mmrecode-mmfx = { workspace = true, optional = true }
 
 [dev-dependencies]
 mmrecode-dv.workspace = true

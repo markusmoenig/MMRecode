@@ -73,6 +73,22 @@ video-only MP4. It reports presentation and decode ranges, GOP count, copied byt
 frames. Cuts inside a GOP are rejected explicitly; they are not rounded. This is clean-GOP remuxing,
 not yet general H.264 smart rendering.
 
+The optional `mmfx` feature adds the reusable CPU project compositor used by both the terminal
+monitor and full MPEG-2/TS rendering. The compositor owns no decoder: callers provide decoded base
+frames, keeping latest-request-wins scrubbing and sequential export independent of scene work. It
+incrementally caches MMFX parsing, host-supplied font/image resources, prepared scenes, static
+rasterization, placement scaling, transparent bounds, preview-size variants, and limited/full-range
+YUV conversions. Animated scenes evaluate lazily at exact placement-local frames and keep a bounded
+overlay cache. Repeated-frame export blends only active prepared pixels directly into planar Yuv420p8 rather than
+round-tripping the base frame through RGBA. Invalid edits retain the last valid cached pixels for
+interactive preview, while export treats diagnostics as fatal. A shared recursive timeline
+projection flattens nested placement paths in stable depth-first composition order and maps every
+output frame through exact source/timeline transforms. Ancestor trims clip descendants correctly,
+including across differing frame rates. The editor keys compositor synchronization by project
+revision and hierarchy context, so an unchanged graph is not re-flattened in the playback loop.
+The MPEG-2/TS full renderer uses the same projection for nested video and MMFX objects; MMFX assets
+remain cached by reusable media identity and scale variant.
+
 The `mmrecode` binary exposes the earlier one-clip path as `render-plan` and `render`. Those
 argument-heavy commands are development and integration-test harnesses, not the intended editor
 interface. The user-facing direction is one typed command model shared by script files and an

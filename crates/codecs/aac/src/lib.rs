@@ -1,7 +1,17 @@
-//! MPEG-4 AAC configuration and transport framing.
+//! MPEG-4 AAC configuration, transport framing, and native decoder foundations.
 //!
-//! This first decoder slice owns `AudioSpecificConfig` parsing and raw-access-unit framing. AAC-LC
-//! spectral reconstruction will live behind the audio decoder interface added by later slices.
+//! [`AacLcDecoder`] implements the shared audio interface with native Huffman spectral decoding,
+//! inverse quantization, PNS, stereo/pulse/TNS tools, and sine/KBD synthesis. Unsupported modes
+//! remain explicit errors; they are never replaced with silence or an external decoder inside the
+//! codec crate.
+
+mod decoder;
+mod huffman;
+mod syntax;
+mod synthesis;
+mod tables;
+
+pub use decoder::AacLcDecoder;
 
 use mmrecode_bitstream::BitReader;
 use mmrecode_core::{Error, Result};
@@ -24,18 +34,18 @@ pub struct AudioSpecificConfig {
     pub channels: u8,
     /// PCM samples represented by each raw AAC access unit.
     pub samples_per_frame: u16,
-    /// Whether an explicit SBR extension was signalled.
+    /// Whether an explicit or backward-compatible sync SBR extension was signalled.
     pub sbr_present: bool,
-    /// Whether an explicit Parametric Stereo extension was signalled.
+    /// Whether a Parametric Stereo extension was signalled.
     pub ps_present: bool,
-    /// Extension/output sample rate when SBR is explicit.
+    /// Extension/output sample rate when SBR is signalled.
     pub extension_sample_rate: Option<u32>,
 }
 
 impl AudioSpecificConfig {
     /// Parses an MPEG-4 `AudioSpecificConfig` byte string.
     ///
-    /// The first slice accepts AAC-LC and recognizes explicit HE-AAC signalling so callers can
+    /// Accepts AAC-LC and recognizes explicit and sync-extension HE-AAC signalling so callers can
     /// report it accurately. Program-config elements and non-General-Audio object types remain
     /// unsupported.
     ///
@@ -82,8 +92,29 @@ impl AudioSpecificConfig {
         let frame_length_flag = reader.read_bit()?;
         if reader.read_bit()? {
             reader.skip_bits(14)?;
+            return Err(Error::Unsupported("AAC core-coder dependency".into()));
         }
-        let _extension_flag = reader.read_bit()?;
+        if reader.read_bit()? && reader.read_bit()? {
+            return Err(Error::Unsupported("AAC extensionFlag3".into()));
+        }
+        // Backward-compatible HE-AAC signalling follows GASpecificConfig, not a byte boundary.
+        if signalled_type == 2 && reader.bits_remaining() >= 11 && reader.peek_bits(11)? == 0x2b7 {
+            reader.skip_bits(11)?;
+            let extension_type = read_object_type(&mut reader)?;
+            if extension_type != 5 {
+                return Err(Error::Unsupported(format!(
+                    "AAC sync extension type {extension_type}"
+                )));
+            }
+            sbr_present = reader.read_bit()?;
+            if sbr_present {
+                extension_sample_rate = Some(read_sample_rate(&mut reader)?);
+            }
+            if reader.bits_remaining() >= 11 && reader.peek_bits(11)? == 0x548 {
+                reader.skip_bits(11)?;
+                ps_present = reader.read_bit()?;
+            }
+        }
         Ok(Self {
             audio_object_type,
             sample_rate,
@@ -103,7 +134,12 @@ impl AudioSpecificConfig {
     /// Returns an error when the configuration cannot be represented by ADTS or the frame is too
     /// large for its 13-bit length field.
     pub fn adts_header(&self, payload_length: usize) -> Result<[u8; 7]> {
-        if self.audio_object_type != 2 || self.sbr_present || self.ps_present {
+        if self.audio_object_type != 2
+            || self.sbr_present
+            || self.ps_present
+            || self.samples_per_frame != 1_024
+            || channel_count(self.channel_configuration) != Some(self.channels)
+        {
             return Err(Error::Unsupported(
                 "ADTS bridge currently supports plain AAC-LC only".into(),
             ));
@@ -210,5 +246,34 @@ mod tests {
         assert!(AudioSpecificConfig::parse(&[0x12]).is_err());
         assert!(AudioSpecificConfig::parse(&[0x0a, 0x10]).is_err());
         assert!(AudioSpecificConfig::parse(&[0x12, 0x00]).is_err());
+    }
+
+    #[test]
+    fn detects_backward_compatible_sbr_and_ps_instead_of_decoding_as_lc() {
+        use mmrecode_bitstream::BitWriter;
+        let mut writer = BitWriter::new();
+        writer.write_bits(0x1210, 16).unwrap();
+        writer.write_bits(0x2b7, 11).unwrap();
+        writer.write_bits(5, 5).unwrap();
+        writer.write_bit(true).unwrap();
+        writer.write_bits(1, 4).unwrap(); // 88.2 kHz extension
+        writer.write_bits(0x548, 11).unwrap();
+        writer.write_bit(true).unwrap();
+        let config = AudioSpecificConfig::parse(&writer.into_bytes()).unwrap();
+        assert!(config.sbr_present);
+        assert!(config.ps_present);
+        assert_eq!(config.extension_sample_rate, Some(88_200));
+        assert!(config.adts_header(6).is_err());
+        assert!(AudioSpecificConfig::parse(&[0x12, 0x10, 0x56, 0xe5]).is_err());
+    }
+
+    #[test]
+    fn adts_rejects_960_sample_frames_and_invalid_public_configuration() {
+        let mut config = AudioSpecificConfig::parse(&[0x12, 0x14]).unwrap();
+        assert_eq!(config.samples_per_frame, 960);
+        assert!(config.adts_header(6).is_err());
+        config.samples_per_frame = 1024;
+        config.channel_configuration = 15;
+        assert!(config.adts_header(6).is_err());
     }
 }

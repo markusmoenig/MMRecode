@@ -17,6 +17,14 @@ representations which meet in MMRecode's render graph.
 This document records the intended direction. Syntax examples illustrate semantics and remain
 subject to adjustment while the parser, typed scene model, and reference renderer are built.
 
+## Documentation contract
+
+Every executable MMFX syntax, semantic, editor-integration, or rendering change must update the
+public reference under `docs/docs/mmfx/` in the same change. Visual features should also add or
+update a checked-in scene under `examples/mmfx/` and CPU-reference output under
+`docs/static/img/mmfx/`. Documentation examples are runnable acceptance material, not speculative
+syntax; future-only designs remain in this concept document and must be labeled as such.
+
 ## Core decisions
 
 1. **Scene authoring is CSS-shaped rather than a general-purpose programming language.** Layout,
@@ -36,7 +44,8 @@ subject to adjustment while the parser, typed scene model, and reference rendere
 6. **Time, coordinates, color, sampling, alpha, precision, and edge behavior are explicit.** They
    must not be inherited accidentally from a display API or codec pixel format.
 7. **The editor supports direct source editing.** Scene and kernel source can replace the contextual
-   inspector while the monitor continues to display an incrementally compiled preview.
+   inspector while the monitor displays either the incrementally compiled real project composition
+   or an explicitly selected isolated local context.
 
 ## System shape
 
@@ -72,29 +81,44 @@ kernels may then use any compatible backend.
 ## Current executable foundation
 
 The first implementation slices now live in the renderer-independent `mmrecode-mmfx` crate. A
-`.mmfx` file is parsed into typed `Scene`, `Group`, `Rect`, `Font`, and `Text` values before rendering. The parser
+`.mmfx` file is parsed into typed `Scene`, `Group`, `Rect`, `Font`, `Text`, and `Image` values before rendering. The parser
 rejects unknown and duplicate declarations, reports byte spans plus line/column locations, and
 suggests likely property names. Invalid source never reaches a renderer.
 
-The initial scalar CPU backend supports an explicit pixel canvas, nested overlay groups, absolute
-left/top/right/bottom anchors, `px` and `%` lengths, translation, sRGBA hexadecimal colors,
+The scalar CPU backend supports an explicit pixel canvas, nested overlay/row/column groups,
+absolute left/top/right/bottom anchors, padding, gaps, alignment and justification, `px` and `%`
+lengths, translation/scale/rotation, decoded images with contain/cover/fill, sRGBA hexadecimal colors,
 opacity, overflow clipping, and rounded rectangles. It composites in linear premultiplied RGBA and
 implements true group opacity. Rounded hidden groups also clip their descendants to the rounded
 shape. Rectangle, rounded-rectangle, and clip coverage is rasterized through pinned Zeno 0.3.3
 with 256-level antialiasing; fractional edges feed coverage directly into the linear compositor.
 Static Unicode text uses Parley 0.9 for shaping, bidirectional analysis, wrapping, line metrics, and
-alignment, then Swash 0.2.10 with Zeno coverage for hinted glyph rasterization. Font files are
+alignment, then Swash 0.2.10 with Zeno coverage for hinted glyph rasterization. Exact-frame named
+keyframes and cover-style scrolling evaluate in the scene object's source-local time. Font files are
 explicit module resources; the CPU render context disables system fonts so the same project cannot
 silently select different export fonts on another machine. The CLI proof is:
 
 ```text
-mmrecode render-mmfx examples/mmfx/lower-third.mmfx output.png
+mmrecode render-mmfx examples/mmfx/motion-layout.mmfx output.png --frame 23 --frames 60
 ```
 
+Generated scene objects now own their source inside the project, appear as ordinary hierarchical
+timeline placements, and can be edited directly with automatic worker previews and last-valid-frame
+retention. A reusable incremental CPU project compositor serves both the monitor and direct-root
+MPEG-2/TS export, including FX-only projects and recursively nested placements. It caches parsing,
+resources, prepared scenes, static rasterization, placement scaling, transparent bounds,
+terminal-size variants, and limited/full-range YUV values. Animated overlays are evaluated lazily
+at exact local frame time and kept in a bounded cache. Repeated-frame work performs no parsing,
+font/image loading, scene allocation, or image resizing and touches only active prepared pixels.
+Decoders remain outside the compositor so interactive hosts can discard obsolete seeks while
+export hosts decode sequentially.
+
 This is intentionally narrower than the target profile below. It does not yet define fallback font
-chains, color glyphs, text decorations, images, row/column layout, animation, media slots,
-serialization, project placements, live editor preview, or Kernel IR. Those features should extend
-the typed boundary rather than bypass it.
+chains, color glyphs, text decorations, media slots, intrinsic sizing, richer timing controls, or
+Kernel IR. The current direct YUV delivery blend is the optimized SDR path; the
+high-precision linear project-frame path, tiled/SIMD execution, and differential tests remain
+required before treating it as the final color pipeline. Those features should extend the typed
+boundary rather than bypass it.
 
 ## MMFX scene CSS
 
@@ -494,7 +518,15 @@ affected range. Declared temporal dependencies can extend that range and its dec
 
 The terminal editor can switch its contextual inspector among inspection, scene source, kernel
 source, parameters, and diagnostics while retaining the monitor, timeline, result area, and command
-prompt. A later full-screen source view can use the same editor buffer and preview state.
+prompt. The source pane and hierarchy path are authoring context only: `cd` never changes monitor
+scope implicitly. `monitor project` is the default and renders from the project root, decoding the
+underlying media at the project playhead and compositing the edited scene where its placement is
+active. `monitor local` explicitly isolates the current context and its descendants on a
+transparency-revealing checkerboard when no local video is present; `monitor toggle` switches the
+two modes. The hierarchy timeline continues to use local time, and its playhead maps exactly to and
+from the separate project playhead across placement ranges and rational time bases. Monitor scope is
+editor-session state, not project content. A later full-screen source view can use the same editor
+buffer and preview state.
 
 The live compilation loop is:
 
@@ -518,14 +550,33 @@ bindings. Draft preview does not require saving, but ordinary project save persi
 source even when it contains a temporary diagnostic. Opening the user's external editor remains a
 useful optional escape hatch.
 
-The first executable integration implements this loop on hierarchical timeline objects. `add fx`
+The first executable integration implements this loop on hierarchical timeline objects. `add scene`
 creates generated media with embedded starter Scene source and a placement in the current local
-timeline. `cd` selects that object and `fx edit` opens its source in the right-hand pane. Every source
-edit updates the project object and project history; ordinary project `save` serializes the source.
-`fx load` replaces it with an embedded copy of an external module while retaining that module's
-directory as the relative-resource base, and `fx save as` only extracts a copy. Compilation is
+timeline. `cd` selects that object and contextual `edit` opens its source in the right-hand pane
+(`scene edit` is an alias). Every source edit updates the project object and project history;
+ordinary project `save` serializes the source.
+`scene load` replaces it with an embedded copy of an external module while retaining that module's
+directory as the relative-resource base, and `scene save as` only extracts a copy. Compilation is
 debounced and coalesced on a worker. Source-spanned failures are shown without replacing the last
-successful monitor frame. `help` and `man fx` are the normative interactive discovery surface.
+successful monitor frame. `help`, `man edit`, and `man scene` are the normative interactive discovery
+surface.
+
+The command vocabulary distinguishes content from processing. `scene` creates and manages a
+declarative, duration-bearing timeline object. `fx` is reserved for applying filters, generators,
+transitions, and their optional kernel implementations to timeline objects or boundaries. Legacy
+`add fx` and `fx load/save/close` remain compatibility aliases for early projects and scripts.
+
+In project-monitor mode, MMFX placements recursively nested below the root participate in preview
+regardless of the current `cd` path. In local-monitor mode, only the current media definition and its
+descendants participate. FX-only projects retain the same custom-pixel timeline renderer used with
+decoded media. The project monitor renders a black project canvas beneath active scenes; the local
+monitor uses a checkerboard when there is no local video. With a decoded video preview, active
+scenes are alpha-composited over the underlying frame in the selected scope. The same flattened time
+mapping drives the local hierarchy playhead, monitor, and MPEG-2/TS export, including ancestor trims
+and different local frame rates. Static scene/resource pixels remain cached across hierarchy and
+monitor-scope changes.
+Generated starter scenes contain a named text element and use the bundled deterministic
+`builtin:inter` resource.
 
 ## Modules and plugins
 
@@ -644,27 +695,29 @@ tested as explicit modes rather than accepted as undocumented differences.
 
 ### Slice 1: typed scene boundary
 
-- Add renderer-independent scene values, object types, units, transforms, layout, animation, and
-  validation.
-- Add typed generated-content/module-instance records to the project model and a versioned project
-  migration.
-- Add typed placement presentation properties needed by the first composition.
+- [x] Add renderer-independent scene values, object types, units, transforms, bounded layout,
+  animation, and validation.
+- [x] Add typed generated-content records to the project model and its versioned serialization.
+- [x] Add typed placement presentation properties needed by the first composition.
 
 ### Slice 2: scalar scene renderer
 
-- Introduce a linear premultiplied working surface.
-- Render groups, rectangles, images/media slots, opacity, transforms, and clipping.
-- Implement row, column, overlay, and absolute layout.
-- Recursively compile generated media into the project render path.
+- [x] Introduce a linear premultiplied working surface.
+- [x] Render groups, rectangles, decoded images, opacity, transforms, and clipping.
+- [x] Implement row, column, overlay, and absolute layout.
+- [x] Recursively compile generated MMFX media into preview and MPEG-2/TS project rendering.
+- [ ] Add live media slots to the render graph.
 
 ### Slice 3: text and scrolling
 
-- [Done for static text] Pin Parley/Swash for text, reusing the pinned Zeno coverage backend behind
+- [x] Pin Parley/Swash for text, reusing the pinned Zeno coverage backend behind
   MMFX-owned text and path interfaces.
-- Add controlled font resources, fallback, shaping, wrapping, glyph coverage, and compositing.
-- Implement exact local animation time and keyframes.
-- Implement the `mm-scroll-*` declarations.
-- Prove centered titles, subtitles, rolling credits, and a horizontal ticker.
+- [x] Add controlled font resources, shaping, wrapping, glyph coverage, and compositing.
+- [ ] Add deterministic fallback font chains and color glyph policy.
+- [x] Implement exact local animation time and keyframes.
+- [x] Implement the initial `mm-scroll-*` cover profile.
+- [x] Prove titles, subtitles, and a horizontal ticker in checked-in examples and output frames.
+- [ ] Add a complete rolling-credits example after intrinsic text sizing is available.
 
 ### Slice 4: CSS source and live editor
 

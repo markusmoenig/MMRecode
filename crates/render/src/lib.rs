@@ -19,6 +19,16 @@ use mmrecode_edit::{Clip, ClipId, EditSequence, SourceId, TimeRange, Track, Trac
 mod compositor;
 pub use compositor::scale_yuv420_to_canvas;
 
+mod project_timeline;
+pub use project_timeline::{FlattenedProjectPlacement, flatten_project_timeline};
+
+#[cfg(feature = "mmfx")]
+mod project_compositor;
+#[cfg(feature = "mmfx")]
+pub use project_compositor::{
+    ProjectCompositor, ProjectCompositorDiagnostic, ProjectCompositorSync,
+};
+
 #[cfg(feature = "h264")]
 mod h264;
 #[cfg(feature = "h264")]

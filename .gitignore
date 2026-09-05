@@ -8,3 +8,6 @@
 *.mxf
 *.ts
 
+# The documentation site uses TypeScript configuration and page sources.
+!docs/**/*.ts
+!docs/**/*.tsx

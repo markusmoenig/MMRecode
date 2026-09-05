@@ -12,7 +12,10 @@ use std::{
 
 use mmrecode_core::{Error, Rational, Result};
 
-pub use aac::{AacAudioIndex, AacPlaybackEvent, AacPlaybackSource, IndexedAacSample};
+pub use aac::{
+    AacAudioIndex, AacDecodeBackend, AacDecodePolicy, AacPlaybackEvent, AacPlaybackSource,
+    IndexedAacSample,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use executor::NativeDecodeExecutor;
 pub use executor::{

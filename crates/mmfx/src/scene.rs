@@ -13,8 +13,42 @@ pub struct Scene {
     pub background: Color,
     /// Explicit font resources required by text objects.
     pub fonts: Vec<FontResource>,
+    /// Named animation definitions referenced by scene nodes.
+    pub animations: Vec<Keyframes>,
     /// Top-level nodes, in paint order.
     pub children: Vec<Node>,
+}
+
+impl Scene {
+    /// Returns every image source referenced by the scene, in paint order.
+    #[must_use]
+    pub fn image_sources(&self) -> Vec<&str> {
+        fn collect<'a>(nodes: &'a [Node], sources: &mut Vec<&'a str>) {
+            for node in nodes {
+                if let NodeKind::Image(image) = &node.kind {
+                    sources.push(&image.source);
+                }
+                collect(&node.children, sources);
+            }
+        }
+
+        let mut sources = Vec::new();
+        collect(&self.children, &mut sources);
+        sources
+    }
+
+    /// Returns whether any node changes with scene-local time.
+    #[must_use]
+    pub fn is_animated(&self) -> bool {
+        fn animated(nodes: &[Node]) -> bool {
+            nodes.iter().any(|node| {
+                node.style.animation.is_some()
+                    || node.style.scroll.is_some()
+                    || animated(&node.children)
+            })
+        }
+        animated(&self.children)
+    }
 }
 
 /// A node in the typed MMFX scene tree.
@@ -39,14 +73,37 @@ pub enum NodeKind {
     Rect,
     /// Shaped and laid-out text.
     Text(TextContent),
+    /// A decoded image resource supplied by the host.
+    Image(ImageContent),
 }
 
-/// An explicitly declared font file.
+/// Typed properties specific to an image object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageContent {
+    /// Module-relative resource source.
+    pub source: String,
+    /// Mapping of the image pixels into the resolved object box.
+    pub fit: ObjectFit,
+}
+
+/// Image fitting policy inside an image object's box.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectFit {
+    /// Preserve aspect ratio and fit completely inside the box.
+    #[default]
+    Contain,
+    /// Preserve aspect ratio and cover the box, clipping excess pixels.
+    Cover,
+    /// Stretch independently in both dimensions.
+    Fill,
+}
+
+/// An explicitly declared module-relative or built-in font resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FontResource {
     /// Family name used by `font-family` declarations.
     pub name: String,
-    /// Module-relative source path.
+    /// Module-relative source path or stable built-in resource name.
     pub source: String,
 }
 
@@ -105,6 +162,10 @@ pub enum TextWrap {
 /// Layout and paint properties shared by scene nodes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
+    /// Whether this node participates in parent flow or is positioned independently.
+    pub position: Position,
+    /// How this node arranges its children.
+    pub display: Display,
     /// Distance from the parent left edge.
     pub left: Option<Length>,
     /// Distance from the parent top edge.
@@ -117,6 +178,14 @@ pub struct Style {
     pub width: Length,
     /// Object height. Defaults to 100 percent.
     pub height: Length,
+    /// Uniform inset applied to child layout.
+    pub padding: Length,
+    /// Space inserted between flow children.
+    pub gap: Length,
+    /// Cross-axis alignment of flow children.
+    pub align_items: AlignItems,
+    /// Main-axis distribution of flow children.
+    pub justify_content: JustifyContent,
     /// Fill color. Only rectangles paint it in the initial subset.
     pub background: Color,
     /// Object opacity represented as an integer unit interval.
@@ -127,24 +196,86 @@ pub struct Style {
     pub border_radius: Length,
     /// Geometric transform applied after layout.
     pub transform: Transform,
+    /// Optional named keyframe animation.
+    pub animation: Option<Animation>,
+    /// Optional cover-style timeline scroll.
+    pub scroll: Option<Scroll>,
 }
 
 impl Default for Style {
     fn default() -> Self {
         Self {
+            position: Position::Flow,
+            display: Display::Overlay,
             left: None,
             top: None,
             right: None,
             bottom: None,
             width: Length::Percent(100.0),
             height: Length::Percent(100.0),
+            padding: Length::Pixels(0.0),
+            gap: Length::Pixels(0.0),
+            align_items: AlignItems::Start,
+            justify_content: JustifyContent::Start,
             background: Color::TRANSPARENT,
             opacity: u16::MAX,
             overflow: Overflow::Visible,
             border_radius: Length::Pixels(0.0),
             transform: Transform::default(),
+            animation: None,
+            scroll: None,
         }
     }
+}
+
+/// Participation in the parent's child layout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Position {
+    /// Participate in row or column flow.
+    #[default]
+    Flow,
+    /// Position independently using inset properties.
+    Absolute,
+}
+
+/// Child layout mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Display {
+    /// Paint children in the same containing box.
+    #[default]
+    Overlay,
+    /// Lay out non-absolute children from left to right.
+    Row,
+    /// Lay out non-absolute children from top to bottom.
+    Column,
+}
+
+/// Cross-axis flow alignment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AlignItems {
+    /// Align children to the cross-axis start.
+    #[default]
+    Start,
+    /// Center children on the cross axis.
+    Center,
+    /// Align children to the cross-axis end.
+    End,
+    /// Expand children across the available cross axis.
+    Stretch,
+}
+
+/// Main-axis flow distribution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JustifyContent {
+    /// Pack children at the main-axis start.
+    #[default]
+    Start,
+    /// Center the packed child sequence.
+    Center,
+    /// Pack children at the main-axis end.
+    End,
+    /// Distribute remaining space between children.
+    SpaceBetween,
 }
 
 /// A CSS-like length resolved relative to the containing object.
@@ -219,6 +350,12 @@ pub struct Transform {
     pub translate_x: Length,
     /// Vertical translation.
     pub translate_y: Length,
+    /// Horizontal scale around the object center.
+    pub scale_x: f32,
+    /// Vertical scale around the object center.
+    pub scale_y: f32,
+    /// Clockwise rotation around the object center, in degrees.
+    pub rotate_degrees: f32,
 }
 
 impl Default for Transform {
@@ -226,6 +363,106 @@ impl Default for Transform {
         Self {
             translate_x: Length::Pixels(0.0),
             translate_y: Length::Pixels(0.0),
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotate_degrees: 0.0,
         }
     }
+}
+
+/// A named keyframe animation attached to a node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Animation {
+    /// Referenced `@keyframes` name.
+    pub name: String,
+    /// Exact duration in local frames, or the complete containing scene duration.
+    pub duration: AnimationDuration,
+    /// Timing curve applied between stops.
+    pub timing: TimingFunction,
+}
+
+/// Duration of a scene animation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AnimationDuration {
+    /// Exact number of frames in the containing media's time base.
+    Frames(u32),
+    /// Complete local duration of the containing FX media.
+    Scene,
+}
+
+/// Supported deterministic timing curves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimingFunction {
+    /// Constant-rate interpolation.
+    Linear,
+    /// Symmetric smooth acceleration and deceleration.
+    #[default]
+    Ease,
+    /// Accelerate from rest.
+    EaseIn,
+    /// Decelerate to rest.
+    EaseOut,
+    /// Smoothly accelerate and decelerate.
+    EaseInOut,
+}
+
+/// One named set of ordered animation stops.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Keyframes {
+    /// Name referenced by `animation` declarations.
+    pub name: String,
+    /// Ordered keyframe stops.
+    pub stops: Vec<Keyframe>,
+}
+
+/// One keyframe stop at an offset from zero through one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Keyframe {
+    /// Normalized position within the animation.
+    pub offset: f32,
+    /// Properties overridden at this stop.
+    pub style: AnimatedStyle,
+}
+
+/// Properties which may be interpolated by the initial CPU evaluator.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnimatedStyle {
+    /// Animated horizontal inset.
+    pub left: Option<Length>,
+    /// Animated vertical inset.
+    pub top: Option<Length>,
+    /// Animated width.
+    pub width: Option<Length>,
+    /// Animated height.
+    pub height: Option<Length>,
+    /// Animated box background.
+    pub background: Option<Color>,
+    /// Animated text color.
+    pub color: Option<Color>,
+    /// Animated node opacity.
+    pub opacity: Option<u16>,
+    /// Animated two-dimensional transform.
+    pub transform: Option<Transform>,
+}
+
+/// Cover-style scrolling lowered to a timeline-dependent translation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scroll {
+    /// Direction in which content travels.
+    pub direction: ScrollDirection,
+    /// Exact local duration.
+    pub duration: AnimationDuration,
+}
+
+/// Logical scroll direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrollDirection {
+    /// Move toward the top edge.
+    BlockStart,
+    /// Move toward the bottom edge.
+    BlockEnd,
+    /// Move toward the left edge.
+    InlineStart,
+    /// Move toward the right edge.
+    InlineEnd,
 }
