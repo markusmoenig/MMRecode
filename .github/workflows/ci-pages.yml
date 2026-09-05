@@ -23,7 +23,12 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+          sudo apt-get install --yes \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev
 
       - name: Install Rust 1.92
         run: |
