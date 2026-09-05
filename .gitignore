@@ -2,6 +2,7 @@
 **/*.rs.bk
 .DS_Store
 *.y4m
+!testdata/y4m/valid/two-frame-420.y4m
 *.avi
 *.mov
 *.mp4
