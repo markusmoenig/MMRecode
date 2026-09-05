@@ -253,7 +253,7 @@ fn export_renders_all_sequential_root_timeline_placements() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Path: full project-timeline render"));
-    assert!(stdout.contains("Placements: 2 in project composition order"));
+    assert!(stdout.contains("Placements: 2 object(s) in project composition order"));
     assert!(stdout.contains("First:"));
     assert!(stdout.contains("Second:"));
     let transport =
