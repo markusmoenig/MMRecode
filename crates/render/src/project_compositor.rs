@@ -1076,6 +1076,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    linked_path: None,
                     parameter_bindings: BTreeMap::new(),
                 },
             )
@@ -1177,6 +1178,7 @@ mod tests {
                 MmfxSource {
                     source: red_scene().into(),
                     resource_base: None,
+                    linked_path: None,
                     parameter_bindings: BTreeMap::new(),
                 },
             )
@@ -1426,6 +1428,7 @@ mod tests {
                 MmfxSource {
                     source: "not mmfx".into(),
                     resource_base: None,
+                    linked_path: None,
                     parameter_bindings: BTreeMap::new(),
                 },
             )

@@ -328,6 +328,23 @@ properties, strings, colors, units, keywords, and comments while the preview rec
 short pause. `scene save as <file>` extracts a reusable copy; ordinary project `save` remains the
 authoritative save operation.
 
+To keep editing the module in an external editor instead, link it:
+
+```console
+add scene Credits 4:00
+cd Credits
+scene link examples/mmfx/rolling-credits.mmfx
+# Save the file in Helix, Neovim, Emacs, or another editor; MMRecode refreshes automatically.
+scene reload
+scene unlink
+edit
+```
+
+`scene link` stores a cached last-valid snapshot with the project. Automatic and manual refreshes
+validate the complete source and existing parameter bindings before installing it. Invalid or
+temporarily missing files keep the prior preview and export snapshot. `scene unlink` makes that
+snapshot ordinary embedded source, after which `edit` opens it inside MMRecode.
+
 Tab and Shift-Tab move focus between source, timeline, inspector, and command panes. The default
 `monitor project` view composites the draft scene over media at the project playhead;
 `monitor local` isolates the current `cd` context and its descendants.

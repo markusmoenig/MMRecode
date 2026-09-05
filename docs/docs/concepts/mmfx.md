@@ -67,7 +67,16 @@ The `mmrecode-mmfx` crate currently provides:
 - explicit font resources with no silent system-font fallback; and
 - a linear-premultiplied scalar CPU renderer.
 
-The terminal editor creates declarative content with `add scene`, edits its embedded source, debounces compilation on a worker, lets the animated timeline remain scrubbable while source is open, retains the last valid preview, and serializes source with the project. The default `monitor project` view composites the draft scene over underlying media at the project playhead. `monitor local` explicitly isolates the current hierarchy context and its descendants, while `monitor toggle` switches views without moving either mapped playhead. Merely using `cd` never changes monitor scope. The `fx` namespace is reserved for the future filter/transition/kernel workflow; legacy `add fx` remains compatible. The same exact placement-time evaluation is used for nested timeline preview and MPEG-2/TS project export.
+The terminal editor creates declarative content with `add scene`, edits embedded source, or links an
+external `.mmfx` module with a persisted last-valid cache. Linked files are polled and debounced;
+only source that parses and type-checks replaces the cache, while missing or invalid files retain
+the current preview/export snapshot. The animated timeline remains scrubbable while embedded source
+is open. The default `monitor project` view composites the draft scene over underlying media at the
+project playhead. `monitor local` explicitly isolates the current hierarchy context and its
+descendants, while `monitor toggle` switches views without moving either mapped playhead. Merely
+using `cd` never changes monitor scope. The `fx` namespace is reserved for the future
+filter/transition/kernel workflow; legacy `add fx` remains compatible. The same exact placement-time
+evaluation is used for nested timeline preview and MPEG-2/TS project export.
 
 ## What comes next
 

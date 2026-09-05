@@ -69,6 +69,8 @@ struct MmfxRecord {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linked_path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     parameter_bindings: BTreeMap<String, String>,
 }
@@ -188,6 +190,7 @@ impl ProjectDocument {
                     Some(MmfxRecord {
                         source: mmfx.source.clone(),
                         resource_base: mmfx.resource_base.as_deref().map(path_text).transpose()?,
+                        linked_path: mmfx.linked_path.as_deref().map(path_text).transpose()?,
                         parameter_bindings: mmfx.parameter_bindings.clone(),
                     })
                 } else {
@@ -334,6 +337,7 @@ impl ProjectDocument {
 impl MmfxRecord {
     fn into_source(self) -> Result<MmfxSource> {
         let resource_base = self.resource_base.map(PathBuf::from);
+        let linked_path = self.linked_path.map(PathBuf::from);
         if resource_base
             .as_ref()
             .is_some_and(|path| !path.is_absolute())
@@ -342,9 +346,15 @@ impl MmfxRecord {
                 "MMFX external resource base must be absolute".into(),
             ));
         }
+        if linked_path.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(Error::InvalidData(
+                "MMFX linked source path must be absolute".into(),
+            ));
+        }
         Ok(MmfxSource {
             source: self.source,
             resource_base,
+            linked_path,
             parameter_bindings: self.parameter_bindings,
         })
     }
@@ -604,6 +614,7 @@ mod tests {
                 MmfxSource {
                     source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
                     resource_base: Some(directory.join("fx")),
+                    linked_path: Some(directory.join("fx/lower-third.mmfx")),
                     parameter_bindings: BTreeMap::from([
                         ("title".into(), "Launch Day".into()),
                         ("accent".into(), "#42d6c7".into()),
@@ -633,6 +644,7 @@ mod tests {
             &MmfxSource {
                 source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
                 resource_base: Some(directory.join("fx")),
+                linked_path: Some(directory.join("fx/lower-third.mmfx")),
                 parameter_bindings: BTreeMap::from([
                     ("title".into(), "Launch Day".into()),
                     ("accent".into(), "#42d6c7".into()),

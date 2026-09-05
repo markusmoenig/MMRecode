@@ -202,6 +202,15 @@ pub enum EditCommand {
         /// User-entered MMFX file locator.
         locator: String,
     },
+    /// Link the focused scene to an external MMFX file and watch it for changes.
+    SceneLink {
+        /// User-entered MMFX file locator.
+        locator: String,
+    },
+    /// Immediately refresh the focused scene from its linked MMFX file.
+    SceneReload,
+    /// Convert the focused linked scene's cached source into an embedded source.
+    SceneUnlink,
     /// Extract the focused timeline object's embedded MMFX source to a file.
     FxSave {
         /// Output file locator.
@@ -342,6 +351,15 @@ pub enum CommandOutput {
         /// User-entered file locator.
         locator: String,
     },
+    /// The application host must establish a watched external MMFX source.
+    SceneLinkRequested {
+        /// User-entered file locator.
+        locator: String,
+    },
+    /// The application host must refresh the focused linked MMFX source immediately.
+    SceneReloadRequested,
+    /// The application host must stop watching and embed the focused source snapshot.
+    SceneUnlinkRequested,
     /// The application host must extract the focused embedded MMFX source.
     FxSaveRequested {
         /// Output locator.
@@ -441,7 +459,7 @@ impl EditorSession {
         self.project_file.as_deref()
     }
 
-    /// Returns the embedded MMFX payload owned by the currently focused timeline object.
+    /// Returns the MMFX payload owned by the currently focused timeline object.
     ///
     /// # Errors
     ///
@@ -464,7 +482,7 @@ impl EditorSession {
         Ok((media_id, source))
     }
 
-    /// Replaces the focused scene's embedded source as one project undo step.
+    /// Replaces the focused scene's source payload as one project undo step.
     ///
     /// # Errors
     ///
@@ -505,6 +523,41 @@ impl EditorSession {
             project.set_mmfx_source(media_id, source)?;
             Ok("update MMFX scene parameters".into())
         })
+    }
+
+    /// Refreshes the cached source for a linked MMFX definition without creating an undo step.
+    ///
+    /// Filesystem changes are external events rather than editor commands. Existing undo snapshots
+    /// that refer to the same link are refreshed too, so undoing an unrelated edit does
+    /// not silently restore an obsolete external snapshot. Redo is cleared because its future
+    /// states may contain stale link transitions. The saved snapshot is intentionally unchanged,
+    /// making the project dirty until the refreshed cache is persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `media_id` is missing or is not currently linked.
+    pub fn refresh_linked_mmfx_source(&mut self, media_id: MediaId, source: &str) -> Result<bool> {
+        let linked_path = self
+            .project
+            .media(media_id)
+            .and_then(|media| media.mmfx.as_ref())
+            .and_then(|mmfx| mmfx.linked_path.clone())
+            .ok_or_else(|| Error::Unsupported("MMFX scene is not linked to a file".into()))?;
+        if self
+            .project
+            .media(media_id)
+            .and_then(|media| media.mmfx.as_ref())
+            .is_some_and(|mmfx| mmfx.source == source)
+        {
+            return Ok(false);
+        }
+        refresh_linked_snapshot(&mut self.project, media_id, &linked_path, source)?;
+        for snapshot in &mut self.undo {
+            let _ = refresh_linked_snapshot(snapshot, media_id, &linked_path, source);
+        }
+        self.redo.clear();
+        self.advance_revision();
+        Ok(true)
     }
 
     /// Replaces the complete session with a loaded project and marks it clean.
@@ -652,6 +705,18 @@ impl EditorSession {
                 self.current_mmfx_source()?;
                 Ok(CommandOutput::FxLoadRequested { locator })
             }
+            EditCommand::SceneLink { locator } => {
+                self.current_mmfx_source()?;
+                Ok(CommandOutput::SceneLinkRequested { locator })
+            }
+            EditCommand::SceneReload => {
+                self.current_mmfx_source()?;
+                Ok(CommandOutput::SceneReloadRequested)
+            }
+            EditCommand::SceneUnlink => {
+                self.current_mmfx_source()?;
+                Ok(CommandOutput::SceneUnlinkRequested)
+            }
             EditCommand::FxSave { locator } => Ok(CommandOutput::FxSaveRequested { locator }),
             EditCommand::FxEdit => {
                 self.current_mmfx_source()?;
@@ -729,6 +794,7 @@ impl EditorSession {
                         MmfxSource {
                             source: mmfx_starter_source(&alias, settings.width, settings.height),
                             resource_base: None,
+                            linked_path: None,
                             parameter_bindings: BTreeMap::new(),
                         },
                     )?;
@@ -1040,6 +1106,29 @@ impl EditorSession {
     }
 }
 
+fn refresh_linked_snapshot(
+    project: &mut MediaProject,
+    media_id: MediaId,
+    linked_path: &PathBuf,
+    source: &str,
+) -> Result<bool> {
+    let Some(mut mmfx) = project.media(media_id).and_then(|media| media.mmfx.clone()) else {
+        return Err(Error::InvalidState("linked MMFX scene disappeared".into()));
+    };
+    if mmfx.linked_path.as_ref() != Some(linked_path) {
+        return Err(Error::Unsupported(
+            "MMFX scene no longer refers to the watched file".into(),
+        ));
+    }
+    if mmfx.source == source {
+        return Ok(false);
+    }
+    mmfx.source = source.into();
+    mmfx.resource_base = linked_path.parent().map(std::path::Path::to_path_buf);
+    project.set_mmfx_source(media_id, mmfx)?;
+    Ok(true)
+}
+
 /// Parses one script/interactive line into the shared typed command representation.
 ///
 /// Blank lines and lines beginning with `#` return `None`.
@@ -1152,6 +1241,11 @@ fn parse_scene_command(tokens: &[String]) -> Result<EditCommand> {
         [_, command, locator] if command == "load" => Ok(EditCommand::FxLoad {
             locator: locator.clone(),
         }),
+        [_, command, locator] if command == "link" => Ok(EditCommand::SceneLink {
+            locator: locator.clone(),
+        }),
+        [_, command] if command == "reload" => Ok(EditCommand::SceneReload),
+        [_, command] if command == "unlink" => Ok(EditCommand::SceneUnlink),
         [_, command, keyword, locator] if command == "save" && keyword == "as" => {
             Ok(EditCommand::FxSave {
                 locator: locator.clone(),
@@ -1171,7 +1265,7 @@ fn parse_scene_command(tokens: &[String]) -> Result<EditCommand> {
             name: Some(name.clone()),
         }),
         _ => Err(Error::InvalidData(format!(
-            "usage: {} [edit|load <scene.mmfx>|save [as] <scene.mmfx>|close|params|set <name> <value>|reset [name]]",
+            "usage: {} [edit|load <scene.mmfx>|link <scene.mmfx>|reload|unlink|save [as] <scene.mmfx>|close|params|set <name> <value>|reset [name]]",
             tokens.first().map_or("scene", String::as_str)
         ))),
     }
@@ -1617,7 +1711,7 @@ fn display_frame_value(value: FrameValue, time_base: Rational) -> Result<String>
 }
 
 fn help_text() -> String {
-    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save project and embedded scenes\nimport <file> [as <alias>]  import media\nadd scene <alias> <duration> [at <start>]\ncd <alias>                  focus an MMFX scene\nedit                        edit the focused scene\nscene params                inspect public inputs\nscene set <name> <value>    override one input\nscene reset [name]          restore defaults\nscene load <scene.mmfx>     replace it with an embedded copy\nscene save as <scene.mmfx>  extract source to a file\nscene close                 close the source pane\nmonitor project|local|toggle\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 project edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nPane focus: Tab/Shift-Tab. With the timeline focused, Left/Right scrubs, Shift-Left/Right pans the zoomed view, +/- zooms, and 0 fits the full timeline. MMFX source edits and typed parameter bindings immediately update the focused timeline object; ordinary project `save` persists both. The Project Monitor shows the complete root composition; `monitor local` isolates the current hierarchy context and its descendants. Legacy `add fx` and `fx load/save/close` remain compatible aliases; `fx` is reserved for the future effect/kernel workflow. Ctrl-S saves the project, Ctrl-Z/Ctrl-Y undo/redo project edits, and Esc focuses the command prompt. Preview compilation is automatic and keeps the last valid frame when source has errors.\nInteractive prompt: Ctrl-Space completes commands, paths, settings, presets, topics, scene parameters, scale modes, monitor targets, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
+    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save project and scene snapshots\nimport <file> [as <alias>]  import media\nadd scene <alias> <duration> [at <start>]\ncd <alias>                  focus an MMFX scene\nedit                        edit an embedded scene\nscene params                inspect public inputs\nscene set <name> <value>    override one input\nscene reset [name]          restore defaults\nscene load <scene.mmfx>     embed a one-time copy\nscene link <scene.mmfx>     watch an external source\nscene reload / unlink       refresh / embed linked source\nscene save as <scene.mmfx>  extract source to a file\nscene close                 close the source pane\nmonitor project|local|toggle\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 project edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nPane focus: Tab/Shift-Tab. With the timeline focused, Left/Right scrubs, Shift-Left/Right pans the zoomed view, +/- zooms, and 0 fits the full timeline. Embedded MMFX edits, linked snapshots, and typed bindings are persisted by ordinary project `save`. Linked files are polled and debounced; valid changes refresh preview/export while missing or invalid files retain the cached scene. Use `scene unlink` before editing linked source internally. The Project Monitor shows the complete root composition; `monitor local` isolates the current hierarchy context and its descendants. Legacy `add fx` and `fx load/save/close` remain compatible aliases; `fx` is reserved for the future effect/kernel workflow. Ctrl-S saves the project, Ctrl-Z/Ctrl-Y undo/redo project edits, and Esc focuses the command prompt. Preview compilation is automatic and keeps the last valid frame when source has errors.\nInteractive prompt: Ctrl-Space completes commands, paths, settings, presets, topics, scene parameters, scale modes, monitor targets, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
         .into()
 }
 
@@ -1651,7 +1745,7 @@ fn man_text(command: &str) -> Result<String> {
                 .into()
         }
         "edit" | "scene" | "fx" => {
-            "EDIT / SCENE — edit an MMFX scene timeline object\n\nadd scene <alias> <duration> [at <start>]\ncd <alias>\nedit\nscene params\nscene set <name> <value>\nscene reset [name]\nscene load <scene.mmfx>\nscene save as <scene.mmfx>\nscene close\n\n`add scene` creates a generated object in the current local timeline with starter MMFX source and a project-sized canvas. Focus it with `cd`, then contextual `edit` opens that object's embedded source in the right-hand pane. Editing rejects the project root and non-scene objects, so the hierarchy always identifies exactly what is being edited. Legacy `add fx` and `fx load/save/close` remain accepted for existing scripts and projects; the `fx` namespace is reserved for the later filter, generator, transition, and kernel workflow.\n\nScene 0.4 declares reusable typed inputs with `@param --name { type: text|color|length|number|boolean|choice; default: ...; }` and consumes them as a complete property value with `var(--name)`. Choice parameters also declare a quoted comma-separated `choices` list. `scene params` shows effective values. `scene set` validates and stores an override; quote text containing spaces. `scene reset name` removes one override and bare `scene reset` restores every default. Bindings are undoable and serialized with the project.\n\nSource is owned by the reusable scene media definition and serialized inside the `.mmrecode` project by ordinary `save`. There is no second MMFX dirty document. `scene load` replaces the focused object's source with an embedded copy of an external UTF-8 file and clears old bindings; the original directory is retained as its relative-resource base. `scene save as` extracts source defaults and does not change project ownership. `.mmfx` is appended when the extraction path has no extension.\n\nEditing keys\n  Tab / Shift-Tab    change focused pane\n  arrows, Home, End  move source cursor\n  Page Up / Down     move and scroll by a page\n  Enter / Backspace / Delete and printable text edit source\n  Ctrl-S             save the containing project\n  Ctrl-Z / Ctrl-Y    undo / redo project edits, including source and bindings\n  Esc                focus command prompt\n\nThe editor highlights MMFX at-rules, properties, strings, colors, numeric units, values, and comments. Scene 0.4 also supports @image resources, intrinsic `auto` sizing with min/max constraints, overlay/row/column layout, absolute children, padding and gaps, exact-frame @keyframes, translation/scale/rotation, and cover-style scrolling. Animation time is source-local, so trimming selects a different part of the animation. The monitor continues to show the timeline playhead while source is open; focus the timeline with Tab to scrub it.\n\nEach source edit or binding update schedules compilation after a short pause. Diagnostics include source line and column. Invalid source remains editable and persistable, while an invalid render never replaces the last valid monitor frame. Color glyphs and system-font fallback are not part of the current deterministic renderer."
+            "EDIT / SCENE — edit an MMFX scene timeline object\n\nadd scene <alias> <duration> [at <start>]\ncd <alias>\nedit\nscene params\nscene set <name> <value>\nscene reset [name]\nscene load <scene.mmfx>\nscene link <scene.mmfx>\nscene reload\nscene unlink\nscene save as <scene.mmfx>\nscene close\n\n`add scene` creates a generated object in the current local timeline with starter MMFX source and a project-sized canvas. Focus it with `cd`, then contextual `edit` opens that object's embedded source in the right-hand pane. Editing rejects the project root and non-scene objects, so the hierarchy always identifies exactly what is being edited. Legacy `add fx` and `fx load/save/close` remain accepted for existing scripts and projects; the `fx` namespace is reserved for the later filter, generator, transition, and kernel workflow.\n\nScene 0.4 declares reusable typed inputs with `@param --name { type: text|color|length|number|boolean|choice; default: ...; }` and consumes them as a complete property value with `var(--name)`. Choice parameters also declare a quoted comma-separated `choices` list. `scene params` shows effective values. `scene set` validates and stores an override; quote text containing spaces. `scene reset name` removes one override and bare `scene reset` restores every default. Bindings are undoable and serialized with the project.\n\n`scene load` imports a one-time embedded copy and clears old bindings. `scene link` instead records an absolute external path plus a last-valid cached snapshot. The editor polls only linked files, debounces writes, and automatically refreshes valid changes. Missing files and syntax/type errors keep the cached snapshot active. `scene reload` forces an immediate read, while `scene unlink` removes the link and makes the cache internally editable. Linked source is read-only in MMRecode to avoid two writers; edit it externally or unlink it first. Relative resources continue to resolve beside the imported or linked module. Ordinary project `save` persists source snapshots, links, and bindings; `scene save as` extracts the current cached source without changing ownership.\n\nEditing keys\n  Tab / Shift-Tab    change focused pane\n  arrows, Home, End  move source cursor\n  Page Up / Down     move and scroll by a page\n  Enter / Backspace / Delete and printable text edit source\n  Ctrl-S             save the containing project\n  Ctrl-Z / Ctrl-Y    undo / redo project edits, including source and bindings\n  Esc                focus command prompt\n\nThe editor highlights MMFX at-rules, properties, strings, colors, numeric units, values, and comments. Scene 0.4 also supports @image resources, intrinsic `auto` sizing with min/max constraints, overlay/row/column layout, absolute children, padding and gaps, exact-frame @keyframes, translation/scale/rotation, and cover-style scrolling. Animation time is source-local, so trimming selects a different part of the animation. The monitor continues to show the timeline playhead while source is open; focus the timeline with Tab to scrub it.\n\nEach source edit or binding update schedules compilation after a short pause. Diagnostics include source line and column. Invalid source remains editable and persistable, while an invalid render never replaces the last valid monitor frame. Color glyphs and system-font fallback are not part of the current deterministic renderer."
                 .replace(
                     "The monitor continues to show the timeline playhead while source is open; focus the timeline with Tab to scrub it.",
                     "The Project Monitor continues to show the root project composition while source is open, with the draft scene over its underlying frame. The hierarchy timeline remains local to the selected object and maps its playhead to project time; focus it with Tab to scrub.",
@@ -1873,6 +1967,7 @@ mod tests {
         assert!(source.source.contains("@scene LowerThird"));
         assert!(source.source.contains("width: 1920px"));
         assert!(source.resource_base.is_none());
+        assert!(source.linked_path.is_none());
         assert_eq!(
             session.project().media(media_id).unwrap().kind.as_str(),
             "scene/mmfx"
@@ -1882,6 +1977,7 @@ mod tests {
             .replace_current_mmfx_source(MmfxSource {
                 source: "@scene Changed { width: 1px; height: 1px; }".into(),
                 resource_base: Some(PathBuf::from("/tmp/mmfx-resources")),
+                linked_path: None,
                 parameter_bindings: BTreeMap::new(),
             })
             .unwrap();
@@ -2081,6 +2177,20 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command("scene link scenes/title.mmfx").unwrap(),
+            Some(EditCommand::SceneLink {
+                locator: "scenes/title.mmfx".into()
+            })
+        );
+        assert_eq!(
+            parse_command("scene reload").unwrap(),
+            Some(EditCommand::SceneReload)
+        );
+        assert_eq!(
+            parse_command("scene unlink").unwrap(),
+            Some(EditCommand::SceneUnlink)
+        );
+        assert_eq!(
             parse_command("fx save as title.mmfx").unwrap(),
             Some(EditCommand::FxSave {
                 locator: "title.mmfx".into()
@@ -2096,7 +2206,43 @@ mod tests {
         };
         assert!(fx_manual.contains("add scene <alias>"));
         assert!(fx_manual.contains("cd <alias>\nedit"));
-        assert!(fx_manual.contains("serialized inside the `.mmrecode` project"));
+        assert!(fx_manual.contains("last-valid cached snapshot"));
+    }
+
+    #[test]
+    fn external_refresh_survives_undoing_an_unrelated_project_edit() {
+        let mut session = session();
+        apply(&mut session, "add scene Title 2:00");
+        apply(&mut session, "cd Title");
+        session
+            .replace_current_mmfx_source(MmfxSource {
+                source: "@scene old { width: 10px; height: 10px; }".into(),
+                resource_base: Some(PathBuf::from("/tmp")),
+                linked_path: Some(PathBuf::from("/tmp/title.mmfx")),
+                parameter_bindings: BTreeMap::new(),
+            })
+            .unwrap();
+        apply(&mut session, "add text Child 0:10");
+        session.mark_saved(PathBuf::from("/tmp/film.mmrecode"));
+        assert!(!session.is_dirty());
+        let media_id = session.current_mmfx_source().unwrap().0;
+
+        assert!(
+            session
+                .refresh_linked_mmfx_source(media_id, "@scene new { width: 10px; height: 10px; }",)
+                .unwrap()
+        );
+        assert!(session.is_dirty());
+        apply(&mut session, "undo");
+        assert!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .source
+                .contains("new")
+        );
+        assert!(session.project().list(session.path()).unwrap().is_empty());
     }
 
     #[test]

@@ -1703,6 +1703,7 @@ impl H264Decoder {
                     order.value,
                     &mut luma_qp,
                     pps.chroma_qp_index_offset,
+                    pps.transform_8x8_mode,
                     first_macroblock,
                     end_macroblock,
                     false,
@@ -1919,6 +1920,7 @@ impl H264Decoder {
                 picture_order.value,
                 &mut luma_qp,
                 pps.chroma_qp_index_offset,
+                pps.transform_8x8_mode,
                 0,
                 macroblock_count,
                 sps.mb_adaptive_frame_field && structure == PictureStructure::Frame,
@@ -2054,6 +2056,7 @@ fn decode_p_macroblocks(
                 luma_qp,
                 pps.chroma_qp_index_offset,
                 prediction_weights,
+                pps.transform_8x8_mode,
             )?,
             5 => decode_intra_nxn(
                 reader,
@@ -2179,10 +2182,14 @@ fn decode_p_field_l0_macroblock(
             reference,
         );
     }
-    decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)
+    decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset, false)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn decode_b_macroblocks(
     reader: &mut SyntaxReader<'_>,
     buffer: &mut FrameBuffer,
@@ -2196,6 +2203,7 @@ fn decode_b_macroblocks(
     picture_order_count: i32,
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
+    transform_8x8_mode: bool,
     first_macroblock: usize,
     end_macroblock: usize,
     mbaff_frame: bool,
@@ -2251,7 +2259,7 @@ fn decode_b_macroblocks(
                 address,
                 direct_spatial_mv_pred,
             )?;
-            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset, false)?;
             bitstream_address += 1;
             continue;
         }
@@ -2267,7 +2275,7 @@ fn decode_b_macroblocks(
                 active_l0_minus1,
                 active_l1_minus1,
             )?;
-            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset, false)?;
             bitstream_address += 1;
             continue;
         }
@@ -2284,7 +2292,7 @@ fn decode_b_macroblocks(
                 direct_spatial_mv_pred,
                 direct_8x8_inference,
             )?;
-            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset, false)?;
             bitstream_address += 1;
             continue;
         }
@@ -2304,12 +2312,19 @@ fn decode_b_macroblocks(
                 direct_8x8_inference,
                 picture_order_count,
             )?;
-            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+            decode_inter_residuals(
+                reader,
+                buffer,
+                address,
+                luma_qp,
+                chroma_qp_offset,
+                transform_8x8_mode && direct_8x8_inference,
+            )?;
             bitstream_address += 1;
             continue;
         }
         if macroblock_type == 22 {
-            decode_b8x8_macroblock(
+            let transform_allowed = decode_b8x8_macroblock(
                 reader,
                 buffer,
                 list0,
@@ -2322,7 +2337,14 @@ fn decode_b_macroblocks(
                 direct_8x8_inference,
                 picture_order_count,
             )?;
-            decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+            decode_inter_residuals(
+                reader,
+                buffer,
+                address,
+                luma_qp,
+                chroma_qp_offset,
+                transform_8x8_mode && transform_allowed,
+            )?;
             bitstream_address += 1;
             continue;
         }
@@ -2410,7 +2432,14 @@ fn decode_b_macroblocks(
                 motion_l1,
             )?;
         }
-        decode_inter_residuals(reader, buffer, address, luma_qp, chroma_qp_offset)?;
+        decode_inter_residuals(
+            reader,
+            buffer,
+            address,
+            luma_qp,
+            chroma_qp_offset,
+            transform_8x8_mode,
+        )?;
         bitstream_address += 1;
     }
     Ok(())
@@ -2940,13 +2969,18 @@ fn decode_b8x8_macroblock(
     direct_spatial_mv_pred: bool,
     direct_8x8_inference: bool,
     picture_order_count: i32,
-) -> Result<()> {
+) -> Result<bool> {
     let subtypes = (0..4).map(|_| reader.ue()).collect::<Result<Vec<_>>>()?;
     let sub_macroblocks = subtypes
         .into_iter()
         .enumerate()
         .map(|(index, subtype)| b_sub_macroblock(index, subtype, direct_8x8_inference))
         .collect::<Result<Vec<_>>>()?;
+    let transform_allowed = sub_macroblocks.iter().all(|sub| {
+        sub.partitions
+            .iter()
+            .all(|partition| partition.block_width >= 2 && partition.block_height >= 2)
+    });
     let reference_indices_l0 = sub_macroblocks
         .iter()
         .map(|sub| {
@@ -3024,7 +3058,7 @@ fn decode_b8x8_macroblock(
             )?;
         }
     }
-    Ok(())
+    Ok(transform_allowed)
 }
 
 fn read_b_sub_motion_differences(
@@ -6893,30 +6927,30 @@ const CABAC_I_LUMA_4X4_ABS_LEVEL_INIT: [(i8, i8); 10] = [
     (-17, 110),
 ];
 
-struct CabacIContexts {
-    macroblock_type: [ContextState; 11],
-    macroblock_qp_delta: [ContextState; 4],
-    chroma_prediction_mode: [ContextState; 4],
+pub(crate) struct CabacIContexts {
+    pub(crate) macroblock_type: [ContextState; 11],
+    pub(crate) macroblock_qp_delta: [ContextState; 4],
+    pub(crate) chroma_prediction_mode: [ContextState; 4],
     intra4_prediction_mode: [ContextState; 2],
     transform_size_8x8: [ContextState; 3],
     coded_block_pattern_luma: [ContextState; 4],
     coded_block_pattern_chroma: [ContextState; 8],
-    luma_dc_coded_block: [ContextState; 4],
-    chroma_dc_coded_block: [ContextState; 4],
-    luma_ac_coded_block: [ContextState; 4],
-    chroma_ac_coded_block: [ContextState; 4],
-    luma_dc_significant: [ContextState; 15],
-    luma_dc_last: [ContextState; 15],
-    luma_dc_abs_level: [ContextState; 10],
-    chroma_dc_significant: [ContextState; 4],
-    chroma_dc_last: [ContextState; 4],
-    chroma_dc_abs_level: [ContextState; 10],
-    luma_ac_significant: [ContextState; 14],
-    luma_ac_last: [ContextState; 14],
-    luma_ac_abs_level: [ContextState; 10],
-    chroma_ac_significant: [ContextState; 14],
-    chroma_ac_last: [ContextState; 14],
-    chroma_ac_abs_level: [ContextState; 10],
+    pub(crate) luma_dc_coded_block: [ContextState; 4],
+    pub(crate) chroma_dc_coded_block: [ContextState; 4],
+    pub(crate) luma_ac_coded_block: [ContextState; 4],
+    pub(crate) chroma_ac_coded_block: [ContextState; 4],
+    pub(crate) luma_dc_significant: [ContextState; 15],
+    pub(crate) luma_dc_last: [ContextState; 15],
+    pub(crate) luma_dc_abs_level: [ContextState; 10],
+    pub(crate) chroma_dc_significant: [ContextState; 4],
+    pub(crate) chroma_dc_last: [ContextState; 4],
+    pub(crate) chroma_dc_abs_level: [ContextState; 10],
+    pub(crate) luma_ac_significant: [ContextState; 14],
+    pub(crate) luma_ac_last: [ContextState; 14],
+    pub(crate) luma_ac_abs_level: [ContextState; 10],
+    pub(crate) chroma_ac_significant: [ContextState; 14],
+    pub(crate) chroma_ac_last: [ContextState; 14],
+    pub(crate) chroma_ac_abs_level: [ContextState; 10],
     luma_4x4_coded_block: [ContextState; 4],
     luma_4x4_significant: [ContextState; 15],
     luma_4x4_last: [ContextState; 15],
@@ -6927,7 +6961,7 @@ struct CabacIContexts {
 }
 
 impl CabacIContexts {
-    fn new(slice_qp_y: i32) -> Result<Self> {
+    pub(crate) fn new(slice_qp_y: i32) -> Result<Self> {
         Ok(Self {
             macroblock_type: initial_i_macroblock_contexts(slice_qp_y)?,
             macroblock_qp_delta: initial_contexts(&CABAC_I_MB_QP_DELTA_INIT, slice_qp_y)?,
@@ -7975,8 +8009,13 @@ fn decode_p_l0_macroblock(
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
     prediction_weights: PredictionWeights,
+    transform_8x8_mode: bool,
 ) -> Result<()> {
     let partitions = read_inter_partitions(reader, macroblock_type)?;
+    let transform_8x8_allowed = transform_8x8_mode
+        && partitions
+            .iter()
+            .all(|partition| partition.block_width >= 2 && partition.block_height >= 2);
     let reference_partition_count = match macroblock_type {
         0 => 1,
         1 | 2 => 2,
@@ -8051,6 +8090,7 @@ fn decode_p_l0_macroblock(
         macroblock_address,
         luma_qp,
         chroma_qp_offset,
+        transform_8x8_allowed,
     )
 }
 
@@ -8060,6 +8100,7 @@ fn decode_inter_residuals(
     macroblock_address: usize,
     luma_qp: &mut i32,
     chroma_qp_offset: i32,
+    transform_8x8_allowed: bool,
 ) -> Result<()> {
     let pattern_code = usize::try_from(reader.ue()?)
         .ok()
@@ -8068,26 +8109,59 @@ fn decode_inter_residuals(
     let pattern = INTER_CODED_BLOCK_PATTERN[pattern_code];
     let luma_pattern = pattern & 15;
     let chroma_pattern = pattern >> 4;
+    let transform_8x8 = transform_8x8_allowed && luma_pattern != 0 && reader.bit()?;
+    buffer.transform_8x8[macroblock_address] = transform_8x8;
     if pattern != 0 {
         *luma_qp = (*luma_qp + reader.se()?).rem_euclid(52);
     }
-    let mut luma_blocks: [Vec<i32>; 16] = std::array::from_fn(|_| vec![0; 16]);
-    for group in 0..4 {
-        for within_group in 0..4 {
-            let block_index = group * 4 + within_group;
-            if luma_pattern & (1 << group) != 0 {
-                let n_c = buffer.luma_nc(macroblock_address, block_index);
-                let decoded = decode_residual_block(&mut reader.bits, n_c, 16)?;
-                luma_blocks[block_index] = decoded.coefficients;
-                buffer.set_luma_nonzero(macroblock_address, block_index, decoded.total_coeff);
-            } else {
-                buffer.set_luma_nonzero(macroblock_address, block_index, 0);
+    let luma_blocks = if transform_8x8 {
+        None
+    } else {
+        let mut blocks: [Vec<i32>; 16] = std::array::from_fn(|_| vec![0; 16]);
+        for group in 0..4 {
+            for within_group in 0..4 {
+                let block_index = group * 4 + within_group;
+                if luma_pattern & (1 << group) != 0 {
+                    let n_c = buffer.luma_nc(macroblock_address, block_index);
+                    let decoded = decode_residual_block(&mut reader.bits, n_c, 16)?;
+                    blocks[block_index] = decoded.coefficients;
+                    buffer.set_luma_nonzero(macroblock_address, block_index, decoded.total_coeff);
+                } else {
+                    buffer.set_luma_nonzero(macroblock_address, block_index, 0);
+                }
             }
         }
-    }
+        Some(blocks)
+    };
+    let luma_8x8_blocks = if transform_8x8 {
+        let mut blocks: [Vec<i32>; 4] = std::array::from_fn(|_| vec![0; 64]);
+        for (group, levels) in blocks.iter_mut().enumerate() {
+            for sub_block in 0..4 {
+                let block_index = group * 4 + sub_block;
+                if luma_pattern & (1 << group) != 0 {
+                    let n_c = buffer.luma_nc(macroblock_address, block_index);
+                    let decoded = decode_residual_block(&mut reader.bits, n_c, 16)?;
+                    for (coefficient, level) in decoded.coefficients.into_iter().enumerate() {
+                        levels[coefficient * 4 + sub_block] = level;
+                    }
+                    buffer.set_luma_nonzero(macroblock_address, block_index, decoded.total_coeff);
+                } else {
+                    buffer.set_luma_nonzero(macroblock_address, block_index, 0);
+                }
+            }
+        }
+        Some(blocks)
+    } else {
+        None
+    };
     let (chroma_dc, chroma_blocks) =
         decode_chroma_blocks(reader, buffer, macroblock_address, chroma_pattern)?;
-    buffer.add_luma_residual_blocks(macroblock_address, &luma_blocks, *luma_qp)?;
+    if let Some(luma_blocks) = luma_blocks {
+        buffer.add_luma_residual_blocks(macroblock_address, &luma_blocks, *luma_qp)?;
+    }
+    if let Some(luma_8x8_blocks) = luma_8x8_blocks {
+        buffer.add_luma_residual_8x8_blocks(macroblock_address, &luma_8x8_blocks, *luma_qp)?;
+    }
     buffer.add_chroma_residual(
         macroblock_address,
         &chroma_dc,

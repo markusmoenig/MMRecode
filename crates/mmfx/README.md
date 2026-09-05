@@ -104,6 +104,12 @@ source line and column while the monitor retains its last valid frame. Run `help
 `man scene` for the complete workflow. The `fx` namespace is reserved for future filters,
 transitions, generators, and kernels; the old scene-oriented `add fx` commands remain aliases.
 
+For an external-editor workflow, `scene link <file>` keeps an absolute watched path plus a
+last-valid cached snapshot in the project. Valid file saves refresh automatically after a short
+debounce; missing or invalid files retain the cached preview/export source. `scene reload` forces a
+read and `scene unlink` embeds the cache for internal editing. Linked source is read-only in the
+internal code pane to avoid simultaneous writers.
+
 MMFX placements at the current hierarchy level are rendered at their timeline ranges even while
 the source pane is open. FX-only projects use the same custom-pixel timeline as video projects and
 show the composited project canvas in the monitor; when video is present, active MMFX scenes are

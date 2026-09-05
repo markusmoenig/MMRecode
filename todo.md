@@ -426,8 +426,9 @@ redistributes each picture target between quiet and textured regions with normat
 Opt-in single-CPB NAL HRD/VBV signalling and scheduling writes VUI plus buffering/picture-timing
 SEI and rejects access units that violate the declared buffer. Broader coding tools remain
 follow-on work. Encoder profile selection now advertises Baseline for I/P-only streams and Main for
-B-picture streams instead of placing unsupported B syntax under a Baseline SPS. Annex A level
-selection covers Levels 1 through 6.2 using structural, cadence, DPB, bitrate, and CPB limits.
+B-picture streams instead of placing unsupported B syntax under a Baseline SPS. High Profile
+Intra8 output adds filtered 8x8 prediction, transform/quantization, and CAVLC residuals. Annex A
+level selection covers Levels 1 through 6.2 using structural, cadence, DPB, bitrate, and CPB limits.
 Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
 in-loop deblocking and default-list multiple-reference CAVLC P slices are also implemented, including skip,
@@ -636,13 +637,29 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Add opt-in single-entry NAL HRD/VBV scheduling with scaled SPS rate/CPB syntax, 24-bit
   buffering-period and picture-timing SEI delays, duration-aware removal clocks, reordered B output
   delays, shared rate-controller capacity, and explicit CPB violation errors.
-- [x] Add `profile=auto|baseline|main`, automatically promote B-picture streams to Main Profile,
-  reject forced Baseline+B output, and keep SPS plus `avcC` profile declarations identical.
+- [x] Add `profile=auto|baseline|main|high`, automatically promote B-picture streams to Main and
+  Intra8 streams to High Profile, reject incompatible forced profiles, and keep SPS plus `avcC`
+  profile declarations identical.
 - [x] Add Annex A level negotiation across Levels 1 through 6.2, including Level 1b signalling,
   exact frame-size/rate and dimension checks, DPB/bitrate/CPB constraints, explicit-level
   diagnostics, actual-frame-duration enforcement, and matching SPS/`avcC` declarations.
-- [ ] Add broader High Profile encoder tools after the adaptive and buffer-constrained controller
-  and Baseline/Main profile-level negotiation are mature.
+- [x] Start High Profile encoding with all nine filtered Intra8 prediction directions, normative
+  8x8 integer transforms and flat-matrix quantization, CAVLC coefficient interleaving, High SPS/PPS
+  syntax, adaptive inter 4x4/8x8 transform decisions for eligible P/B macroblocks, matching native
+  CAVLC reconstruction, and FFmpeg reconstruction checks.
+- [x] Add High Profile QP-zero transform bypass for lossless Intra4 and inter P/B coding, including
+  directional luma/chroma residual DPCM, automatic High Profile selection, incompatible-setting
+  validation, exact native reconstruction, and FFmpeg verification.
+- [x] Add `scaling_matrix=flat|jvt`, signal the standard High Profile SPS fallback matrices, and
+  apply them consistently to Intra16/Intra4/Intra8, chroma, and adaptive P/B 4x4/8x8 quantization
+  plus local reconstruction with native and FFmpeg verification.
+- [x] Add the CABAC arithmetic encoder core and a complete `entropy=cabac` lossless `I_PCM` IDR
+  path with PPS signalling, Main/High profile negotiation, byte alignment, PCM restart, native
+  reconstruction, and FFmpeg verification.
+- [x] Extend CABAC emission to compressed Intra16 IDRs, including macroblock/chroma modes,
+  modulo-52 QP deltas, contextual luma/chroma coded-block flags, significance/last maps, reverse
+  coefficient levels and signs, AQ, scaling matrices, and native plus FFmpeg verification.
+- [ ] Extend CABAC emission to compressed Intra4/Intra8 and P/B macroblocks.
 - [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
   Treat a production-quality encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.

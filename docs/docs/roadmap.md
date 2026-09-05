@@ -22,8 +22,9 @@ The immediate editor work is dependable project handling and composition rather 
 
 ## MMFX progression
 
-MMFX now has a typed Scene 0.4 foundation with public parameters, text, images, intrinsic row/column/overlay layout,
-exact-frame keyframes, scrolling, and recursive placement-time preview/export. The next progression is:
+MMFX now has a typed Scene 0.4 foundation with public parameters, text, images, intrinsic
+row/column/overlay layout, exact-frame keyframes, scrolling, embedded or auto-synchronized linked
+source, and recursive placement-time preview/export. The next progression is:
 
 1. richer scene objects, media slots, and named reusable styles;
 2. animation delay/repetition and more timing controls;

@@ -6,10 +6,16 @@ use mmrecode_core::{
     PixelFormat, Plane, Result, StreamId, VideoEncoderSettings, VideoFrame,
 };
 
-use crate::{CODEC_NAME, cavlc::encode_residual_block};
+use crate::{
+    CODEC_NAME,
+    cabac::{CabacEncoder, initial_i_macroblock_contexts},
+    cavlc::encode_residual_block,
+    decoder::CabacIContexts,
+};
 
 const PROFILE_BASELINE: u8 = 66;
 const PROFILE_MAIN: u8 = 77;
+const PROFILE_HIGH: u8 = 100;
 const BASELINE_COMPATIBILITY: u8 = 0xc0;
 const NAL_LENGTH_SIZE: u8 = 4;
 const MAX_MACROBLOCKS_PER_FRAME: usize = 36_864;
@@ -64,6 +70,10 @@ struct Configuration {
     b_direct_mode: BDirectMode,
     aq_strength: u8,
     pic_order_cnt_type0: bool,
+    transform_8x8_mode: bool,
+    transform_bypass: bool,
+    entropy_coding: EntropyCoding,
+    scaling_matrix: ScalingMatrixPreset,
     level: LevelConfiguration,
 }
 
@@ -77,6 +87,8 @@ struct SequenceConfiguration {
     pic_order_cnt_type0: bool,
     hrd: Option<EncoderHrd>,
     profile: EncoderProfile,
+    transform_bypass: bool,
+    scaling_matrix: ScalingMatrixPreset,
     level: AvcLevel,
 }
 
@@ -304,19 +316,52 @@ struct ChromaResidual {
     ac: [[i32; 15]; 4],
 }
 
+#[derive(Clone, Debug)]
+enum InterLumaResidual {
+    FourByFour(Box<[[i32; 16]; 16]>),
+    BypassFourByFour(Box<[[i32; 16]; 16]>),
+    EightByEight(Box<[[i32; 64]; 4]>),
+}
+
+impl InterLumaResidual {
+    const fn uses_8x8(&self) -> bool {
+        matches!(self, Self::EightByEight(_))
+    }
+
+    fn coded_block_pattern(&self) -> u8 {
+        match self {
+            Self::FourByFour(levels) | Self::BypassFourByFour(levels) => {
+                luma_coded_block_pattern(levels)
+            }
+            Self::EightByEight(levels) => (0..4).fold(0_u8, |pattern, group| {
+                pattern | (u8::from(levels[group].iter().any(|&level| level != 0)) << group)
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum EncoderMode {
     #[default]
     Ipcm,
     Intra16,
     Intra4,
+    Intra8,
     Inter,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EntropyCoding {
+    #[default]
+    Cavlc,
+    Cabac,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EncoderProfile {
     Baseline,
     Main,
+    High,
 }
 
 impl EncoderProfile {
@@ -324,13 +369,14 @@ impl EncoderProfile {
         match self {
             Self::Baseline => PROFILE_BASELINE,
             Self::Main => PROFILE_MAIN,
+            Self::High => PROFILE_HIGH,
         }
     }
 
     const fn compatibility(self) -> u8 {
         match self {
             Self::Baseline => BASELINE_COMPATIBILITY,
-            Self::Main => 0,
+            Self::Main | Self::High => 0,
         }
     }
 }
@@ -341,6 +387,51 @@ enum ProfilePreference {
     Auto,
     Baseline,
     Main,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ScalingMatrixPreset {
+    #[default]
+    Flat,
+    Jvt,
+}
+
+const FLAT_4X4: [u8; 16] = [16; 16];
+const FLAT_8X8: [u8; 64] = [16; 64];
+const JVT_4X4_INTRA: [u8; 16] = [
+    6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42,
+];
+const JVT_4X4_INTER: [u8; 16] = [
+    10, 14, 20, 24, 14, 20, 24, 27, 20, 24, 27, 30, 24, 27, 30, 34,
+];
+const JVT_8X8_INTRA: [u8; 64] = [
+    6, 10, 13, 16, 18, 23, 25, 27, 10, 11, 16, 18, 23, 25, 27, 29, 13, 16, 18, 23, 25, 27, 29, 31,
+    16, 18, 23, 25, 27, 29, 31, 33, 18, 23, 25, 27, 29, 31, 33, 36, 23, 25, 27, 29, 31, 33, 36, 38,
+    25, 27, 29, 31, 33, 36, 38, 40, 27, 29, 31, 33, 36, 38, 40, 42,
+];
+const JVT_8X8_INTER: [u8; 64] = [
+    9, 13, 15, 17, 19, 21, 22, 24, 13, 13, 17, 19, 21, 22, 24, 25, 15, 17, 19, 21, 22, 24, 25, 27,
+    17, 19, 21, 22, 24, 25, 27, 28, 19, 21, 22, 24, 25, 27, 28, 30, 21, 22, 24, 25, 27, 28, 30, 32,
+    22, 24, 25, 27, 28, 30, 32, 33, 24, 25, 27, 28, 30, 32, 33, 35,
+];
+
+impl ScalingMatrixPreset {
+    const fn four_by_four(self, intra: bool) -> &'static [u8; 16] {
+        match (self, intra) {
+            (Self::Flat, _) => &FLAT_4X4,
+            (Self::Jvt, true) => &JVT_4X4_INTRA,
+            (Self::Jvt, false) => &JVT_4X4_INTER,
+        }
+    }
+
+    const fn eight_by_eight(self, intra: bool) -> &'static [u8; 64] {
+        match (self, intra) {
+            (Self::Flat, _) => &FLAT_8X8,
+            (Self::Jvt, true) => &JVT_8X8_INTRA,
+            (Self::Jvt, false) => &JVT_8X8_INTER,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -819,18 +910,24 @@ fn scaled_hrd_value(value: u64, base_shift: u8, name: &str) -> Result<(u8, u32, 
 
 /// Stateful deterministic H.264/AVC encoder foundation.
 ///
-/// This encoder emits Baseline- or Main-profile CAVLC access units. Its default `I_PCM` mode is
+/// This encoder emits Baseline-, Main-, or High-profile access units. Its default `I_PCM` mode is
 /// lossless but intentionally large. Setting the codec-specific `mode`
 /// option to `intra16` enables reconstructed-neighbor macroblock prediction, while `intra4`
-/// selects among all nine 4x4 luma prediction modes. Both compressed modes write quantized luma
-/// and chroma residuals with CAVLC. `inter` adds periodic Intra4 IDRs, the complete P partition tree
+/// selects among all nine 4x4 luma prediction modes. High Profile `intra8` uses filtered 8x8
+/// prediction and transforms. The compressed modes write quantized luma and chroma residuals with
+/// CAVLC. `inter` adds periodic Intra4 IDRs, the complete P partition tree
 /// down to 4x4, quarter-pixel luma refinement, multiple short-term references, optional B pictures,
 /// and optional scene-cut IDRs. The `qp` option selects a luma QP from 0 through 51. When the
 /// generic `bitrate` setting is present, it becomes the initial QP for a deterministic frame-level
 /// virtual-buffer controller. `aq_strength=1..12` redistributes that picture QP between quiet and
 /// textured macroblocks while preserving normative QP-delta state. `vbv_buffer_ms` activates
 /// single-CPB NAL HRD signalling and checked removal scheduling. `profile=auto` selects Baseline
-/// without B pictures and Main when B pictures are enabled.
+/// without B pictures, Main when B pictures are enabled, and High for `intra8`. Explicit High
+/// Profile inter coding adaptively selects 4x4 or 8x8 luma transforms for eligible macroblocks.
+/// `transform_bypass=true` enables exact QP-zero High Profile Intra4 or inter coding.
+/// `scaling_matrix=jvt` selects the standard High Profile intra/inter quantization matrices.
+/// `entropy=cabac` enables CABAC for `I_PCM` and Intra16 slices; other compressed CABAC
+/// macroblocks remain follow-on work and are rejected during configuration.
 #[derive(Debug, Default)]
 pub struct H264Encoder {
     configuration: Option<Configuration>,
@@ -1103,6 +1200,9 @@ impl Encoder for H264Encoder {
         let mut aq_strength = 0;
         let mut vbv_buffer_milliseconds = None;
         let mut profile_preference = ProfilePreference::Auto;
+        let mut transform_bypass = false;
+        let mut entropy_coding = EntropyCoding::Cavlc;
+        let mut scaling_matrix = ScalingMatrixPreset::Flat;
         let mut level_preference = LevelPreference::Auto;
         let mut frame_duration_ticks = 1_u64;
         for (name, value) in &settings.options {
@@ -1112,10 +1212,11 @@ impl Encoder for H264Encoder {
                         "ipcm" => EncoderMode::Ipcm,
                         "intra16" => EncoderMode::Intra16,
                         "intra4" => EncoderMode::Intra4,
+                        "intra8" => EncoderMode::Intra8,
                         "inter" => EncoderMode::Inter,
                         _ => {
                             return Err(Error::Unsupported(format!(
-                                "unsupported H.264 encoder mode {value}; expected ipcm, intra16, intra4, or inter"
+                                "unsupported H.264 encoder mode {value}; expected ipcm, intra16, intra4, intra8, or inter"
                             )));
                         }
                     };
@@ -1220,9 +1321,43 @@ impl Encoder for H264Encoder {
                         "auto" => ProfilePreference::Auto,
                         "baseline" => ProfilePreference::Baseline,
                         "main" => ProfilePreference::Main,
+                        "high" => ProfilePreference::High,
                         _ => {
                             return Err(Error::Unsupported(format!(
-                                "invalid H.264 profile {value}; expected auto, baseline, or main"
+                                "invalid H.264 profile {value}; expected auto, baseline, main, or high"
+                            )));
+                        }
+                    };
+                }
+                "transform_bypass" => {
+                    transform_bypass = match value.as_str() {
+                        "false" => false,
+                        "true" => true,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 transform_bypass {value}; expected true or false"
+                            )));
+                        }
+                    };
+                }
+                "entropy" => {
+                    entropy_coding = match value.as_str() {
+                        "cavlc" => EntropyCoding::Cavlc,
+                        "cabac" => EntropyCoding::Cabac,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 entropy {value}; expected cavlc or cabac"
+                            )));
+                        }
+                    };
+                }
+                "scaling_matrix" => {
+                    scaling_matrix = match value.as_str() {
+                        "flat" => ScalingMatrixPreset::Flat,
+                        "jvt" => ScalingMatrixPreset::Jvt,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 scaling_matrix {value}; expected flat or jvt"
                             )));
                         }
                     };
@@ -1284,7 +1419,7 @@ impl Encoder for H264Encoder {
         }
         if mode == EncoderMode::Ipcm && aq_strength != 0 {
             return Err(Error::Unsupported(
-                "H.264 aq_strength requires mode=intra16, intra4, or inter".into(),
+                "H.264 aq_strength requires mode=intra16, intra4, intra8, or inter".into(),
             ));
         }
         if vbv_buffer_milliseconds.is_some() && settings.bitrate.is_none() {
@@ -1293,14 +1428,70 @@ impl Encoder for H264Encoder {
             ));
         }
         let profile = match profile_preference {
-            ProfilePreference::Auto if b_frames == 0 => EncoderProfile::Baseline,
+            ProfilePreference::Auto
+                if mode == EncoderMode::Intra8
+                    || transform_bypass
+                    || scaling_matrix == ScalingMatrixPreset::Jvt =>
+            {
+                EncoderProfile::High
+            }
+            ProfilePreference::Auto if b_frames == 0 && entropy_coding == EntropyCoding::Cavlc => {
+                EncoderProfile::Baseline
+            }
             ProfilePreference::Baseline => EncoderProfile::Baseline,
             ProfilePreference::Auto | ProfilePreference::Main => EncoderProfile::Main,
+            ProfilePreference::High => EncoderProfile::High,
         };
         if profile == EncoderProfile::Baseline && b_frames != 0 {
             return Err(Error::Unsupported(
                 "H.264 Baseline Profile does not support B pictures; use profile=main or auto"
                     .into(),
+            ));
+        }
+        if entropy_coding == EntropyCoding::Cabac && profile == EncoderProfile::Baseline {
+            return Err(Error::Unsupported(
+                "H.264 CABAC requires profile=main, profile=high, or profile=auto".into(),
+            ));
+        }
+        if entropy_coding == EntropyCoding::Cabac
+            && !matches!(mode, EncoderMode::Ipcm | EncoderMode::Intra16)
+        {
+            return Err(Error::Unsupported(
+                "H.264 CABAC emission currently supports mode=ipcm or intra16; other compressed macroblocks require entropy=cavlc"
+                    .into(),
+            ));
+        }
+        if mode == EncoderMode::Intra8 && profile != EncoderProfile::High {
+            return Err(Error::Unsupported(
+                "H.264 Intra8x8 coding requires profile=high or auto".into(),
+            ));
+        }
+        if transform_bypass {
+            if profile != EncoderProfile::High {
+                return Err(Error::Unsupported(
+                    "H.264 transform bypass requires profile=high or auto".into(),
+                ));
+            }
+            if !matches!(mode, EncoderMode::Intra4 | EncoderMode::Inter) {
+                return Err(Error::Unsupported(
+                    "H.264 transform bypass currently requires mode=intra4 or inter".into(),
+                ));
+            }
+            if qp != 0 || aq_strength != 0 || settings.bitrate.is_some() {
+                return Err(Error::Unsupported(
+                    "H.264 transform bypass requires qp=0, aq_strength=0, and fixed-QP encoding"
+                        .into(),
+                ));
+            }
+        }
+        if scaling_matrix == ScalingMatrixPreset::Jvt && profile != EncoderProfile::High {
+            return Err(Error::Unsupported(
+                "H.264 JVT scaling matrices require profile=high or auto".into(),
+            ));
+        }
+        if scaling_matrix == ScalingMatrixPreset::Jvt && transform_bypass {
+            return Err(Error::Unsupported(
+                "H.264 scaling matrices do not apply when transform_bypass=true".into(),
             ));
         }
         let hrd = vbv_buffer_milliseconds
@@ -1314,7 +1505,8 @@ impl Encoder for H264Encoder {
             .map(|bitrate| {
                 if mode == EncoderMode::Ipcm {
                     return Err(Error::Unsupported(
-                        "H.264 bitrate control requires mode=intra16, intra4, or inter".into(),
+                        "H.264 bitrate control requires mode=intra16, intra4, intra8, or inter"
+                            .into(),
                     ));
                 }
                 RateControl::new(
@@ -1353,9 +1545,13 @@ impl Encoder for H264Encoder {
             pic_order_cnt_type0: b_frames != 0,
             hrd,
             profile,
+            transform_bypass,
+            scaling_matrix,
             level,
         })?;
-        let pps = encode_pps()?;
+        let transform_8x8_mode = mode == EncoderMode::Intra8
+            || mode == EncoderMode::Inter && profile == EncoderProfile::High && !transform_bypass;
+        let pps = encode_pps(transform_8x8_mode, entropy_coding)?;
         let descriptor = CodecDescriptor {
             codec_id: CodecId::new(CODEC_NAME),
             codec_tag: Some(FourCc(*b"avc1")),
@@ -1377,6 +1573,10 @@ impl Encoder for H264Encoder {
             b_direct_mode,
             aq_strength,
             pic_order_cnt_type0: b_frames != 0,
+            transform_8x8_mode,
+            transform_bypass,
+            entropy_coding,
+            scaling_matrix,
             level: LevelConfiguration {
                 level,
                 macroblocks_per_frame: macroblock_count,
@@ -1560,6 +1760,19 @@ fn encode_sps(configuration: &SequenceConfiguration) -> Result<Vec<u8>> {
     )?;
     writer.write_bits(u64::from(configuration.level.level_idc), 8)?;
     write_ue(&mut writer, 0)?; // seq_parameter_set_id
+    if configuration.profile == EncoderProfile::High {
+        write_ue(&mut writer, 1)?; // chroma_format_idc: 4:2:0
+        write_ue(&mut writer, 0)?; // bit_depth_luma_minus8
+        write_ue(&mut writer, 0)?; // bit_depth_chroma_minus8
+        writer.write_bit(configuration.transform_bypass)?; // qpprime_y_zero_transform_bypass_flag
+        let scaling_matrix_present = configuration.scaling_matrix == ScalingMatrixPreset::Jvt;
+        writer.write_bit(scaling_matrix_present)?; // seq_scaling_matrix_present_flag
+        if scaling_matrix_present {
+            for _ in 0..8 {
+                writer.write_bit(false)?; // seq_scaling_list_present_flag
+            }
+        }
+    }
     write_ue(&mut writer, 0)?; // log2_max_frame_num_minus4
     if configuration.pic_order_cnt_type0 {
         write_ue(&mut writer, 0)?; // pic_order_cnt_type
@@ -1618,11 +1831,11 @@ fn encode_sps(configuration: &SequenceConfiguration) -> Result<Vec<u8>> {
     Ok(make_nal(0x67, writer.into_bytes()))
 }
 
-fn encode_pps() -> Result<Vec<u8>> {
+fn encode_pps(transform_8x8_mode: bool, entropy_coding: EntropyCoding) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
     write_ue(&mut writer, 0)?; // pic_parameter_set_id
     write_ue(&mut writer, 0)?; // seq_parameter_set_id
-    writer.write_bit(false)?; // entropy_coding_mode_flag
+    writer.write_bit(entropy_coding == EntropyCoding::Cabac)?; // entropy_coding_mode_flag
     writer.write_bit(false)?; // bottom_field_pic_order_in_frame_present_flag
     write_ue(&mut writer, 0)?; // num_slice_groups_minus1
     write_ue(&mut writer, 0)?; // num_ref_idx_l0_default_active_minus1
@@ -1635,6 +1848,11 @@ fn encode_pps() -> Result<Vec<u8>> {
     writer.write_bit(true)?; // deblocking_filter_control_present_flag
     writer.write_bit(false)?; // constrained_intra_pred_flag
     writer.write_bit(false)?; // redundant_pic_cnt_present_flag
+    if transform_8x8_mode {
+        writer.write_bit(true)?; // transform_8x8_mode_flag
+        writer.write_bit(false)?; // pic_scaling_matrix_present_flag
+        write_se(&mut writer, 0)?; // second_chroma_qp_index_offset
+    }
     finish_rbsp(&mut writer)?;
     Ok(make_nal(0x68, writer.into_bytes()))
 }
@@ -1662,6 +1880,29 @@ fn encode_idr(
     let macroblocks_wide = configuration.coded_width / 16;
     let macroblocks_high = configuration.coded_height / 16;
     let padded = padded_planes(frame, configuration);
+    if configuration.entropy_coding == EntropyCoding::Cabac {
+        writer.align_to_byte_with(true); // cabac_alignment_one_bit
+        let rbsp = writer.into_bytes();
+        return match configuration.mode {
+            EncoderMode::Ipcm => encode_cabac_ipcm_idr(
+                frame,
+                configuration,
+                rbsp,
+                padded,
+                macroblocks_wide,
+                macroblocks_high,
+            ),
+            EncoderMode::Intra16 => encode_cabac_intra16_idr(
+                frame,
+                configuration,
+                rbsp,
+                &padded,
+                macroblocks_wide,
+                macroblocks_high,
+            ),
+            _ => unreachable!("configuration gates CABAC macroblock modes"),
+        };
+    }
     let macroblock_qps = adaptive_macroblock_qps(
         &padded[0],
         configuration.coded_width,
@@ -1682,6 +1923,28 @@ fn encode_idr(
             let address = macroblock_y * macroblocks_wide + macroblock_x;
             let macroblock_qp = macroblock_qps[address];
             let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+            if configuration.mode == EncoderMode::Intra8 {
+                let qp_changed = encode_intra8_macroblock(
+                    &mut writer,
+                    &padded,
+                    &mut reconstructed,
+                    &mut luma_modes,
+                    &mut luma_nonzero,
+                    &mut chroma_nonzero,
+                    address,
+                    macroblocks_wide,
+                    macroblock_x,
+                    macroblock_y,
+                    configuration.coded_width,
+                    macroblock_qp,
+                    qp_delta,
+                    configuration.scaling_matrix,
+                )?;
+                if qp_changed {
+                    previous_qp = macroblock_qp;
+                }
+                continue;
+            }
             if matches!(configuration.mode, EncoderMode::Intra4 | EncoderMode::Inter) {
                 let qp_changed = encode_intra4_macroblock(
                     &mut writer,
@@ -1697,6 +1960,9 @@ fn encode_idr(
                     configuration.coded_width,
                     macroblock_qp,
                     qp_delta,
+                    configuration.transform_8x8_mode,
+                    configuration.transform_bypass,
+                    configuration.scaling_matrix,
                 )?;
                 if qp_changed {
                     previous_qp = macroblock_qp;
@@ -1725,6 +1991,7 @@ fn encode_idr(
                     macroblock_y,
                     &luma_prediction,
                     macroblock_qp,
+                    configuration.scaling_matrix.four_by_four(true),
                 );
                 let ac_levels = quantize_intra16_luma_ac(
                     &padded[0],
@@ -1733,6 +2000,7 @@ fn encode_idr(
                     macroblock_y,
                     &luma_prediction,
                     macroblock_qp,
+                    configuration.scaling_matrix.four_by_four(true),
                 );
                 let chroma_qp = chroma_qp(macroblock_qp);
                 let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
@@ -1743,6 +2011,9 @@ fn encode_idr(
                         macroblock_y,
                         &chroma_predictions[component],
                         chroma_qp,
+                        false,
+                        Some(chroma_mode),
+                        configuration.scaling_matrix.four_by_four(true),
                     )
                 });
                 let has_luma_ac = ac_levels.iter().flatten().any(|&level| level != 0);
@@ -1803,6 +2074,7 @@ fn encode_idr(
                     &dc_levels,
                     &ac_levels,
                     macroblock_qp,
+                    configuration.scaling_matrix.four_by_four(true),
                 );
                 for (component, prediction) in chroma_predictions.iter().enumerate() {
                     reconstruct_chroma(
@@ -1813,6 +2085,9 @@ fn encode_idr(
                         prediction,
                         &chroma_residuals[component],
                         chroma_qp,
+                        false,
+                        Some(chroma_mode),
+                        configuration.scaling_matrix.four_by_four(true),
                     );
                 }
                 continue;
@@ -1860,6 +2135,541 @@ fn encode_idr(
         reference_l0_poc: vec![[None; 16]; macroblocks_wide * macroblocks_high],
         macroblock_intra: vec![true; macroblocks_wide * macroblocks_high],
     })
+}
+
+fn encode_cabac_ipcm_idr(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    mut rbsp: Vec<u8>,
+    padded: [Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    debug_assert_eq!(configuration.mode, EncoderMode::Ipcm);
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let mut contexts = initial_i_macroblock_contexts(configuration.qp)?;
+    let mut arithmetic = CabacEncoder::new();
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let context_increment = usize::from(macroblock_x != 0) + usize::from(macroblock_y != 0);
+            arithmetic.decision(&mut contexts[3 + context_increment], true)?;
+            arithmetic.terminate(true)?; // pcm_flag encoded through the termination process
+            rbsp.extend_from_slice(&arithmetic.finish()?);
+
+            let mut samples = BitWriter::new();
+            write_pcm_plane_block(
+                &mut samples,
+                &padded[0],
+                configuration.coded_width,
+                macroblock_x * 16,
+                macroblock_y * 16,
+                16,
+                16,
+            )?;
+            for plane in &padded[1..=2] {
+                write_pcm_plane_block(
+                    &mut samples,
+                    plane,
+                    configuration.coded_width / 2,
+                    macroblock_x * 8,
+                    macroblock_y * 8,
+                    8,
+                    8,
+                )?;
+            }
+            rbsp.extend_from_slice(&samples.into_bytes());
+
+            arithmetic = CabacEncoder::new();
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    Ok(EncodedFrame {
+        nal: make_nal(0x65, rbsp),
+        reconstructed: frame.clone(),
+        coded_reconstruction: padded,
+        motion_l0: vec![[None; 16]; macroblock_count],
+        reference_l0_poc: vec![[None; 16]; macroblock_count],
+        macroblock_intra: vec![true; macroblock_count],
+    })
+}
+
+#[derive(Debug)]
+struct CabacIntra16CodedBlocks {
+    luma_dc: Vec<bool>,
+    chroma_dc: Vec<[bool; 2]>,
+    luma_ac: Vec<[bool; 16]>,
+    chroma_ac: Vec<[[bool; 4]; 2]>,
+}
+
+impl CabacIntra16CodedBlocks {
+    fn new(macroblock_count: usize) -> Self {
+        Self {
+            luma_dc: vec![false; macroblock_count],
+            chroma_dc: vec![[false; 2]; macroblock_count],
+            luma_ac: vec![[false; 16]; macroblock_count],
+            chroma_ac: vec![[[false; 4]; 2]; macroblock_count],
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_cabac_intra16_idr(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    mut rbsp: Vec<u8>,
+    padded: &[Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    debug_assert_eq!(configuration.mode, EncoderMode::Intra16);
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let macroblock_qps = adaptive_macroblock_qps(
+        &padded[0],
+        configuration.coded_width,
+        configuration.coded_height,
+        configuration.qp,
+        configuration.aq_strength,
+    );
+    let mut contexts = CabacIContexts::new(configuration.qp)?;
+    let mut arithmetic = CabacEncoder::new();
+    let mut coded_blocks = CabacIntra16CodedBlocks::new(macroblock_count);
+    let mut chroma_prediction_modes = vec![0_u8; macroblock_count];
+    let mut previous_qp = configuration.qp;
+    let mut previous_qp_delta = 0;
+    let mut reconstructed: [Vec<u8>; 3] = std::array::from_fn(|component| {
+        let divisor = if component == 0 { 1 } else { 2 };
+        vec![0; configuration.coded_width / divisor * configuration.coded_height / divisor]
+    });
+
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let macroblock_qp = macroblock_qps[address];
+            let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+            let (luma_mode, luma_prediction) = select_luma_prediction(
+                &padded[0],
+                &reconstructed[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+            );
+            let (chroma_mode, chroma_predictions) = select_chroma_prediction(
+                [&padded[1], &padded[2]],
+                [&reconstructed[1], &reconstructed[2]],
+                configuration.coded_width / 2,
+                macroblock_x,
+                macroblock_y,
+            );
+            let dc_levels = quantize_intra16_luma_dc(
+                &padded[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &luma_prediction,
+                macroblock_qp,
+                configuration.scaling_matrix.four_by_four(true),
+            );
+            let ac_levels = quantize_intra16_luma_ac(
+                &padded[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &luma_prediction,
+                macroblock_qp,
+                configuration.scaling_matrix.four_by_four(true),
+            );
+            let chroma_qp = chroma_qp(macroblock_qp);
+            let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+                quantize_chroma_residual(
+                    &padded[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    &chroma_predictions[component],
+                    chroma_qp,
+                    false,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                )
+            });
+            let has_luma_ac = ac_levels.iter().flatten().any(|&level| level != 0);
+            let has_chroma_ac = chroma_residuals
+                .iter()
+                .flat_map(|residual| residual.ac.iter().flatten())
+                .any(|&level| level != 0);
+            let chroma_cbp = if has_chroma_ac {
+                2
+            } else {
+                u8::from(
+                    chroma_residuals
+                        .iter()
+                        .flat_map(|residual| residual.dc)
+                        .any(|level| level != 0),
+                )
+            };
+            let macroblock_type = 1 + luma_mode + chroma_cbp * 4 + u8::from(has_luma_ac) * 12;
+
+            encode_cabac_i_macroblock_type(
+                &mut arithmetic,
+                &mut contexts,
+                macroblock_type,
+                usize::from(macroblock_x != 0) + usize::from(macroblock_y != 0),
+            )?;
+            encode_cabac_chroma_prediction_mode(
+                &mut arithmetic,
+                &mut contexts,
+                chroma_mode,
+                address,
+                macroblocks_wide,
+                &chroma_prediction_modes,
+            )?;
+            chroma_prediction_modes[address] = chroma_mode;
+            encode_cabac_macroblock_qp_delta(
+                &mut arithmetic,
+                &mut contexts,
+                qp_delta,
+                previous_qp_delta,
+            )?;
+            previous_qp_delta = qp_delta;
+            previous_qp = macroblock_qp;
+
+            let luma_dc_context =
+                cabac_intra_dc_coded_context(address, macroblocks_wide, |neighbor| {
+                    coded_blocks.luma_dc[neighbor]
+                });
+            let luma_dc_coded = dc_levels.iter().any(|&level| level != 0);
+            arithmetic.decision(
+                &mut contexts.luma_dc_coded_block[luma_dc_context],
+                luma_dc_coded,
+            )?;
+            coded_blocks.luma_dc[address] = luma_dc_coded;
+            if luma_dc_coded {
+                encode_cabac_residual_block(
+                    &mut arithmetic,
+                    &mut contexts.luma_dc_significant,
+                    &mut contexts.luma_dc_last,
+                    &mut contexts.luma_dc_abs_level,
+                    &dc_levels,
+                )?;
+            }
+
+            if has_luma_ac {
+                for (block_index, levels) in ac_levels.iter().enumerate() {
+                    let coded_context = cabac_intra_luma_ac_coded_context(
+                        address,
+                        macroblocks_wide,
+                        block_index,
+                        &coded_blocks.luma_ac,
+                    );
+                    let coded = levels.iter().any(|&level| level != 0);
+                    arithmetic.decision(&mut contexts.luma_ac_coded_block[coded_context], coded)?;
+                    coded_blocks.luma_ac[address][block_index] = coded;
+                    if coded {
+                        encode_cabac_residual_block(
+                            &mut arithmetic,
+                            &mut contexts.luma_ac_significant,
+                            &mut contexts.luma_ac_last,
+                            &mut contexts.luma_ac_abs_level,
+                            levels,
+                        )?;
+                    }
+                }
+            }
+
+            if chroma_cbp != 0 {
+                for (component, residual) in chroma_residuals.iter().enumerate() {
+                    let coded_context =
+                        cabac_intra_dc_coded_context(address, macroblocks_wide, |neighbor| {
+                            coded_blocks.chroma_dc[neighbor][component]
+                        });
+                    let coded = residual.dc.iter().any(|&level| level != 0);
+                    arithmetic
+                        .decision(&mut contexts.chroma_dc_coded_block[coded_context], coded)?;
+                    coded_blocks.chroma_dc[address][component] = coded;
+                    if coded {
+                        encode_cabac_residual_block(
+                            &mut arithmetic,
+                            &mut contexts.chroma_dc_significant,
+                            &mut contexts.chroma_dc_last,
+                            &mut contexts.chroma_dc_abs_level,
+                            &residual.dc,
+                        )?;
+                    }
+                }
+            }
+            if chroma_cbp == 2 {
+                for (component, residual) in chroma_residuals.iter().enumerate() {
+                    for (block_index, levels) in residual.ac.iter().enumerate() {
+                        let coded_context = cabac_intra_chroma_ac_coded_context(
+                            address,
+                            macroblocks_wide,
+                            component,
+                            block_index,
+                            &coded_blocks.chroma_ac,
+                        );
+                        let coded = levels.iter().any(|&level| level != 0);
+                        arithmetic
+                            .decision(&mut contexts.chroma_ac_coded_block[coded_context], coded)?;
+                        coded_blocks.chroma_ac[address][component][block_index] = coded;
+                        if coded {
+                            encode_cabac_residual_block(
+                                &mut arithmetic,
+                                &mut contexts.chroma_ac_significant,
+                                &mut contexts.chroma_ac_last,
+                                &mut contexts.chroma_ac_abs_level,
+                                levels,
+                            )?;
+                        }
+                    }
+                }
+            }
+
+            reconstruct_intra16_luma(
+                &mut reconstructed[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &luma_prediction,
+                &dc_levels,
+                &ac_levels,
+                macroblock_qp,
+                configuration.scaling_matrix.four_by_four(true),
+            );
+            for (component, prediction) in chroma_predictions.iter().enumerate() {
+                reconstruct_chroma(
+                    &mut reconstructed[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    prediction,
+                    &chroma_residuals[component],
+                    chroma_qp,
+                    false,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                );
+            }
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    let visible = visible_frame(frame, configuration, &reconstructed);
+    Ok(EncodedFrame {
+        nal: make_nal(0x65, rbsp),
+        reconstructed: visible,
+        coded_reconstruction: reconstructed,
+        motion_l0: vec![[None; 16]; macroblock_count],
+        reference_l0_poc: vec![[None; 16]; macroblock_count],
+        macroblock_intra: vec![true; macroblock_count],
+    })
+}
+
+fn encode_cabac_i_macroblock_type(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacIContexts,
+    macroblock_type: u8,
+    context_increment: usize,
+) -> Result<()> {
+    debug_assert!((1..=24).contains(&macroblock_type));
+    arithmetic.decision(&mut contexts.macroblock_type[3 + context_increment], true)?;
+    arithmetic.terminate(false)?;
+    let code = macroblock_type - 1;
+    arithmetic.decision(&mut contexts.macroblock_type[6], code >= 12)?;
+    let remainder = code % 12;
+    arithmetic.decision(&mut contexts.macroblock_type[7], remainder >= 4)?;
+    if remainder >= 4 {
+        arithmetic.decision(&mut contexts.macroblock_type[8], remainder >= 8)?;
+    }
+    arithmetic.decision(&mut contexts.macroblock_type[9], remainder % 4 >= 2)?;
+    arithmetic.decision(
+        &mut contexts.macroblock_type[10],
+        !remainder.is_multiple_of(2),
+    )
+}
+
+fn encode_cabac_chroma_prediction_mode(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacIContexts,
+    mode: u8,
+    address: usize,
+    macroblocks_wide: usize,
+    modes: &[u8],
+) -> Result<()> {
+    debug_assert!(mode <= 3);
+    let context_increment =
+        usize::from(!address.is_multiple_of(macroblocks_wide) && modes[address - 1] != 0)
+            + usize::from(address >= macroblocks_wide && modes[address - macroblocks_wide] != 0);
+    arithmetic.decision(
+        &mut contexts.chroma_prediction_mode[context_increment],
+        mode != 0,
+    )?;
+    if mode != 0 {
+        arithmetic.decision(&mut contexts.chroma_prediction_mode[3], mode != 1)?;
+        if mode > 1 {
+            arithmetic.decision(&mut contexts.chroma_prediction_mode[3], mode == 3)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_cabac_macroblock_qp_delta(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacIContexts,
+    delta: i32,
+    previous_delta: i32,
+) -> Result<()> {
+    arithmetic.decision(
+        &mut contexts.macroblock_qp_delta[usize::from(previous_delta != 0)],
+        delta != 0,
+    )?;
+    if delta == 0 {
+        return Ok(());
+    }
+    let magnitude = delta.unsigned_abs();
+    let code = if delta > 0 {
+        magnitude * 2 - 1
+    } else {
+        magnitude * 2
+    };
+    for index in 1..code {
+        let context_index = if index == 1 { 2 } else { 3 };
+        arithmetic.decision(&mut contexts.macroblock_qp_delta[context_index], true)?;
+    }
+    let context_index = if code == 1 { 2 } else { 3 };
+    arithmetic.decision(&mut contexts.macroblock_qp_delta[context_index], false)
+}
+
+fn encode_cabac_residual_block(
+    arithmetic: &mut CabacEncoder,
+    significant_contexts: &mut [crate::cabac::ContextState],
+    last_contexts: &mut [crate::cabac::ContextState],
+    absolute_level_contexts: &mut [crate::cabac::ContextState],
+    levels: &[i32],
+) -> Result<()> {
+    const LEVEL_ONE_CONTEXT: [usize; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+    const LEVEL_GT_ONE_CONTEXT: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
+    const AFTER_LEVEL_ONE: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
+    const AFTER_LEVEL_GT_ONE: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
+
+    let last_nonzero = levels
+        .iter()
+        .rposition(|&level| level != 0)
+        .expect("coded CABAC residual block contains a coefficient");
+    for (position, &level) in levels.iter().enumerate().take(levels.len() - 1) {
+        let significant = level != 0;
+        arithmetic.decision(&mut significant_contexts[position], significant)?;
+        if significant {
+            let last = position == last_nonzero;
+            arithmetic.decision(&mut last_contexts[position], last)?;
+            if last {
+                break;
+            }
+        }
+    }
+
+    let mut node_context = 0;
+    for &level in levels[..=last_nonzero]
+        .iter()
+        .rev()
+        .filter(|&&level| level != 0)
+    {
+        let absolute_level = level.unsigned_abs();
+        arithmetic.decision(
+            &mut absolute_level_contexts[LEVEL_ONE_CONTEXT[node_context]],
+            absolute_level > 1,
+        )?;
+        if absolute_level > 1 {
+            let context_index = LEVEL_GT_ONE_CONTEXT[node_context];
+            node_context = AFTER_LEVEL_GT_ONE[node_context];
+            for _ in 2..absolute_level.min(15) {
+                arithmetic.decision(&mut absolute_level_contexts[context_index], true)?;
+            }
+            if absolute_level < 15 {
+                arithmetic.decision(&mut absolute_level_contexts[context_index], false)?;
+            } else {
+                encode_cabac_unsigned_bypass(arithmetic, absolute_level - 15)?;
+            }
+        } else {
+            node_context = AFTER_LEVEL_ONE[node_context];
+        }
+        arithmetic.bypass(level < 0)?;
+    }
+    Ok(())
+}
+
+fn encode_cabac_unsigned_bypass(arithmetic: &mut CabacEncoder, value: u32) -> Result<()> {
+    let code_num = value + 1;
+    let prefix = u32::BITS - 1 - code_num.leading_zeros();
+    for _ in 0..prefix {
+        arithmetic.bypass(true)?;
+    }
+    arithmetic.bypass(false)?;
+    for bit in (0..prefix).rev() {
+        arithmetic.bypass(code_num & (1 << bit) != 0)?;
+    }
+    Ok(())
+}
+
+fn cabac_intra_dc_coded_context(
+    address: usize,
+    macroblocks_wide: usize,
+    neighbor_is_coded: impl Fn(usize) -> bool,
+) -> usize {
+    let left = address.is_multiple_of(macroblocks_wide) || neighbor_is_coded(address - 1);
+    let top = address < macroblocks_wide || neighbor_is_coded(address - macroblocks_wide);
+    usize::from(left) + 2 * usize::from(top)
+}
+
+fn cabac_intra_luma_ac_coded_context(
+    address: usize,
+    macroblocks_wide: usize,
+    block_index: usize,
+    coded: &[[bool; 16]],
+) -> usize {
+    let (block_x, block_y) = luma_block_position(block_index);
+    let left = if block_x > 0 {
+        coded[address][luma_block_index(block_x - 1, block_y)]
+    } else if !address.is_multiple_of(macroblocks_wide) {
+        coded[address - 1][luma_block_index(3, block_y)]
+    } else {
+        true
+    };
+    let top = if block_y > 0 {
+        coded[address][luma_block_index(block_x, block_y - 1)]
+    } else if address >= macroblocks_wide {
+        coded[address - macroblocks_wide][luma_block_index(block_x, 3)]
+    } else {
+        true
+    };
+    usize::from(left) + 2 * usize::from(top)
+}
+
+fn cabac_intra_chroma_ac_coded_context(
+    address: usize,
+    macroblocks_wide: usize,
+    component: usize,
+    block_index: usize,
+    coded: &[[[bool; 4]; 2]],
+) -> usize {
+    let block_x = block_index % 2;
+    let block_y = block_index / 2;
+    let left = if block_x > 0 {
+        coded[address][component][block_index - 1]
+    } else if !address.is_multiple_of(macroblocks_wide) {
+        coded[address - 1][component][block_y * 2 + 1]
+    } else {
+        true
+    };
+    let top = if block_y > 0 {
+        coded[address][component][block_index - 2]
+    } else if address >= macroblocks_wide {
+        coded[address - macroblocks_wide][component][2 + block_x]
+    } else {
+        true
+    };
+    usize::from(left) + 2 * usize::from(top)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1925,13 +2735,20 @@ fn encode_p_picture(
                 address,
                 macroblocks_wide,
             );
-            let luma_levels = quantize_inter_luma_residual(
+            let transform_8x8_allowed = configuration.transform_8x8_mode
+                && decision.partitions.iter().all(|selected| {
+                    selected.partition.block_width >= 2 && selected.partition.block_height >= 2
+                });
+            let luma_levels = select_inter_luma_residual(
                 &source[0],
                 configuration.coded_width,
                 macroblock_x,
                 macroblock_y,
                 &decision.luma_prediction,
                 macroblock_qp,
+                transform_8x8_allowed,
+                configuration.transform_bypass,
+                configuration.scaling_matrix,
             );
             let chroma_qp = chroma_qp(macroblock_qp);
             let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
@@ -1942,9 +2759,12 @@ fn encode_p_picture(
                     macroblock_y,
                     &decision.chroma_predictions[component],
                     chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
                 )
             });
-            let luma_pattern = luma_coded_block_pattern(&luma_levels);
+            let luma_pattern = luma_levels.coded_block_pattern();
             let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
             let coded_block_pattern = luma_pattern | chroma_pattern << 4;
 
@@ -1956,6 +2776,7 @@ fn encode_p_picture(
                 &decision.luma_prediction,
                 &luma_levels,
                 macroblock_qp,
+                configuration.scaling_matrix,
             );
             for (component, prediction) in decision.chroma_predictions.iter().enumerate() {
                 reconstruct_chroma(
@@ -1966,6 +2787,9 @@ fn encode_p_picture(
                     prediction,
                     &chroma_residuals[component],
                     chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
                 );
             }
 
@@ -2028,6 +2852,9 @@ fn encode_p_picture(
                 .position(|&pattern| pattern == coded_block_pattern)
                 .expect("every inter coded-block pattern has an Exp-Golomb mapping");
             write_ue(&mut writer, pattern_code as u64)?;
+            if transform_8x8_allowed && luma_pattern != 0 {
+                writer.write_bit(luma_levels.uses_8x8())?; // transform_size_8x8_flag
+            }
             if coded_block_pattern != 0 {
                 let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
                 write_se(&mut writer, i64::from(qp_delta))?;
@@ -2145,13 +2972,21 @@ fn encode_b_picture(
                     picture_order_count,
                 },
             );
-            let luma_levels = quantize_inter_luma_residual(
+            let transform_8x8_allowed = configuration.transform_8x8_mode
+                && decision.partitions.iter().all(|selected| {
+                    let partition = selected.partition();
+                    partition.block_width >= 2 && partition.block_height >= 2
+                });
+            let luma_levels = select_inter_luma_residual(
                 &source[0],
                 configuration.coded_width,
                 macroblock_x,
                 macroblock_y,
                 &decision.luma_prediction,
                 macroblock_qp,
+                transform_8x8_allowed,
+                configuration.transform_bypass,
+                configuration.scaling_matrix,
             );
             let chroma_qp = chroma_qp(macroblock_qp);
             let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
@@ -2162,9 +2997,12 @@ fn encode_b_picture(
                     macroblock_y,
                     &decision.chroma_predictions[component],
                     chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
                 )
             });
-            let luma_pattern = luma_coded_block_pattern(&luma_levels);
+            let luma_pattern = luma_levels.coded_block_pattern();
             let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
             let coded_block_pattern = luma_pattern | chroma_pattern << 4;
 
@@ -2176,6 +3014,7 @@ fn encode_b_picture(
                 &decision.luma_prediction,
                 &luma_levels,
                 macroblock_qp,
+                configuration.scaling_matrix,
             );
             for (component, prediction) in decision.chroma_predictions.iter().enumerate() {
                 reconstruct_chroma(
@@ -2186,6 +3025,9 @@ fn encode_b_picture(
                     prediction,
                     &chroma_residuals[component],
                     chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
                 );
             }
 
@@ -2234,6 +3076,9 @@ fn encode_b_picture(
                 .position(|&pattern| pattern == coded_block_pattern)
                 .expect("every inter coded-block pattern has an Exp-Golomb mapping");
             write_ue(&mut writer, pattern_code as u64)?;
+            if transform_8x8_allowed && luma_pattern != 0 {
+                writer.write_bit(luma_levels.uses_8x8())?; // transform_size_8x8_flag
+            }
             if coded_block_pattern != 0 {
                 let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
                 write_se(&mut writer, i64::from(qp_delta))?;
@@ -3262,7 +4107,7 @@ fn write_motion_difference(writer: &mut BitWriter, selected: SelectedPartition) 
 #[allow(clippy::too_many_arguments)]
 fn encode_inter_residuals(
     writer: &mut BitWriter,
-    luma_levels: &[[i32; 16]; 16],
+    luma_levels: &InterLumaResidual,
     chroma_residuals: &[ChromaResidual; 2],
     luma_pattern: u8,
     chroma_pattern: u8,
@@ -3271,12 +4116,31 @@ fn encode_inter_residuals(
     address: usize,
     macroblocks_wide: usize,
 ) -> Result<()> {
-    for group in 0..4 {
-        if luma_pattern & (1 << group) != 0 {
-            for block_index in group * 4..group * 4 + 4 {
-                let n_c = luma_nc(luma_nonzero, address, block_index, macroblocks_wide);
-                luma_nonzero[address][block_index] =
-                    encode_residual_block(writer, n_c, &luma_levels[block_index])?;
+    match luma_levels {
+        InterLumaResidual::FourByFour(levels) | InterLumaResidual::BypassFourByFour(levels) => {
+            for group in 0..4 {
+                if luma_pattern & (1 << group) != 0 {
+                    for block_index in group * 4..group * 4 + 4 {
+                        let n_c = luma_nc(luma_nonzero, address, block_index, macroblocks_wide);
+                        luma_nonzero[address][block_index] =
+                            encode_residual_block(writer, n_c, &levels[block_index])?;
+                    }
+                }
+            }
+        }
+        InterLumaResidual::EightByEight(levels) => {
+            for (group, group_levels) in levels.iter().enumerate() {
+                if luma_pattern & (1 << group) != 0 {
+                    for sub_block in 0..4 {
+                        let block_index = group * 4 + sub_block;
+                        let block_levels: [i32; 16] = std::array::from_fn(|coefficient| {
+                            group_levels[coefficient * 4 + sub_block]
+                        });
+                        let n_c = luma_nc(luma_nonzero, address, block_index, macroblocks_wide);
+                        luma_nonzero[address][block_index] =
+                            encode_residual_block(writer, n_c, &block_levels)?;
+                    }
+                }
             }
         }
     }
@@ -4138,6 +5002,7 @@ fn quantize_inter_luma_residual(
     macroblock_y: usize,
     prediction: &[u8],
     qp: i32,
+    scaling_list: &[u8; 16],
 ) -> [[i32; 16]; 16] {
     let origin_x = macroblock_x * 16;
     let origin_y = macroblock_y * 16;
@@ -4157,11 +5022,174 @@ fn quantize_inter_luma_residual(
             let transformed = forward_transform_4x4(&residual);
             let block_index = luma_block_index(block_x, block_y);
             for (destination, &(row, column)) in output[block_index].iter_mut().zip(&ZIG_ZAG_4X4) {
-                *destination = quantize_coefficient(transformed[row * 4 + column], qp, row, column);
+                *destination = quantize_coefficient(
+                    transformed[row * 4 + column],
+                    qp,
+                    row,
+                    column,
+                    scaling_list,
+                );
             }
         }
     }
     output
+}
+
+fn quantize_inter_luma_residual_8x8(
+    source: &[u8],
+    stride: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    prediction: &[u8],
+    qp: i32,
+    scaling_list: &[u8; 64],
+) -> [[i32; 64]; 4] {
+    let origin_x = macroblock_x * 16;
+    let origin_y = macroblock_y * 16;
+    std::array::from_fn(|group| {
+        let block_x = (group % 2) * 8;
+        let block_y = (group / 2) * 8;
+        let block_prediction: [u8; 64] = std::array::from_fn(|index| {
+            prediction[(block_y + index / 8) * 16 + block_x + index % 8]
+        });
+        quantize_intra8_luma_block(
+            source,
+            stride,
+            origin_x + block_x,
+            origin_y + block_y,
+            &block_prediction,
+            qp,
+            scaling_list,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_inter_luma_residual(
+    source: &[u8],
+    stride: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    prediction: &[u8],
+    qp: i32,
+    transform_8x8_allowed: bool,
+    transform_bypass: bool,
+    scaling_matrix: ScalingMatrixPreset,
+) -> InterLumaResidual {
+    if transform_bypass {
+        return InterLumaResidual::BypassFourByFour(Box::new(quantize_inter_luma_residual_bypass(
+            source,
+            stride,
+            macroblock_x,
+            macroblock_y,
+            prediction,
+        )));
+    }
+    let four_by_four = InterLumaResidual::FourByFour(Box::new(quantize_inter_luma_residual(
+        source,
+        stride,
+        macroblock_x,
+        macroblock_y,
+        prediction,
+        qp,
+        scaling_matrix.four_by_four(false),
+    )));
+    if !transform_8x8_allowed {
+        return four_by_four;
+    }
+    let eight_by_eight =
+        InterLumaResidual::EightByEight(Box::new(quantize_inter_luma_residual_8x8(
+            source,
+            stride,
+            macroblock_x,
+            macroblock_y,
+            prediction,
+            qp,
+            scaling_matrix.eight_by_eight(false),
+        )));
+    let four_cost = inter_luma_residual_cost(
+        source,
+        stride,
+        macroblock_x,
+        macroblock_y,
+        prediction,
+        &four_by_four,
+        qp,
+        scaling_matrix,
+    );
+    let eight_cost = inter_luma_residual_cost(
+        source,
+        stride,
+        macroblock_x,
+        macroblock_y,
+        prediction,
+        &eight_by_eight,
+        qp,
+        scaling_matrix,
+    );
+    if eight_cost <= four_cost {
+        eight_by_eight
+    } else {
+        four_by_four
+    }
+}
+
+fn quantize_inter_luma_residual_bypass(
+    source: &[u8],
+    stride: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    prediction: &[u8],
+) -> [[i32; 16]; 16] {
+    let origin_x = macroblock_x * 16;
+    let origin_y = macroblock_y * 16;
+    std::array::from_fn(|block_index| {
+        let (block_x, block_y) = luma_block_position(block_index);
+        std::array::from_fn(|coefficient| {
+            let (row, column) = ZIG_ZAG_4X4[coefficient];
+            i32::from(
+                source[(origin_y + block_y * 4 + row) * stride + origin_x + block_x * 4 + column],
+            ) - i32::from(prediction[(block_y * 4 + row) * 16 + block_x * 4 + column])
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inter_luma_residual_cost(
+    source: &[u8],
+    stride: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    prediction: &[u8],
+    levels: &InterLumaResidual,
+    qp: i32,
+    scaling_matrix: ScalingMatrixPreset,
+) -> u64 {
+    let reconstructed = reconstruct_inter_luma_prediction(prediction, levels, qp, scaling_matrix);
+    let origin_x = macroblock_x * 16;
+    let origin_y = macroblock_y * 16;
+    let mut distortion = 0_u64;
+    for y in 0..16 {
+        for x in 0..16 {
+            let difference = i32::from(source[(origin_y + y) * stride + origin_x + x])
+                - i32::from(reconstructed[y * 16 + x]);
+            distortion = distortion.saturating_add(u64::from(difference.unsigned_abs()).pow(2));
+        }
+    }
+    let nonzero = match levels {
+        InterLumaResidual::FourByFour(levels) | InterLumaResidual::BypassFourByFour(levels) => {
+            levels.iter().flatten().filter(|&&x| x != 0).count()
+        }
+        InterLumaResidual::EightByEight(levels) => {
+            levels.iter().flatten().filter(|&&x| x != 0).count()
+        }
+    };
+    let lambda = u64::try_from(qp + 1).expect("non-negative QP").pow(2);
+    distortion.saturating_add(
+        u64::try_from(nonzero)
+            .expect("bounded coefficient count")
+            .saturating_mul(lambda),
+    )
 }
 
 fn luma_coded_block_pattern(levels: &[[i32; 16]; 16]) -> u8 {
@@ -4200,29 +5228,11 @@ fn reconstruct_inter_luma(
     macroblock_x: usize,
     macroblock_y: usize,
     prediction: &[u8],
-    levels: &[[i32; 16]; 16],
+    levels: &InterLumaResidual,
     qp: i32,
+    scaling_matrix: ScalingMatrixPreset,
 ) {
-    let mut reconstructed = prediction.to_vec();
-    for block_y in 0..4 {
-        for block_x in 0..4 {
-            let block_index = luma_block_index(block_x, block_y);
-            let mut scaled = [0_i64; 16];
-            for (&level, &(row, column)) in levels[block_index].iter().zip(&ZIG_ZAG_4X4) {
-                scaled[row * 4 + column] = inverse_quantized_coefficient(level, qp, row, column);
-            }
-            let residual = inverse_transform_4x4(&scaled);
-            for y in 0..4 {
-                for x in 0..4 {
-                    let index = (block_y * 4 + y) * 16 + block_x * 4 + x;
-                    reconstructed[index] = u8::try_from(
-                        (i64::from(reconstructed[index]) + residual[y * 4 + x]).clamp(0, 255),
-                    )
-                    .expect("clamped inter reconstruction fits u8");
-                }
-            }
-        }
-    }
+    let reconstructed = reconstruct_inter_luma_prediction(prediction, levels, qp, scaling_matrix);
     place_block(
         destination,
         stride,
@@ -4231,6 +5241,81 @@ fn reconstruct_inter_luma(
         16,
         &reconstructed,
     );
+}
+
+fn reconstruct_inter_luma_prediction(
+    prediction: &[u8],
+    levels: &InterLumaResidual,
+    qp: i32,
+    scaling_matrix: ScalingMatrixPreset,
+) -> Vec<u8> {
+    let mut reconstructed = prediction.to_vec();
+    match levels {
+        InterLumaResidual::FourByFour(levels) => {
+            for block_y in 0..4 {
+                for block_x in 0..4 {
+                    let block_index = luma_block_index(block_x, block_y);
+                    let mut scaled = [0_i64; 16];
+                    for (&level, &(row, column)) in levels[block_index].iter().zip(&ZIG_ZAG_4X4) {
+                        scaled[row * 4 + column] = inverse_quantized_coefficient(
+                            level,
+                            qp,
+                            row,
+                            column,
+                            scaling_matrix.four_by_four(false),
+                        );
+                    }
+                    let residual = inverse_transform_4x4(&scaled);
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let index = (block_y * 4 + y) * 16 + block_x * 4 + x;
+                            reconstructed[index] = u8::try_from(
+                                (i64::from(reconstructed[index]) + residual[y * 4 + x])
+                                    .clamp(0, 255),
+                            )
+                            .expect("clamped inter reconstruction fits u8");
+                        }
+                    }
+                }
+            }
+        }
+        InterLumaResidual::BypassFourByFour(levels) => {
+            for block_y in 0..4 {
+                for block_x in 0..4 {
+                    let block_index = luma_block_index(block_x, block_y);
+                    for (coefficient, &(row, column)) in ZIG_ZAG_4X4.iter().enumerate() {
+                        let index = (block_y * 4 + row) * 16 + block_x * 4 + column;
+                        reconstructed[index] = u8::try_from(
+                            (i32::from(reconstructed[index]) + levels[block_index][coefficient])
+                                .clamp(0, 255),
+                        )
+                        .expect("clamped transform-bypass reconstruction fits u8");
+                    }
+                }
+            }
+        }
+        InterLumaResidual::EightByEight(levels) => {
+            for (group, group_levels) in levels.iter().enumerate() {
+                let residual = inverse_quantized_transform_8x8(
+                    group_levels,
+                    qp,
+                    scaling_matrix.eight_by_eight(false),
+                );
+                let block_x = (group % 2) * 8;
+                let block_y = (group / 2) * 8;
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let index = (block_y + y) * 16 + block_x + x;
+                        reconstructed[index] = u8::try_from(
+                            (i64::from(reconstructed[index]) + residual[y * 8 + x]).clamp(0, 255),
+                        )
+                        .expect("clamped inter 8x8 reconstruction fits u8");
+                    }
+                }
+            }
+        }
+    }
+    reconstructed
 }
 
 fn write_pcm_plane_block(
@@ -4364,6 +5449,180 @@ fn scene_cut_detected(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn encode_intra8_macroblock(
+    writer: &mut BitWriter,
+    source: &[Vec<u8>; 3],
+    reconstructed: &mut [Vec<u8>; 3],
+    luma_modes: &mut [[u8; 16]],
+    luma_nonzero: &mut [[u8; 16]],
+    chroma_nonzero: &mut [[[u8; 4]; 2]],
+    address: usize,
+    macroblocks_wide: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    coded_width: usize,
+    qp: i32,
+    qp_delta: i32,
+    scaling_matrix: ScalingMatrixPreset,
+) -> Result<bool> {
+    let mut levels = [[0_i32; 64]; 4];
+    for (group, group_levels) in levels.iter_mut().enumerate() {
+        let origin_x = macroblock_x * 16 + (group % 2) * 8;
+        let origin_y = macroblock_y * 16 + (group / 2) * 8;
+        let (mode, prediction) = (0..=8)
+            .filter_map(|mode| {
+                intra8_prediction(
+                    &reconstructed[0],
+                    coded_width,
+                    origin_x,
+                    origin_y,
+                    group,
+                    mode,
+                    macroblock_y > 0,
+                    macroblock_x > 0,
+                )
+                .map(|prediction| {
+                    let sad =
+                        block_sad(&source[0], coded_width, origin_x, origin_y, 8, &prediction);
+                    (mode, prediction, sad)
+                })
+            })
+            .min_by_key(|(_, _, sad)| *sad)
+            .map(|(mode, prediction, _)| (mode, prediction))
+            .expect("Intra8 DC prediction is always available");
+        luma_modes[address][group * 4..group * 4 + 4].fill(mode);
+        *group_levels = quantize_intra8_luma_block(
+            &source[0],
+            coded_width,
+            origin_x,
+            origin_y,
+            &prediction,
+            qp,
+            scaling_matrix.eight_by_eight(true),
+        );
+        reconstruct_intra8_luma_block(
+            &mut reconstructed[0],
+            coded_width,
+            origin_x,
+            origin_y,
+            &prediction,
+            group_levels,
+            qp,
+            scaling_matrix.eight_by_eight(true),
+        );
+    }
+
+    let (chroma_mode, chroma_predictions) = select_chroma_prediction(
+        [&source[1], &source[2]],
+        [&reconstructed[1], &reconstructed[2]],
+        coded_width / 2,
+        macroblock_x,
+        macroblock_y,
+    );
+    let chroma_qp = chroma_qp(qp);
+    let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+        quantize_chroma_residual(
+            &source[component + 1],
+            coded_width / 2,
+            macroblock_x,
+            macroblock_y,
+            &chroma_predictions[component],
+            chroma_qp,
+            false,
+            Some(chroma_mode),
+            scaling_matrix.four_by_four(true),
+        )
+    });
+    let luma_pattern = (0..4).fold(0_u8, |pattern, group| {
+        pattern | (u8::from(levels[group].iter().any(|&level| level != 0)) << group)
+    });
+    let has_chroma_ac = chroma_residuals
+        .iter()
+        .flat_map(|residual| residual.ac.iter().flatten())
+        .any(|&level| level != 0);
+    let chroma_pattern = if has_chroma_ac {
+        2
+    } else {
+        u8::from(
+            chroma_residuals
+                .iter()
+                .flat_map(|residual| residual.dc)
+                .any(|level| level != 0),
+        )
+    };
+    let coded_block_pattern = luma_pattern | chroma_pattern << 4;
+    let pattern_code = INTRA4_CODED_BLOCK_PATTERN
+        .iter()
+        .position(|&pattern| pattern == coded_block_pattern)
+        .expect("every Intra8 coded-block pattern has an Exp-Golomb mapping");
+
+    write_ue(writer, 0)?; // I_NxN
+    writer.write_bit(true)?; // transform_size_8x8_flag
+    for group in 0..4 {
+        let block_index = group * 4;
+        let predicted = predicted_intra4_mode(luma_modes, address, block_index, macroblocks_wide);
+        let mode = luma_modes[address][block_index];
+        writer.write_bit(mode == predicted)?;
+        if mode != predicted {
+            let remaining = mode - u8::from(mode > predicted);
+            writer.write_bits(u64::from(remaining), 3)?;
+        }
+    }
+    write_ue(writer, u64::from(chroma_mode))?;
+    write_ue(writer, pattern_code as u64)?;
+    if coded_block_pattern != 0 {
+        write_se(writer, i64::from(qp_delta))?;
+    }
+    for (group, group_levels) in levels.iter().enumerate() {
+        if luma_pattern & (1 << group) != 0 {
+            for sub_block in 0..4 {
+                let block_index = group * 4 + sub_block;
+                let block_levels: [i32; 16] =
+                    std::array::from_fn(|coefficient| group_levels[coefficient * 4 + sub_block]);
+                let n_c = luma_nc(luma_nonzero, address, block_index, macroblocks_wide);
+                luma_nonzero[address][block_index] =
+                    encode_residual_block(writer, n_c, &block_levels)?;
+            }
+        }
+    }
+    if chroma_pattern != 0 {
+        for residual in &chroma_residuals {
+            encode_residual_block(writer, -1, &residual.dc)?;
+        }
+    }
+    if chroma_pattern == 2 {
+        for (component, residual) in chroma_residuals.iter().enumerate() {
+            for (block_index, block_levels) in residual.ac.iter().enumerate() {
+                let n_c = chroma_nc(
+                    chroma_nonzero,
+                    address,
+                    component,
+                    block_index,
+                    macroblocks_wide,
+                );
+                chroma_nonzero[address][component][block_index] =
+                    encode_residual_block(writer, n_c, block_levels)?;
+            }
+        }
+    }
+    for (component, prediction) in chroma_predictions.iter().enumerate() {
+        reconstruct_chroma(
+            &mut reconstructed[component + 1],
+            coded_width / 2,
+            macroblock_x,
+            macroblock_y,
+            prediction,
+            &chroma_residuals[component],
+            chroma_qp,
+            false,
+            Some(chroma_mode),
+            scaling_matrix.four_by_four(true),
+        );
+    }
+    Ok(coded_block_pattern != 0)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn encode_intra4_macroblock(
     writer: &mut BitWriter,
     source: &[Vec<u8>; 3],
@@ -4378,6 +5637,9 @@ fn encode_intra4_macroblock(
     coded_width: usize,
     qp: i32,
     qp_delta: i32,
+    transform_8x8_mode: bool,
+    transform_bypass: bool,
+    scaling_matrix: ScalingMatrixPreset,
 ) -> Result<bool> {
     let mut levels = [[0_i32; 16]; 16];
     for block_index in 0..16 {
@@ -4413,16 +5675,34 @@ fn encode_intra4_macroblock(
             origin_y,
             &prediction,
             qp,
+            transform_bypass,
+            mode,
+            scaling_matrix.four_by_four(true),
         );
-        reconstruct_intra4_luma_block(
-            &mut reconstructed[0],
-            coded_width,
-            origin_x,
-            origin_y,
-            &prediction,
-            &levels[block_index],
-            qp,
-        );
+        if transform_bypass {
+            let samples: [u8; 16] = std::array::from_fn(|index| {
+                source[0][(origin_y + index / 4) * coded_width + origin_x + index % 4]
+            });
+            place_block(
+                &mut reconstructed[0],
+                coded_width,
+                origin_x,
+                origin_y,
+                4,
+                &samples,
+            );
+        } else {
+            reconstruct_intra4_luma_block(
+                &mut reconstructed[0],
+                coded_width,
+                origin_x,
+                origin_y,
+                &prediction,
+                &levels[block_index],
+                qp,
+                scaling_matrix.four_by_four(true),
+            );
+        }
     }
 
     let (chroma_mode, chroma_predictions) = select_chroma_prediction(
@@ -4441,6 +5721,9 @@ fn encode_intra4_macroblock(
             macroblock_y,
             &chroma_predictions[component],
             chroma_qp,
+            transform_bypass,
+            Some(chroma_mode),
+            scaling_matrix.four_by_four(true),
         )
     });
     let luma_pattern = (0..4).fold(0_u8, |pattern, group| {
@@ -4473,6 +5756,9 @@ fn encode_intra4_macroblock(
         .expect("every Intra4 coded-block pattern has an Exp-Golomb mapping");
 
     write_ue(writer, 0)?; // I_NxN
+    if transform_8x8_mode {
+        writer.write_bit(false)?; // transform_size_8x8_flag
+    }
     for block_index in 0..16 {
         let predicted = predicted_intra4_mode(luma_modes, address, block_index, macroblocks_wide);
         let mode = luma_modes[address][block_index];
@@ -4525,6 +5811,9 @@ fn encode_intra4_macroblock(
             prediction,
             &chroma_residuals[component],
             chroma_qp,
+            transform_bypass,
+            Some(chroma_mode),
+            scaling_matrix.four_by_four(true),
         );
     }
     Ok(coded_block_pattern != 0)
@@ -4561,6 +5850,232 @@ const INTRA4_CODED_BLOCK_PATTERN: [u8; 48] = [
     47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19, 21, 26, 28,
     35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36, 40, 38, 41,
 ];
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn intra8_prediction(
+    plane: &[u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    group: usize,
+    mode: u8,
+    top_macroblock_available: bool,
+    left_macroblock_available: bool,
+) -> Option<[u8; 64]> {
+    let top_available = group / 2 > 0 || top_macroblock_available;
+    let left_available = !group.is_multiple_of(2) || left_macroblock_available;
+    let top = top_available.then(|| {
+        let mut samples = [0_u8; 16];
+        for x in 0..8 {
+            samples[x] = plane[(origin_y - 1) * stride + origin_x + x];
+        }
+        for x in 8..16 {
+            samples[x] = if group == 3 || origin_x + x >= stride {
+                samples[7]
+            } else {
+                plane[(origin_y - 1) * stride + origin_x + x]
+            };
+        }
+        samples
+    });
+    let left: Option<[u8; 8]> = left_available
+        .then(|| std::array::from_fn(|y| plane[(origin_y + y) * stride + origin_x - 1]));
+    let corner =
+        (top_available && left_available).then(|| plane[(origin_y - 1) * stride + origin_x - 1]);
+    let top = top.map(|samples| {
+        let mut filtered = [0_u8; 16];
+        filtered[0] = corner.map_or_else(
+            || average_1_3(samples[1], samples[0]),
+            |corner| filter_1_2_1(corner, samples[0], samples[1]),
+        );
+        for index in 1..15 {
+            filtered[index] = filter_1_2_1(samples[index - 1], samples[index], samples[index + 1]);
+        }
+        filtered[15] = average_1_3(samples[14], samples[15]);
+        filtered
+    });
+    let left = left.map(|samples| {
+        let mut filtered = [0_u8; 8];
+        filtered[0] = corner.map_or_else(
+            || average_1_3(samples[1], samples[0]),
+            |corner| filter_1_2_1(corner, samples[0], samples[1]),
+        );
+        for index in 1..7 {
+            filtered[index] = filter_1_2_1(samples[index - 1], samples[index], samples[index + 1]);
+        }
+        filtered[7] = average_1_3(samples[6], samples[7]);
+        filtered
+    });
+    let mut output = [0_u8; 64];
+    match mode {
+        0 => {
+            let top = top?;
+            for row in output.as_chunks_mut::<8>().0 {
+                row.copy_from_slice(&top[..8]);
+            }
+        }
+        1 => {
+            let left = left?;
+            for (row, sample) in output.as_chunks_mut::<8>().0.iter_mut().zip(left) {
+                row.fill(sample);
+            }
+        }
+        2 => output.fill(dc_value(
+            top.as_ref().map(|samples| &samples[..8]),
+            left.as_ref().map(<[u8; 8]>::as_slice),
+        )),
+        3 => {
+            let top = top?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    output[y * 8 + x] = if x == 7 && y == 7 {
+                        average_1_3(top[14], top[15])
+                    } else {
+                        filter_1_2_1(top[x + y], top[x + y + 1], top[x + y + 2])
+                    };
+                }
+            }
+        }
+        4 => {
+            let top = top?;
+            let left = left?;
+            let corner = corner?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let x_coordinate = i32::try_from(x).expect("Intra8 coordinate fits i32");
+                    let y_coordinate = i32::try_from(y).expect("Intra8 coordinate fits i32");
+                    output[y * 8 + x] = match x_coordinate.cmp(&y_coordinate) {
+                        std::cmp::Ordering::Greater => filter_1_2_1(
+                            top_or_corner_intra8(top, corner, x_coordinate - y_coordinate - 2),
+                            top_or_corner_intra8(top, corner, x_coordinate - y_coordinate - 1),
+                            top_or_corner_intra8(top, corner, x_coordinate - y_coordinate),
+                        ),
+                        std::cmp::Ordering::Less => filter_1_2_1(
+                            left_or_corner_intra8(left, corner, y_coordinate - x_coordinate - 2),
+                            left_or_corner_intra8(left, corner, y_coordinate - x_coordinate - 1),
+                            left_or_corner_intra8(left, corner, y_coordinate - x_coordinate),
+                        ),
+                        std::cmp::Ordering::Equal => filter_1_2_1(top[0], corner, left[0]),
+                    };
+                }
+            }
+        }
+        5 => predict_vertical_right_intra8(&mut output, top?, left?, corner?),
+        6 => predict_horizontal_down_intra8(&mut output, top?, left?, corner?),
+        7 => {
+            let top = top?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let start = x + y / 2;
+                    output[y * 8 + x] = if y.is_multiple_of(2) {
+                        average(top[start], top[start + 1])
+                    } else {
+                        filter_1_2_1(top[start], top[start + 1], top[start + 2])
+                    };
+                }
+            }
+        }
+        8 => {
+            let left = left?;
+            for y in 0..8 {
+                for x in 0..8 {
+                    let z = x + 2 * y;
+                    output[y * 8 + x] = match z.cmp(&13) {
+                        std::cmp::Ordering::Less if z.is_multiple_of(2) => {
+                            average(left[z / 2], left[z / 2 + 1])
+                        }
+                        std::cmp::Ordering::Less => {
+                            filter_1_2_1(left[z / 2], left[z / 2 + 1], left[z / 2 + 2])
+                        }
+                        std::cmp::Ordering::Equal => filter_1_2_1(left[6], left[7], left[7]),
+                        std::cmp::Ordering::Greater => left[7],
+                    };
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(output)
+}
+
+fn top_or_corner_intra8(top: [u8; 16], corner: u8, index: i32) -> u8 {
+    if index < 0 {
+        corner
+    } else {
+        top[usize::try_from(index).expect("bounded Intra8 top index")]
+    }
+}
+
+fn left_or_corner_intra8(left: [u8; 8], corner: u8, index: i32) -> u8 {
+    if index < 0 {
+        corner
+    } else {
+        left[usize::try_from(index).expect("bounded Intra8 left index")]
+    }
+}
+
+fn predict_vertical_right_intra8(output: &mut [u8; 64], top: [u8; 16], left: [u8; 8], corner: u8) {
+    for y in 0..8_i32 {
+        for x in 0..8_i32 {
+            let z = 2 * x - y;
+            let value = if z >= 0 {
+                if z % 2 == 0 {
+                    average(
+                        top_or_corner_intra8(top, corner, x - y / 2 - 1),
+                        top_or_corner_intra8(top, corner, x - y / 2),
+                    )
+                } else {
+                    filter_1_2_1(
+                        top_or_corner_intra8(top, corner, x - y / 2 - 2),
+                        top_or_corner_intra8(top, corner, x - y / 2 - 1),
+                        top_or_corner_intra8(top, corner, x - y / 2),
+                    )
+                }
+            } else if z == -1 {
+                filter_1_2_1(left[0], corner, top[0])
+            } else {
+                filter_1_2_1(
+                    left_or_corner_intra8(left, corner, y - 2 * x - 1),
+                    left_or_corner_intra8(left, corner, y - 2 * x - 2),
+                    left_or_corner_intra8(left, corner, y - 2 * x - 3),
+                )
+            };
+            output[usize::try_from(y * 8 + x).expect("Intra8 index fits")] = value;
+        }
+    }
+}
+
+fn predict_horizontal_down_intra8(output: &mut [u8; 64], top: [u8; 16], left: [u8; 8], corner: u8) {
+    for y in 0..8_i32 {
+        for x in 0..8_i32 {
+            let z = 2 * y - x;
+            let value = if z >= 0 {
+                if z % 2 == 0 {
+                    average(
+                        left_or_corner_intra8(left, corner, y - x / 2 - 1),
+                        left_or_corner_intra8(left, corner, y - x / 2),
+                    )
+                } else {
+                    filter_1_2_1(
+                        left_or_corner_intra8(left, corner, y - x / 2 - 2),
+                        left_or_corner_intra8(left, corner, y - x / 2 - 1),
+                        left_or_corner_intra8(left, corner, y - x / 2),
+                    )
+                }
+            } else if z == -1 {
+                filter_1_2_1(top[0], corner, left[0])
+            } else {
+                filter_1_2_1(
+                    top_or_corner_intra8(top, corner, x - 2 * y - 1),
+                    top_or_corner_intra8(top, corner, x - 2 * y - 2),
+                    top_or_corner_intra8(top, corner, x - 2 * y - 3),
+                )
+            };
+            output[usize::try_from(y * 8 + x).expect("Intra8 index fits")] = value;
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn intra4_prediction(
@@ -4962,6 +6477,73 @@ const ZIG_ZAG_4X4: [(usize, usize); 16] = [
     (3, 2),
     (3, 3),
 ];
+
+const ZIG_ZAG_8X8: [(usize, usize); 64] = [
+    (0, 0),
+    (0, 1),
+    (1, 0),
+    (2, 0),
+    (1, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (2, 1),
+    (3, 0),
+    (4, 0),
+    (3, 1),
+    (2, 2),
+    (1, 3),
+    (0, 4),
+    (0, 5),
+    (1, 4),
+    (2, 3),
+    (3, 2),
+    (4, 1),
+    (5, 0),
+    (6, 0),
+    (5, 1),
+    (4, 2),
+    (3, 3),
+    (2, 4),
+    (1, 5),
+    (0, 6),
+    (0, 7),
+    (1, 6),
+    (2, 5),
+    (3, 4),
+    (4, 3),
+    (5, 2),
+    (6, 1),
+    (7, 0),
+    (7, 1),
+    (6, 2),
+    (5, 3),
+    (4, 4),
+    (3, 5),
+    (2, 6),
+    (1, 7),
+    (2, 7),
+    (3, 6),
+    (4, 5),
+    (5, 4),
+    (6, 3),
+    (7, 2),
+    (7, 3),
+    (6, 4),
+    (5, 5),
+    (4, 6),
+    (3, 7),
+    (4, 7),
+    (5, 6),
+    (6, 5),
+    (7, 4),
+    (7, 5),
+    (6, 6),
+    (5, 7),
+    (6, 7),
+    (7, 6),
+    (7, 7),
+];
 const HADAMARD_4X4: [[i32; 4]; 4] = [[1, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
 
 fn quantize_intra16_luma_dc(
@@ -4971,6 +6553,7 @@ fn quantize_intra16_luma_dc(
     macroblock_y: usize,
     prediction: &[u8],
     qp: i32,
+    scaling_list: &[u8; 16],
 ) -> [i32; 16] {
     let origin_x = macroblock_x * 16;
     let origin_y = macroblock_y * 16;
@@ -5003,7 +6586,7 @@ fn quantize_intra16_luma_dc(
                     })
                 })
                 .sum();
-            let scale = i64::from(level_scale_4x4(qp, 0, 0));
+            let scale = i64::from(level_scale_4x4(qp, 0, 0, scaling_list));
             let level = if qp >= 36 {
                 round_div(transformed, 16 * scale * (1_i64 << (qp / 6 - 6)))
             } else {
@@ -5025,6 +6608,7 @@ fn quantize_intra16_luma_ac(
     macroblock_y: usize,
     prediction: &[u8],
     qp: i32,
+    scaling_list: &[u8; 16],
 ) -> [[i32; 15]; 16] {
     let origin_x = macroblock_x * 16;
     let origin_y = macroblock_y * 16;
@@ -5046,13 +6630,20 @@ fn quantize_intra16_luma_ac(
             for (destination, &(row, column)) in
                 output[block_index].iter_mut().zip(&ZIG_ZAG_4X4[1..])
             {
-                *destination = quantize_coefficient(transformed[row * 4 + column], qp, row, column);
+                *destination = quantize_coefficient(
+                    transformed[row * 4 + column],
+                    qp,
+                    row,
+                    column,
+                    scaling_list,
+                );
             }
         }
     }
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantize_chroma_residual(
     source: &[u8],
     stride: usize,
@@ -5060,9 +6651,52 @@ fn quantize_chroma_residual(
     macroblock_y: usize,
     prediction: &[u8],
     qp: i32,
+    transform_bypass: bool,
+    intra_mode: Option<u8>,
+    scaling_list: &[u8; 16],
 ) -> ChromaResidual {
     let origin_x = macroblock_x * 8;
     let origin_y = macroblock_y * 8;
+    if transform_bypass {
+        let mut residual: [i32; 64] = std::array::from_fn(|index| {
+            let x = index % 8;
+            let y = index / 8;
+            i32::from(source[(origin_y + y) * stride + origin_x + x]) - i32::from(prediction[index])
+        });
+        match intra_mode {
+            Some(1) => {
+                for y in 0..8 {
+                    for x in (1..8).rev() {
+                        residual[y * 8 + x] -= residual[y * 8 + x - 1];
+                    }
+                }
+            }
+            Some(2) => {
+                for y in (1..8).rev() {
+                    for x in 0..8 {
+                        residual[y * 8 + x] -= residual[(y - 1) * 8 + x];
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut dc = [0_i32; 4];
+        let mut ac = [[0_i32; 15]; 4];
+        for block_y in 0..2 {
+            for block_x in 0..2 {
+                let block_index = block_y * 2 + block_x;
+                for (coefficient, &(row, column)) in ZIG_ZAG_4X4.iter().enumerate() {
+                    let level = residual[(block_y * 4 + row) * 8 + block_x * 4 + column];
+                    if coefficient == 0 {
+                        dc[block_index] = level;
+                    } else {
+                        ac[block_index][coefficient - 1] = level;
+                    }
+                }
+            }
+        }
+        return ChromaResidual { dc, ac };
+    }
     let mut transformed_blocks = [[0_i32; 16]; 4];
     let mut ac = [[0_i32; 15]; 4];
     for block_y in 0..2 {
@@ -5085,6 +6719,7 @@ fn quantize_chroma_residual(
                     qp,
                     row,
                     column,
+                    scaling_list,
                 );
             }
         }
@@ -5096,7 +6731,7 @@ fn quantize_chroma_residual(
         values[0] + values[1] - values[2] - values[3],
         values[0] - values[1] - values[2] + values[3],
     ];
-    let dc_divisor = 4 * i64::from(level_scale_4x4(qp, 0, 0)) * (1_i64 << (qp / 6));
+    let dc_divisor = 4 * i64::from(level_scale_4x4(qp, 0, 0, scaling_list)) * (1_i64 << (qp / 6));
     let dc = transformed_dc.map(|value| {
         i32::try_from(round_div(i64::from(value) * 32, dc_divisor))
             .expect("quantized chroma DC fits i32")
@@ -5131,6 +6766,211 @@ fn forward_transform_4x4(residual: &[i32; 16]) -> [i32; 16] {
     output
 }
 
+fn forward_transform_8x8(residual: &[i32; 64]) -> [i32; 64] {
+    let mut horizontal = [0_i32; 64];
+    for row in 0..8 {
+        let input: [i32; 8] = std::array::from_fn(|column| residual[row * 8 + column]);
+        let output = forward_transform_8(&input);
+        horizontal[row * 8..row * 8 + 8].copy_from_slice(&output);
+    }
+    let mut transformed = [0_i32; 64];
+    for column in 0..8 {
+        let input: [i32; 8] = std::array::from_fn(|row| horizontal[row * 8 + column]);
+        let output = forward_transform_8(&input);
+        for row in 0..8 {
+            transformed[row * 8 + column] = output[row];
+        }
+    }
+    transformed
+}
+
+fn forward_transform_8(input: &[i32; 8]) -> [i32; 8] {
+    let s07 = input[0] + input[7];
+    let s16 = input[1] + input[6];
+    let s25 = input[2] + input[5];
+    let s34 = input[3] + input[4];
+    let a0 = s07 + s34;
+    let a1 = s16 + s25;
+    let a2 = s07 - s34;
+    let a3 = s16 - s25;
+    let d07 = input[0] - input[7];
+    let d16 = input[1] - input[6];
+    let d25 = input[2] - input[5];
+    let d34 = input[3] - input[4];
+    let a4 = d16 + d25 + d07 + (d07 >> 1);
+    let a5 = d07 - d34 - d25 - (d25 >> 1);
+    let a6 = d07 + d34 - d16 - (d16 >> 1);
+    let a7 = d16 - d25 + d34 + (d34 >> 1);
+    [
+        a0 + a1,
+        a4 + (a7 >> 2),
+        a2 + (a3 >> 1),
+        a5 + (a6 >> 2),
+        a0 - a1,
+        a6 - (a5 >> 2),
+        (a2 >> 1) - a3,
+        (a4 >> 2) - a7,
+    ]
+}
+
+fn quantize_intra8_luma_block(
+    source: &[u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    prediction: &[u8; 64],
+    qp: i32,
+    scaling_list: &[u8; 64],
+) -> [i32; 64] {
+    let mut residual = [0_i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            residual[y * 8 + x] = i32::from(source[(origin_y + y) * stride + origin_x + x])
+                - i32::from(prediction[y * 8 + x]);
+        }
+    }
+    let transformed = forward_transform_8x8(&residual);
+    std::array::from_fn(|index| {
+        let (row, column) = ZIG_ZAG_8X8[index];
+        quantize_coefficient_8x8(transformed[row * 8 + column], qp, row, column, scaling_list)
+    })
+}
+
+fn quantize_coefficient_8x8(
+    coefficient: i32,
+    qp: i32,
+    row: usize,
+    column: usize,
+    scaling_list: &[u8; 64],
+) -> i32 {
+    const MULTIPLIERS: [[i64; 6]; 6] = [
+        [13_107, 11_428, 20_972, 12_222, 16_777, 15_481],
+        [11_916, 10_826, 19_174, 11_058, 14_980, 14_290],
+        [10_082, 8_943, 15_978, 9_675, 12_710, 11_985],
+        [9_362, 8_228, 14_913, 8_931, 11_984, 11_259],
+        [8_192, 7_346, 13_159, 7_740, 10_486, 9_777],
+        [7_282, 6_428, 11_570, 6_830, 9_118, 8_640],
+    ];
+    let category = coefficient_category_8x8(row, column);
+    let qp_mod = usize::try_from(qp % 6).expect("non-negative QP");
+    let q_bits = u32::try_from(16 + qp / 6).expect("bounded QP shift");
+    let matrix = i64::from(scaling_list[row * 8 + column]);
+    let divisor = (1_i64 << q_bits) * matrix;
+    let numerator = i64::from(coefficient.unsigned_abs()) * MULTIPLIERS[qp_mod][category] * 16;
+    let level = (numerator + divisor / 3) / divisor;
+    let level = i32::try_from(level).expect("bounded 8x8 coefficient quantizes into i32");
+    if coefficient < 0 { -level } else { level }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_intra8_luma_block(
+    destination: &mut [u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    prediction: &[u8; 64],
+    levels: &[i32; 64],
+    qp: i32,
+    scaling_list: &[u8; 64],
+) {
+    let residual = inverse_quantized_transform_8x8(levels, qp, scaling_list);
+    let reconstructed: [u8; 64] = std::array::from_fn(|index| {
+        u8::try_from((i64::from(prediction[index]) + residual[index]).clamp(0, 255))
+            .expect("clamped Intra8 reconstruction fits u8")
+    });
+    place_block(destination, stride, origin_x, origin_y, 8, &reconstructed);
+}
+
+fn inverse_quantized_transform_8x8(
+    levels: &[i32; 64],
+    qp: i32,
+    scaling_list: &[u8; 64],
+) -> [i64; 64] {
+    let mut scaled = [0_i64; 64];
+    for (&level, &(row, column)) in levels.iter().zip(&ZIG_ZAG_8X8) {
+        let value = i64::from(level) * i64::from(level_scale_8x8(qp, row, column, scaling_list));
+        let shift = qp / 6;
+        scaled[row * 8 + column] = if shift >= 6 {
+            value << (shift - 6)
+        } else {
+            (value + (1_i64 << (5 - shift))) >> (6 - shift)
+        };
+    }
+    scaled[0] += 32;
+    let mut horizontal = [0_i64; 64];
+    for row in 0..8 {
+        let input: [i64; 8] = std::array::from_fn(|column| scaled[row * 8 + column]);
+        let output = inverse_transform_8(&input);
+        horizontal[row * 8..row * 8 + 8].copy_from_slice(&output);
+    }
+    let mut transformed = [0_i64; 64];
+    for column in 0..8 {
+        let input: [i64; 8] = std::array::from_fn(|row| horizontal[row * 8 + column]);
+        let output = inverse_transform_8(&input);
+        for row in 0..8 {
+            transformed[row * 8 + column] = output[row] >> 6;
+        }
+    }
+    transformed
+}
+
+fn inverse_transform_8(input: &[i64; 8]) -> [i64; 8] {
+    let a0 = input[0] + input[4];
+    let a2 = input[0] - input[4];
+    let a4 = (input[2] >> 1) - input[6];
+    let a6 = input[2] + (input[6] >> 1);
+    let b0 = a0 + a6;
+    let b2 = a2 + a4;
+    let b4 = a2 - a4;
+    let b6 = a0 - a6;
+    let a1 = -input[3] + input[5] - input[7] - (input[7] >> 1);
+    let a3 = input[1] + input[7] - input[3] - (input[3] >> 1);
+    let a5 = -input[1] + input[7] + input[5] + (input[5] >> 1);
+    let a7 = input[3] + input[5] + input[1] + (input[1] >> 1);
+    let b1 = a1 + (a7 >> 2);
+    let b7 = a7 - (a1 >> 2);
+    let b3 = a3 + (a5 >> 2);
+    let b5 = (a3 >> 2) - a5;
+    [
+        b0 + b7,
+        b2 + b5,
+        b4 + b3,
+        b6 + b1,
+        b6 - b1,
+        b4 - b3,
+        b2 - b5,
+        b0 - b7,
+    ]
+}
+
+fn coefficient_category_8x8(row: usize, column: usize) -> usize {
+    let row = row % 4;
+    let column = column % 4;
+    match (row.is_multiple_of(2), column.is_multiple_of(2)) {
+        (false, false) => 1,
+        (false, true) | (true, false) if row == 2 || column == 2 => 5,
+        (false, true) | (true, false) => 3,
+        (true, true) if row == 0 && column == 0 => 0,
+        (true, true) if row == 2 && column == 2 => 2,
+        (true, true) => 4,
+    }
+}
+
+fn level_scale_8x8(qp: i32, row: usize, column: usize, scaling_list: &[u8; 64]) -> i32 {
+    const NORM_ADJUST: [[i32; 6]; 6] = [
+        [20, 18, 32, 19, 25, 24],
+        [22, 19, 35, 21, 28, 26],
+        [26, 23, 42, 24, 33, 31],
+        [28, 25, 45, 26, 35, 33],
+        [32, 28, 51, 30, 40, 38],
+        [36, 32, 58, 34, 46, 43],
+    ];
+    NORM_ADJUST[usize::try_from(qp % 6).expect("non-negative QP")]
+        [coefficient_category_8x8(row, column)]
+        * i32::from(scaling_list[row * 8 + column])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn quantize_intra4_luma_block(
     source: &[u8],
     stride: usize,
@@ -5138,6 +6978,9 @@ fn quantize_intra4_luma_block(
     origin_y: usize,
     prediction: &[u8; 16],
     qp: i32,
+    transform_bypass: bool,
+    mode: u8,
+    scaling_list: &[u8; 16],
 ) -> [i32; 16] {
     let mut residual = [0_i32; 16];
     for y in 0..4 {
@@ -5146,13 +6989,42 @@ fn quantize_intra4_luma_block(
                 - i32::from(prediction[y * 4 + x]);
         }
     }
+    if transform_bypass {
+        let differentials = transform_bypass_differentials_4x4(residual, mode);
+        return std::array::from_fn(|index| {
+            let (row, column) = ZIG_ZAG_4X4[index];
+            differentials[row * 4 + column]
+        });
+    }
     let transformed = forward_transform_4x4(&residual);
     std::array::from_fn(|index| {
         let (row, column) = ZIG_ZAG_4X4[index];
-        quantize_coefficient(transformed[row * 4 + column], qp, row, column)
+        quantize_coefficient(transformed[row * 4 + column], qp, row, column, scaling_list)
     })
 }
 
+fn transform_bypass_differentials_4x4(mut residual: [i32; 16], mode: u8) -> [i32; 16] {
+    match mode {
+        0 => {
+            for row in (1..4).rev() {
+                for column in 0..4 {
+                    residual[row * 4 + column] -= residual[(row - 1) * 4 + column];
+                }
+            }
+        }
+        1 => {
+            for row in 0..4 {
+                for column in (1..4).rev() {
+                    residual[row * 4 + column] -= residual[row * 4 + column - 1];
+                }
+            }
+        }
+        _ => {}
+    }
+    residual
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_intra4_luma_block(
     destination: &mut [u8],
     stride: usize,
@@ -5161,10 +7033,12 @@ fn reconstruct_intra4_luma_block(
     prediction: &[u8; 16],
     levels: &[i32; 16],
     qp: i32,
+    scaling_list: &[u8; 16],
 ) {
     let mut scaled = [0_i64; 16];
     for (&level, &(row, column)) in levels.iter().zip(&ZIG_ZAG_4X4) {
-        scaled[row * 4 + column] = inverse_quantized_coefficient(level, qp, row, column);
+        scaled[row * 4 + column] =
+            inverse_quantized_coefficient(level, qp, row, column, scaling_list);
     }
     let residual = inverse_transform_4x4(&scaled);
     let reconstructed: [u8; 16] = std::array::from_fn(|index| {
@@ -5174,7 +7048,13 @@ fn reconstruct_intra4_luma_block(
     place_block(destination, stride, origin_x, origin_y, 4, &reconstructed);
 }
 
-fn quantize_coefficient(coefficient: i32, qp: i32, row: usize, column: usize) -> i32 {
+fn quantize_coefficient(
+    coefficient: i32,
+    qp: i32,
+    row: usize,
+    column: usize,
+    scaling_list: &[u8; 16],
+) -> i32 {
     const MULTIPLIERS: [[i64; 3]; 6] = [
         [13_107, 5_243, 8_066],
         [11_916, 4_660, 7_490],
@@ -5186,9 +7066,10 @@ fn quantize_coefficient(coefficient: i32, qp: i32, row: usize, column: usize) ->
     let category = coefficient_category(row, column);
     let qp_mod = usize::try_from(qp % 6).expect("non-negative QP");
     let q_bits = u32::try_from(15 + qp / 6).expect("bounded QP shift");
-    let rounding = (1_i64 << q_bits) / 3;
-    let level = (i64::from(coefficient.unsigned_abs()) * MULTIPLIERS[qp_mod][category] + rounding)
-        >> q_bits;
+    let matrix = i64::from(scaling_list[row * 4 + column]);
+    let divisor = (1_i64 << q_bits) * matrix;
+    let numerator = i64::from(coefficient.unsigned_abs()) * MULTIPLIERS[qp_mod][category] * 16;
+    let level = (numerator + divisor / 3) / divisor;
     let level = i32::try_from(level).expect("bounded 4x4 coefficient quantizes into i32");
     if coefficient < 0 { -level } else { level }
 }
@@ -5203,6 +7084,7 @@ fn reconstruct_intra16_luma(
     levels: &[i32; 16],
     ac_levels: &[[i32; 15]; 16],
     qp: i32,
+    scaling_list: &[u8; 16],
 ) {
     let mut natural_levels = [0_i64; 16];
     for (index, &(row, column)) in ZIG_ZAG_4X4.iter().enumerate() {
@@ -5220,7 +7102,7 @@ fn reconstruct_intra16_luma(
                     })
                 })
                 .sum::<i64>();
-            let scale = i64::from(level_scale_4x4(qp, 0, 0));
+            let scale = i64::from(level_scale_4x4(qp, 0, 0, scaling_list));
             dc_values[row * 4 + column] = if qp >= 36 {
                 (transformed * scale) << (qp / 6 - 6)
             } else {
@@ -5235,7 +7117,8 @@ fn reconstruct_intra16_luma(
             let mut scaled = [0_i64; 16];
             scaled[0] = dc_values[block_y * 4 + block_x];
             for (&level, &(row, column)) in ac_levels[block_index].iter().zip(&ZIG_ZAG_4X4[1..]) {
-                scaled[row * 4 + column] = inverse_quantized_coefficient(level, qp, row, column);
+                scaled[row * 4 + column] =
+                    inverse_quantized_coefficient(level, qp, row, column, scaling_list);
             }
             let residual = inverse_transform_4x4(&scaled);
             for y in 0..4 {
@@ -5259,6 +7142,7 @@ fn reconstruct_intra16_luma(
     );
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reconstruct_chroma(
     destination: &mut [u8],
     stride: usize,
@@ -5267,14 +7151,100 @@ fn reconstruct_chroma(
     prediction: &[u8],
     residual: &ChromaResidual,
     qp: i32,
+    transform_bypass: bool,
+    intra_mode: Option<u8>,
+    scaling_list: &[u8; 16],
 ) {
+    if transform_bypass {
+        let mut blocks = [[0_i32; 16]; 4];
+        for (block_index, block) in blocks.iter_mut().enumerate() {
+            for (coefficient, &(row, column)) in ZIG_ZAG_4X4.iter().enumerate() {
+                block[row * 4 + column] = if coefficient == 0 {
+                    residual.dc[block_index]
+                } else {
+                    residual.ac[block_index][coefficient - 1]
+                };
+            }
+            let mode = match intra_mode {
+                Some(1) => 1,
+                Some(2) => 0,
+                _ => 2,
+            };
+            match mode {
+                0 => {
+                    for row in 1..4 {
+                        for column in 0..4 {
+                            block[row * 4 + column] += block[(row - 1) * 4 + column];
+                        }
+                    }
+                }
+                1 => {
+                    for row in 0..4 {
+                        for column in 1..4 {
+                            block[row * 4 + column] += block[row * 4 + column - 1];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        match intra_mode {
+            Some(1) => {
+                for right in [1, 3] {
+                    let left = right - 1;
+                    for row in 0..4 {
+                        let continuation = blocks[left][row * 4 + 3];
+                        for column in 0..4 {
+                            blocks[right][row * 4 + column] += continuation;
+                        }
+                    }
+                }
+            }
+            Some(2) => {
+                for bottom in 2..4 {
+                    let top = bottom - 2;
+                    for row in 0..4 {
+                        for column in 0..4 {
+                            blocks[bottom][row * 4 + column] += blocks[top][12 + column];
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut reconstructed = prediction.to_vec();
+        for (block_index, block) in blocks.iter().enumerate() {
+            let block_x = block_index % 2;
+            let block_y = block_index / 2;
+            for row in 0..4 {
+                for column in 0..4 {
+                    let index = (block_y * 4 + row) * 8 + block_x * 4 + column;
+                    reconstructed[index] = u8::try_from(
+                        (i32::from(reconstructed[index]) + block[row * 4 + column]).clamp(0, 255),
+                    )
+                    .expect("clamped transform-bypass chroma reconstruction fits u8");
+                }
+            }
+        }
+        place_block(
+            destination,
+            stride,
+            macroblock_x * 8,
+            macroblock_y * 8,
+            8,
+            &reconstructed,
+        );
+        return;
+    }
     let dc = [
         residual.dc[0] + residual.dc[1] + residual.dc[2] + residual.dc[3],
         residual.dc[0] - residual.dc[1] + residual.dc[2] - residual.dc[3],
         residual.dc[0] + residual.dc[1] - residual.dc[2] - residual.dc[3],
         residual.dc[0] - residual.dc[1] - residual.dc[2] + residual.dc[3],
     ]
-    .map(|value| ((i64::from(value) * i64::from(level_scale_4x4(qp, 0, 0))) << (qp / 6)) >> 5);
+    .map(|value| {
+        ((i64::from(value) * i64::from(level_scale_4x4(qp, 0, 0, scaling_list))) << (qp / 6)) >> 5
+    });
     let mut reconstructed = prediction.to_vec();
     for block_y in 0..2 {
         for block_x in 0..2 {
@@ -5282,7 +7252,8 @@ fn reconstruct_chroma(
             let mut scaled = [0_i64; 16];
             scaled[0] = dc[block_index];
             for (&level, &(row, column)) in residual.ac[block_index].iter().zip(&ZIG_ZAG_4X4[1..]) {
-                scaled[row * 4 + column] = inverse_quantized_coefficient(level, qp, row, column);
+                scaled[row * 4 + column] =
+                    inverse_quantized_coefficient(level, qp, row, column, scaling_list);
             }
             let block = inverse_transform_4x4(&scaled);
             for y in 0..4 {
@@ -5316,7 +7287,7 @@ fn coefficient_category(row: usize, column: usize) -> usize {
     }
 }
 
-fn level_scale_4x4(qp: i32, row: usize, column: usize) -> i32 {
+fn level_scale_4x4(qp: i32, row: usize, column: usize, scaling_list: &[u8; 16]) -> i32 {
     const NORM_ADJUST: [[i32; 3]; 6] = [
         [10, 16, 13],
         [11, 18, 14],
@@ -5327,11 +7298,17 @@ fn level_scale_4x4(qp: i32, row: usize, column: usize) -> i32 {
     ];
     NORM_ADJUST[usize::try_from(qp % 6).expect("non-negative QP")]
         [coefficient_category(row, column)]
-        * 16
+        * i32::from(scaling_list[row * 4 + column])
 }
 
-fn inverse_quantized_coefficient(level: i32, qp: i32, row: usize, column: usize) -> i64 {
-    let value = i64::from(level) * i64::from(level_scale_4x4(qp, row, column));
+fn inverse_quantized_coefficient(
+    level: i32,
+    qp: i32,
+    row: usize,
+    column: usize,
+    scaling_list: &[u8; 16],
+) -> i64 {
+    let value = i64::from(level) * i64::from(level_scale_4x4(qp, row, column, scaling_list));
     if qp >= 24 {
         value << (qp / 6 - 4)
     } else {
@@ -5667,7 +7644,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        AvcDecoderConfigurationRecord, H264Decoder, NalUnitType, Sps, parse_sps,
+        AvcDecoderConfigurationRecord, H264Decoder, NalUnitType, Sps, parse_pps, parse_sps,
         remove_emulation_prevention,
     };
 
@@ -5722,6 +7699,98 @@ mod tests {
             }
         }
         verify_with_ffmpeg(&avcc, &packet_bytes(&mut second, &frame), &frame);
+    }
+
+    #[test]
+    fn cabac_ipcm_round_trips_cropped_multi_macroblock_idr() {
+        let mut encoder_settings = settings(18, 20);
+        encoder_settings
+            .options
+            .insert("entropy".into(), "cabac".into());
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&encoder_settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        let sps = parse_sps(&avcc.sequence_parameter_sets[0]).unwrap();
+        let pps = parse_pps(&avcc.picture_parameter_sets[0]).unwrap();
+        assert_eq!(sps.profile_idc, PROFILE_MAIN);
+        assert!(pps.entropy_coding_mode);
+
+        let frame = patterned_frame(18, 20);
+        encoder.send_frame(frame.clone()).unwrap();
+        let packet = encoder.receive_packet().unwrap().unwrap();
+        assert_frames_pixels_equal(
+            &encoder.receive_reconstructed_frame().unwrap().unwrap(),
+            &frame,
+        );
+
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        decoder.send_packet(packet.clone()).unwrap();
+        assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), &frame);
+        verify_with_ffmpeg(&avcc, &packet.data, &frame);
+    }
+
+    #[test]
+    fn cabac_rejects_baseline_and_unimplemented_compressed_modes() {
+        for (mode, profile) in [("ipcm", "baseline"), ("intra4", "auto")] {
+            let mut invalid = settings(16, 16);
+            invalid.options.insert("mode".into(), mode.into());
+            invalid.options.insert("profile".into(), profile.into());
+            invalid.options.insert("entropy".into(), "cabac".into());
+            assert!(H264Encoder::default().configure(&invalid).is_err());
+        }
+
+        let mut invalid = settings(16, 16);
+        invalid
+            .options
+            .insert("entropy".into(), "arithmetic".into());
+        assert!(H264Encoder::default().configure(&invalid).is_err());
+    }
+
+    #[test]
+    fn cabac_intra16_round_trips_residuals_qp_changes_and_scaling_matrices() {
+        for (qp, adaptive, scaling_matrix) in
+            [(12, false, "flat"), (38, true, "flat"), (27, false, "jvt")]
+        {
+            let frame = if adaptive {
+                mixed_activity_frame(32, 32, 0)
+            } else {
+                patterned_frame(32, 32)
+            };
+            let mut encoder_settings = settings(32, 32);
+            encoder_settings
+                .options
+                .insert("mode".into(), "intra16".into());
+            encoder_settings
+                .options
+                .insert("entropy".into(), "cabac".into());
+            encoder_settings.options.insert("qp".into(), qp.to_string());
+            encoder_settings
+                .options
+                .insert("scaling_matrix".into(), scaling_matrix.into());
+            if adaptive {
+                encoder_settings
+                    .options
+                    .insert("aq_strength".into(), "6".into());
+            }
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            assert!(
+                parse_pps(&avcc.picture_parameter_sets[0])
+                    .unwrap()
+                    .entropy_coding_mode
+            );
+            encoder.send_frame(frame).unwrap();
+            let packet = encoder.receive_packet().unwrap().unwrap();
+            let reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            decoder.send_packet(packet.clone()).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), &reconstruction);
+            verify_with_ffmpeg(&avcc, &packet.data, &reconstruction);
+        }
     }
 
     #[test]
@@ -5780,6 +7849,10 @@ mod tests {
             .options
             .insert("profile".into(), "baseline".into());
         assert!(encoder.configure(&baseline_b).is_err());
+        let mut main_intra8 = settings(16, 16);
+        main_intra8.options.insert("mode".into(), "intra8".into());
+        main_intra8.options.insert("profile".into(), "main".into());
+        assert!(encoder.configure(&main_intra8).is_err());
 
         let mut lossless_bitrate = settings(16, 16);
         lossless_bitrate.bitrate = Some(100_000);
@@ -6228,6 +8301,45 @@ mod tests {
     }
 
     #[test]
+    fn high_profile_intra8_round_trips_normative_reconstruction() {
+        let mut settings = settings(32, 32);
+        settings.options.insert("mode".into(), "intra8".into());
+        let frame = patterned_frame(32, 32);
+
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        let sps = parse_sps(&avcc.sequence_parameter_sets[0]).unwrap();
+        let pps = parse_pps(&avcc.picture_parameter_sets[0]).unwrap();
+        assert_eq!(sps.profile_idc, PROFILE_HIGH);
+        assert_eq!(sps.chroma_format_idc, 1);
+        assert_eq!((sps.bit_depth_luma, sps.bit_depth_chroma), (8, 8));
+        assert!(pps.transform_8x8_mode);
+        assert_eq!(avcc.profile_indication, PROFILE_HIGH);
+
+        encoder.send_frame(frame.clone()).unwrap();
+        let packet = encoder.receive_packet().unwrap().unwrap();
+        let reconstructed = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        assert_ne!(reconstructed.planes[0].data, frame.planes[0].data);
+        assert!(
+            luma_squared_error(&frame, &reconstructed)
+                < luma_squared_error_from_constant(&frame, 128)
+        );
+
+        let mut repeat = H264Encoder::default();
+        repeat.configure(&settings).unwrap();
+        repeat.send_frame(frame).unwrap();
+        assert_eq!(packet.data, repeat.receive_packet().unwrap().unwrap().data);
+
+        verify_with_ffmpeg(&avcc, &packet.data, &reconstructed);
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        decoder.send_packet(packet).unwrap();
+        let decoded_frame = decoder.receive_frame().unwrap().unwrap();
+        assert_frames_pixels_equal(&decoded_frame, &reconstructed);
+    }
+
+    #[test]
     fn all_nine_intra4_predictions_are_available_with_complete_neighbors() {
         let stride = 32;
         let plane = (0..stride * stride)
@@ -6245,7 +8357,330 @@ mod tests {
     }
 
     #[test]
-    fn configurable_qp_round_trips_for_both_compressed_modes() {
+    fn all_nine_intra8_predictions_are_available_with_complete_neighbors() {
+        let stride = 48;
+        let plane = (0..stride * stride)
+            .map(|index| u8::try_from((index * 29 + index / stride * 17) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        for mode in 0..=8 {
+            assert!(
+                intra8_prediction(&plane, stride, 20, 20, 0, mode, true, true).is_some(),
+                "mode {mode} rejected complete neighbor samples"
+            );
+        }
+        assert!(intra8_prediction(&plane, stride, 0, 0, 0, 0, false, false).is_none());
+        assert!(intra8_prediction(&plane, stride, 0, 0, 0, 1, false, false).is_none());
+        assert!(intra8_prediction(&plane, stride, 0, 0, 0, 2, false, false).is_some());
+        assert!(intra8_prediction(&plane, stride, 0, 0, 0, 3, false, false).is_none());
+        assert!(intra8_prediction(&plane, stride, 0, 0, 0, 8, false, false).is_none());
+    }
+
+    #[test]
+    fn adaptive_inter_transform_selects_between_4x4_and_8x8() {
+        let source = vec![152_u8; 16 * 16];
+        let prediction = vec![96_u8; 16 * 16];
+        let four_by_four = select_inter_luma_residual(
+            &source,
+            16,
+            0,
+            0,
+            &prediction,
+            26,
+            false,
+            false,
+            ScalingMatrixPreset::Flat,
+        );
+        let adaptive = select_inter_luma_residual(
+            &source,
+            16,
+            0,
+            0,
+            &prediction,
+            26,
+            true,
+            false,
+            ScalingMatrixPreset::Flat,
+        );
+        assert!(!four_by_four.uses_8x8());
+        assert!(adaptive.uses_8x8());
+        assert_ne!(adaptive.coded_block_pattern(), 0);
+
+        let mut localized_source = prediction.clone();
+        for y in 0..4 {
+            localized_source[y * 16..y * 16 + 4].fill(152);
+        }
+        let localized = select_inter_luma_residual(
+            &localized_source,
+            16,
+            0,
+            0,
+            &prediction,
+            26,
+            true,
+            false,
+            ScalingMatrixPreset::Flat,
+        );
+        assert!(!localized.uses_8x8());
+    }
+
+    #[test]
+    fn high_profile_inter_8x8_round_trips_p_and_b_pictures() {
+        let mut settings = settings(32, 16);
+        settings.options.insert("mode".into(), "inter".into());
+        settings.options.insert("profile".into(), "high".into());
+        settings.options.insert("b_frames".into(), "1".into());
+        settings.options.insert("search_range".into(), "0".into());
+        let frames = [
+            frame_with_pts(constant_frame(32, 16, [64, 96, 160]), 0),
+            frame_with_pts(constant_frame(32, 16, [150, 120, 140]), 1),
+            frame_with_pts(constant_frame(32, 16, [192, 128, 128]), 2),
+        ];
+
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        assert_eq!(
+            parse_sps(&avcc.sequence_parameter_sets[0])
+                .unwrap()
+                .profile_idc,
+            PROFILE_HIGH
+        );
+        assert!(
+            parse_pps(&avcc.picture_parameter_sets[0])
+                .unwrap()
+                .transform_8x8_mode
+        );
+        for frame in &frames {
+            encoder.send_frame(frame.clone()).unwrap();
+        }
+        encoder.flush().unwrap();
+        let mut packets = Vec::new();
+        let mut reconstructions = Vec::new();
+        while let Some(packet) = encoder.receive_packet().unwrap() {
+            packets.push(packet);
+            reconstructions.push(encoder.receive_reconstructed_frame().unwrap().unwrap());
+        }
+        assert_eq!(packets.len(), frames.len());
+
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        for (packet, expected) in packets.iter().cloned().zip(&reconstructions) {
+            decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+        }
+        let mut display_order = packets
+            .iter()
+            .zip(&reconstructions)
+            .map(|(packet, frame)| (packet.pts.unwrap().value, frame.clone()))
+            .collect::<Vec<_>>();
+        display_order.sort_by_key(|(pts, _)| *pts);
+        let display_order = display_order
+            .into_iter()
+            .map(|(_, frame)| frame)
+            .collect::<Vec<_>>();
+        verify_sequence_with_ffmpeg(&avcc, &packets, &display_order);
+    }
+
+    #[test]
+    fn high_profile_transform_bypass_is_lossless_for_intra_p_and_b_pictures() {
+        let mut intra_settings = settings(32, 32);
+        intra_settings
+            .options
+            .insert("mode".into(), "intra4".into());
+        intra_settings.options.insert("qp".into(), "0".into());
+        intra_settings
+            .options
+            .insert("transform_bypass".into(), "true".into());
+        let intra_frame = patterned_frame(32, 32);
+        let mut intra_encoder = H264Encoder::default();
+        let intra_descriptor = intra_encoder.configure(&intra_settings).unwrap();
+        let intra_avcc =
+            AvcDecoderConfigurationRecord::parse(&intra_descriptor.configuration).unwrap();
+        let intra_sps = parse_sps(&intra_avcc.sequence_parameter_sets[0]).unwrap();
+        assert_eq!(intra_sps.profile_idc, PROFILE_HIGH);
+        assert!(intra_sps.qpprime_y_zero_transform_bypass);
+        intra_encoder.send_frame(intra_frame.clone()).unwrap();
+        let intra_packet = intra_encoder.receive_packet().unwrap().unwrap();
+        let intra_reconstruction = intra_encoder
+            .receive_reconstructed_frame()
+            .unwrap()
+            .unwrap();
+        assert_frames_pixels_equal(&intra_reconstruction, &intra_frame);
+        verify_with_ffmpeg(&intra_avcc, &intra_packet.data, &intra_frame);
+        let mut intra_decoder = H264Decoder::default();
+        intra_decoder.configure(&intra_descriptor).unwrap();
+        intra_decoder.send_packet(intra_packet).unwrap();
+        assert_frames_pixels_equal(
+            &intra_decoder.receive_frame().unwrap().unwrap(),
+            &intra_frame,
+        );
+
+        let mut inter_settings = settings(32, 16);
+        inter_settings.options.insert("mode".into(), "inter".into());
+        inter_settings.options.insert("qp".into(), "0".into());
+        inter_settings
+            .options
+            .insert("transform_bypass".into(), "true".into());
+        inter_settings.options.insert("b_frames".into(), "1".into());
+        inter_settings
+            .options
+            .insert("search_range".into(), "2".into());
+        let first = frame_with_pts(patterned_frame(32, 16), 0);
+        let frames = [
+            first.clone(),
+            shifted_frame(&first, 1, 0, 1),
+            shifted_frame(&first, 2, 0, 2),
+        ];
+        let mut inter_encoder = H264Encoder::default();
+        let inter_descriptor = inter_encoder.configure(&inter_settings).unwrap();
+        let inter_avcc =
+            AvcDecoderConfigurationRecord::parse(&inter_descriptor.configuration).unwrap();
+        let inter_sps = parse_sps(&inter_avcc.sequence_parameter_sets[0]).unwrap();
+        let inter_picture_pps = parse_pps(&inter_avcc.picture_parameter_sets[0]).unwrap();
+        assert!(inter_sps.qpprime_y_zero_transform_bypass);
+        assert!(!inter_picture_pps.transform_8x8_mode);
+        for frame in &frames {
+            inter_encoder.send_frame(frame.clone()).unwrap();
+        }
+        inter_encoder.flush().unwrap();
+        let mut packets = Vec::new();
+        let mut reconstructions = Vec::new();
+        while let Some(packet) = inter_encoder.receive_packet().unwrap() {
+            let reconstruction = inter_encoder
+                .receive_reconstructed_frame()
+                .unwrap()
+                .unwrap();
+            let expected = &frames[usize::try_from(packet.pts.unwrap().value).unwrap()];
+            assert_frames_pixels_equal(&reconstruction, expected);
+            packets.push(packet);
+            reconstructions.push(reconstruction);
+        }
+        let mut inter_decoder = H264Decoder::default();
+        inter_decoder.configure(&inter_descriptor).unwrap();
+        for (packet, expected) in packets.iter().cloned().zip(&reconstructions) {
+            inter_decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&inter_decoder.receive_frame().unwrap().unwrap(), expected);
+        }
+        verify_sequence_with_ffmpeg(&inter_avcc, &packets, &frames);
+    }
+
+    #[test]
+    fn transform_bypass_rejects_incompatible_configurations() {
+        for (mode, profile, qp) in [
+            ("intra4", "main", "0"),
+            ("intra8", "high", "0"),
+            ("inter", "high", "1"),
+        ] {
+            let mut invalid = settings(16, 16);
+            invalid.options.insert("mode".into(), mode.into());
+            invalid.options.insert("profile".into(), profile.into());
+            invalid.options.insert("qp".into(), qp.into());
+            invalid
+                .options
+                .insert("transform_bypass".into(), "true".into());
+            assert!(H264Encoder::default().configure(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn jvt_scaling_matrices_round_trip_all_transform_paths() {
+        for mode in ["intra16", "intra4", "intra8"] {
+            let mut encoder_settings = settings(32, 32);
+            encoder_settings.options.insert("mode".into(), mode.into());
+            encoder_settings
+                .options
+                .insert("scaling_matrix".into(), "jvt".into());
+            let frame = patterned_frame(32, 32);
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            let sps = parse_sps(&avcc.sequence_parameter_sets[0]).unwrap();
+            assert_eq!(sps.profile_idc, PROFILE_HIGH);
+            assert!(sps.scaling_matrix_present);
+            assert_eq!(sps.scaling_matrices.four_by_four[0], JVT_4X4_INTRA);
+            assert_eq!(sps.scaling_matrices.four_by_four[3], JVT_4X4_INTER);
+            assert_eq!(sps.scaling_matrices.eight_by_eight[0], JVT_8X8_INTRA);
+            assert_eq!(sps.scaling_matrices.eight_by_eight[1], JVT_8X8_INTER);
+
+            encoder.send_frame(frame).unwrap();
+            let packet = encoder.receive_packet().unwrap().unwrap();
+            let reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+            verify_with_ffmpeg(&avcc, &packet.data, &reconstruction);
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), &reconstruction);
+        }
+
+        let mut encoder_settings = settings(32, 16);
+        encoder_settings
+            .options
+            .insert("mode".into(), "inter".into());
+        encoder_settings
+            .options
+            .insert("b_frames".into(), "1".into());
+        encoder_settings
+            .options
+            .insert("scaling_matrix".into(), "jvt".into());
+        encoder_settings
+            .options
+            .insert("search_range".into(), "0".into());
+        let frames = [
+            frame_with_pts(constant_frame(32, 16, [40, 80, 160]), 0),
+            frame_with_pts(constant_frame(32, 16, [137, 111, 143]), 1),
+            frame_with_pts(constant_frame(32, 16, [216, 144, 112]), 2),
+        ];
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&encoder_settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        for frame in &frames {
+            encoder.send_frame(frame.clone()).unwrap();
+        }
+        encoder.flush().unwrap();
+        let mut packets = Vec::new();
+        let mut reconstructions = Vec::new();
+        while let Some(packet) = encoder.receive_packet().unwrap() {
+            packets.push(packet);
+            reconstructions.push(encoder.receive_reconstructed_frame().unwrap().unwrap());
+        }
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        for (packet, expected) in packets.iter().cloned().zip(&reconstructions) {
+            decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+        }
+        let mut display_order = packets
+            .iter()
+            .zip(&reconstructions)
+            .map(|(packet, frame)| (packet.pts.unwrap().value, frame.clone()))
+            .collect::<Vec<_>>();
+        display_order.sort_by_key(|(pts, _)| *pts);
+        let display_order = display_order
+            .into_iter()
+            .map(|(_, frame)| frame)
+            .collect::<Vec<_>>();
+        verify_sequence_with_ffmpeg(&avcc, &packets, &display_order);
+    }
+
+    #[test]
+    fn jvt_scaling_matrices_reject_non_high_and_bypass_modes() {
+        for (profile, bypass) in [("main", false), ("high", true)] {
+            let mut invalid = settings(16, 16);
+            invalid.options.insert("mode".into(), "intra4".into());
+            invalid.options.insert("profile".into(), profile.into());
+            invalid.options.insert("qp".into(), "0".into());
+            invalid
+                .options
+                .insert("scaling_matrix".into(), "jvt".into());
+            invalid
+                .options
+                .insert("transform_bypass".into(), bypass.to_string());
+            assert!(H264Encoder::default().configure(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn configurable_qp_round_trips_for_compressed_intra_modes() {
         let frame = patterned_frame(16, 16);
         let mut errors = Vec::new();
         for (mode, qp) in [
@@ -6255,6 +8690,8 @@ mod tests {
             ("intra16", 38),
             ("intra4", 0),
             ("intra16", 51),
+            ("intra8", 12),
+            ("intra8", 38),
         ] {
             let mut settings = settings(16, 16);
             settings.options.insert("mode".into(), mode.into());
@@ -6280,6 +8717,10 @@ mod tests {
         assert!(
             errors[2].2 < errors[3].2,
             "lower Intra16 QP should preserve more luma detail"
+        );
+        assert!(
+            errors[6].2 < errors[7].2,
+            "lower Intra8 QP should preserve more luma detail"
         );
 
         for invalid in ["-1", "52", "not-a-number"] {
@@ -6320,7 +8761,7 @@ mod tests {
     #[test]
     fn adaptive_quantization_round_trips_intra_p_and_b_pictures() {
         let source = mixed_activity_frame(32, 16, 0);
-        for mode in ["intra16", "intra4"] {
+        for mode in ["intra16", "intra4", "intra8"] {
             let mut encoder_settings = settings(32, 16);
             encoder_settings.options.insert("mode".into(), mode.into());
             encoder_settings

@@ -18,7 +18,7 @@ MMRecode is under active development. Its codec, editor, playback, rendering, an
 | Audio | Native mono/stereo AAC-LC reconstruction plus MPEG-1 Layer II framing and pass-through |
 | Containers | Y4M, 188-byte MPEG-TS demux/mux, and non-fragmented ISO-BMFF/QuickTime sample-table demuxing |
 | Editing | Recursive media graph, typed commands, exact time, undo/redo, versioned projects, terminal workspace, and initial MPEG-2 export |
-| MMFX | Strict typed scenes and public parameters, intrinsic row/column/overlay layout, images, Unicode text, exact-frame animation and scrolling, highlighted live editing, scalar CPU rendering, and recursive timeline preview/export composition |
+| MMFX | Strict typed scenes and public parameters, intrinsic row/column/overlay layout, images, Unicode text, exact-frame animation and scrolling, embedded or auto-synchronized linked source, highlighted live editing, scalar CPU rendering, and recursive timeline preview/export composition |
 | Integration | Main CLI, native viewer, quality utilities, playback scheduling, and an experimental one-shot C API |
 
 ## Important limits

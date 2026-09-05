@@ -9,15 +9,23 @@ AVC. It currently provides:
 - SPS, PPS, VUI, and leading slice-header parsing;
 - container-timed access-unit indexing;
 - IDR/reference classification and a conservative active-reference dependency set;
-- a deterministic Baseline-profile encoder foundation that emits lossless, all-IDR `I_PCM`
-  pictures through the shared stateful encoder API, including `avcC` configuration, cropping,
-  emulation prevention, packet timing, and exact native round-trip reconstruction;
+- a deterministic all-IDR `I_PCM` encoder foundation that emits lossless pictures through the
+  shared stateful encoder API, including `avcC` configuration, cropping, emulation prevention,
+  packet timing, and exact native round-trip reconstruction. It defaults to Baseline/CAVLC;
+  `entropy=cabac` selects Main Profile CABAC with arithmetic restart around each PCM macroblock;
 - an optional `mode=intra16` compressed path with reconstructed-neighbor DC/horizontal/vertical
   mode decisions, quantized luma DC Hadamard plus 4x4 luma/chroma DC/AC coefficients, general CAVLC
   residual serialization, and a normative reconstruction matching independent FFmpeg decoding;
 - a `mode=intra4` path that selects among all nine luma prediction modes block by block, derives
   predicted-mode and CAVLC contexts from reconstructed neighbors, and writes full luma/chroma
-  residuals. Both compressed modes accept a `qp=0..51` option;
+  residuals;
+- a High Profile `mode=intra8` path with all nine filtered directional prediction modes,
+  normative integer 8x8 transforms, flat-matrix quantization, four-way CAVLC coefficient
+  interleaving, and exact native/FFmpeg reconstruction. High Profile `mode=inter` additionally
+  makes a distortion/rate decision between 4x4 and 8x8 luma transforms for every eligible P/B
+  macroblock. `transform_bypass=true` with `qp=0` provides exact lossless Intra4 and inter P/B
+  coding. `scaling_matrix=jvt` applies the standard High Profile intra/inter 4x4 and 8x8 matrices
+  across luma and chroma. All compressed intra modes accept a `qp=0..51` option;
 - a stateful `mode=inter` path with periodic Intra4 IDRs and the complete P
   partition tree: adaptive P16x16, P16x8, P8x16, and P8x8 macroblocks whose subpartitions reach
   8x4, 4x8, and 4x4. Deterministic integer searches receive quarter-pixel luma refinement with
@@ -94,7 +102,9 @@ CABAC MBAFF, and multi-slice MBAFF remain explicit follow-on work.
 The encoder foundation accepts progressive, even-sized `Yuv420p8` frames, pads the coded canvas to
 macroblock boundaries with edge samples, crops it back to the visible dimensions in the SPS, and
 disables deblocking. Its default `I_PCM` mode is an exact normative reference; `intra16` and
-`intra4` provide deterministic transform-coded all-IDR compression with configurable QP.
+`intra4` provide deterministic 4x4 transform-coded all-IDR compression with configurable QP.
+`intra8` activates High Profile SPS/PPS extensions, chooses filtered 8x8 luma prediction, and emits
+8x8 luma transform coefficients through the CAVLC interleaving required by AVC.
 The `inter` mode retains `max_refs=1..4` reconstructed short-term pictures and applies the complete
 P partition tree down to 4x4 with partition-specific integer search and quarter-pixel refinement,
 or P-skip when the predicted list-0 block needs no residual. `b_frames=1..3` delays that many
@@ -109,7 +119,7 @@ encodes unmatched delayed pictures as P. B mode retains at least two references 
 reconstruction reaches the threshold; zero disables this check. `b_direct=spatial|temporal`
 selects the picture-wide direct derivation, with spatial as the default. Temporal mode retains the
 future anchor's colocated reference identity and unwrapped picture order to scale both list vectors.
-Supplying `VideoEncoderSettings::bitrate` in `intra16`, `intra4`, or `inter` mode enables reactive
+Supplying `VideoEncoderSettings::bitrate` in `intra16`, `intra4`, `intra8`, or `inter` mode enables reactive
 frame-level rate control; `qp` is then its initial value. A positive frame duration sets that
 picture's bit budget, otherwise one configured time-base tick is used. `aq_strength=0..12` then
 redistributes the resulting picture QP across macroblocks according to relative luma activity.
@@ -118,9 +128,25 @@ zero-residual inter blocks. `vbv_buffer_ms` makes the virtual capacity explicit 
 single-entry VBR NAL HRD model. Access-unit arrivals and removals are checked against that CPB;
 units which cannot fit or be removed at the declared cadence are rejected instead of silently
 violating the signal. Bitrate control and AQ with fixed-size lossless `I_PCM` are rejected.
-`profile=auto|baseline|main` defaults to Baseline for I/P-only streams and Main when B pictures are
-enabled. Explicit Baseline+B configurations are rejected, and the `avcC` profile/compatibility
-bytes are copied from the encoded SPS. `level=auto|1|1b|1.1..6.2` checks the Annex A frame-size,
+`profile=auto|baseline|main|high` defaults to High for `intra8`, Main when B pictures are enabled,
+and Baseline otherwise. Explicit Baseline+B and non-High Intra8 configurations are rejected, and
+the `avcC` profile/compatibility bytes are copied from the encoded SPS. Explicit High Profile
+`inter` enables adaptive inter 8x8 transforms while preserving 4x4 transforms for smaller
+subpartitions and whenever their estimated rate/distortion cost is lower.
+`transform_bypass=true` automatically selects High Profile and requires `mode=intra4|inter`,
+`qp=0`, disabled AQ, and fixed-QP encoding. It signals QP-prime-zero transform bypass in the SPS,
+codes spatial residual differences without quantization, and disables inter 8x8 transforms.
+`scaling_matrix=flat|jvt` defaults to the flat matrix. The JVT preset automatically selects High
+Profile, signals the sequence scaling-matrix fallback syntax, and applies the resolved standard
+intra/inter matrices during both forward quantization and local reconstruction. It is incompatible
+with transform bypass because scaling is skipped in bypass mode.
+`entropy=cavlc|cabac` defaults to CAVLC. CABAC currently supports `mode=ipcm|intra16`, automatically
+selects Main Profile when `profile=auto`, and is rejected with Baseline Profile or other compressed
+macroblock modes. Its byte-oriented arithmetic core covers adaptive decisions, bypass bins,
+termination, carry propagation, and PCM substream restart. Intra16 CABAC includes macroblock and
+chroma prediction modes, modulo-52 QP deltas, luma/chroma coded-block contexts, significance maps,
+last flags, reverse coefficient levels, signs, AQ, and High Profile scaling matrices.
+`level=auto|1|1b|1.1..6.2` checks the Annex A frame-size,
 macroblock-rate, decoded-picture-buffer, target-bitrate, and optional CPB limits; automatic mode
 selects the lowest conforming level and `avcC` mirrors the SPS level byte. One `time_base` tick is
 the default frame interval used during configuration. Containers whose timestamp clock is finer

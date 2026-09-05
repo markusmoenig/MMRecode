@@ -96,10 +96,12 @@ pub enum MediaOrigin {
 /// Source payload owned by one generated MMFX media definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MmfxSource {
-    /// Authoritative MMFX scene source stored inside the project document.
+    /// Embedded source, or the last valid cached snapshot of a linked source.
     pub source: String,
     /// Optional directory used to resolve module-relative resources imported from an external file.
     pub resource_base: Option<PathBuf>,
+    /// External source file watched by the editor; absent when the source is fully embedded.
+    pub linked_path: Option<PathBuf>,
     /// Canonical host values overriding public `@param` defaults for this scene object.
     pub parameter_bindings: BTreeMap<String, String>,
 }
@@ -119,7 +121,7 @@ pub struct MediaNode {
     pub duration: Timestamp,
     /// Content origin.
     pub origin: MediaOrigin,
-    /// Embedded MMFX source for generated scene media; absent for other media kinds.
+    /// Embedded or linked-and-cached MMFX source for generated scene media.
     pub mmfx: Option<MmfxSource>,
     children: Vec<MediaLinkId>,
 }
@@ -663,8 +665,18 @@ impl MediaProject {
     ///
     /// # Errors
     ///
-    /// Returns an error when the media is missing, is not an MMFX scene, or has a non-generated origin.
+    /// Returns an error when the media is missing, is not an MMFX scene, has a non-generated
+    /// origin, or declares a relative linked-source path.
     pub fn set_mmfx_source(&mut self, media_id: MediaId, source: MmfxSource) -> Result<()> {
+        if source
+            .linked_path
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(Error::InvalidData(
+                "MMFX linked source path must be absolute".into(),
+            ));
+        }
         let media = self
             .media
             .get_mut(&media_id)

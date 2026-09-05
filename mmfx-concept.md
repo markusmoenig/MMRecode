@@ -563,10 +563,14 @@ timeline. `cd` selects that object and contextual `edit` opens its source in the
 (`scene edit` is an alias). Every source edit updates the project object and project history;
 ordinary project `save` serializes the source.
 `scene load` replaces it with an embedded copy of an external module while retaining that module's
-directory as the relative-resource base, and `scene save as` only extracts a copy. Compilation is
-debounced and coalesced on a worker. Source-spanned failures are shown without replacing the last
-successful monitor frame. `help`, `man edit`, and `man scene` are the normative interactive discovery
-surface.
+directory as the relative-resource base. `scene link` instead stores an absolute external path and
+a last-valid cached snapshot. The editor polls only linked files, debounces write bursts, and
+installs a new snapshot only after parsing and type-checking it with the object's bindings. Missing
+or invalid files retain the cache. `scene reload` forces a read, `scene unlink` converts the cache to
+embedded source, and `scene save as` only extracts a copy. Linked source is read-only in the internal
+editor to avoid competing writers. Source-spanned failures are shown without replacing the last
+successful monitor frame. `help`, `man edit`, and `man scene` are the normative interactive
+discovery surface.
 
 The command vocabulary distinguishes content from processing. `scene` creates and manages a
 declarative, duration-bearing timeline object. `fx` is reserved for applying filters, generators,

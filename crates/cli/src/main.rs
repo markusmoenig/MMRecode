@@ -504,6 +504,9 @@ fn execute_editor_line(
             return Ok(false);
         }
         mmrecode_edit::CommandOutput::FxLoadRequested { .. }
+        | mmrecode_edit::CommandOutput::SceneLinkRequested { .. }
+        | mmrecode_edit::CommandOutput::SceneReloadRequested
+        | mmrecode_edit::CommandOutput::SceneUnlinkRequested
         | mmrecode_edit::CommandOutput::FxSaveRequested { .. }
         | mmrecode_edit::CommandOutput::FxEditRequested
         | mmrecode_edit::CommandOutput::FxCloseRequested => {

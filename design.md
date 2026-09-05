@@ -418,7 +418,21 @@ configurations that contain B slices, and copies the SPS profile bytes into `avc
 negotiation now selects or validates Levels 1 through 6.2 from coded frame size, rational frame
 cadence, DPB occupancy, target bitrate, and optional CPB size. It handles Level 1b signalling,
 mirrors the SPS level in `avcC`, and rejects submitted frame durations that exceed the negotiated
-macroblock rate. High Profile encoder tools remain follow-on work.
+macroblock rate. The first High Profile encoder tool adds `mode=intra8`: High SPS/PPS extensions,
+all nine filtered Intra8 prediction directions, the normative 8x8 integer transform and flat
+quantization matrices, and CAVLC's four-way coefficient interleaving all reconstruct identically in
+the native decoder and FFmpeg. Explicit High Profile inter coding also evaluates 4x4 and 8x8 luma
+residuals per eligible P/B macroblock, signals the selected transform, and shares that reconstruction
+with the native CAVLC decoder. Opt-in QP-zero transform bypass supplies lossless Intra4 and inter
+P/B coding with directional residual DPCM, disables incompatible inter 8x8 transforms, and rejects
+AQ or rate control that could move QP away from zero. The standard JVT scaling-matrix preset is now
+also available: it signals SPS fallback lists and applies distinct intra/inter 4x4 and 8x8 matrices
+consistently to forward quantization and normative local reconstruction. The first CABAC encoder
+slice adds a byte-oriented arithmetic core plus complete lossless `I_PCM` IDRs in Main or High
+Profile, including PPS signalling, context adaptation, carry propagation, termination, and
+arithmetic restart after raw samples. It now also emits compressed Intra16 CABAC macroblocks with
+prediction-mode, QP-delta, coded-block, significance-map, coefficient-level, AQ, and scaling-matrix
+coverage. Intra4/Intra8 and inter CABAC macroblocks remain follow-on work.
 Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
 window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
 reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;

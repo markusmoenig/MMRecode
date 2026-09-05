@@ -55,7 +55,19 @@ impl BitWriter {
 
     /// Pads with zero bits to the next byte boundary.
     pub fn align_to_byte(&mut self) {
+        self.align_to_byte_with(false);
+    }
+
+    /// Pads with the selected bit value to the next byte boundary.
+    pub fn align_to_byte_with(&mut self, value: bool) {
         if !self.bit_position.is_multiple_of(8) {
+            if value {
+                let remaining = 8 - self.bit_position % 8;
+                let mask = (1_u8 << remaining) - 1;
+                if let Some(last) = self.data.last_mut() {
+                    *last |= mask;
+                }
+            }
             self.bit_position = self.bit_position.div_ceil(8) * 8;
         }
     }
@@ -78,5 +90,18 @@ mod tests {
         writer.write_bits(0b0010_1110, 8).unwrap();
         writer.write_bits(0b011, 3).unwrap();
         assert_eq!(writer.into_bytes(), vec![0b1010_0101, 0b1100_1100]);
+    }
+
+    #[test]
+    fn aligns_with_selected_bit_value() {
+        let mut zeros = BitWriter::new();
+        zeros.write_bits(0b101, 3).unwrap();
+        zeros.align_to_byte();
+        assert_eq!(zeros.into_bytes(), vec![0b1010_0000]);
+
+        let mut ones = BitWriter::new();
+        ones.write_bits(0b101, 3).unwrap();
+        ones.align_to_byte_with(true);
+        assert_eq!(ones.into_bytes(), vec![0b1011_1111]);
     }
 }

@@ -71,6 +71,37 @@ scene cache signatures. `scene save as` extracts reusable source with its declar
 than baking project bindings into the file. The standalone renderer accepts repeated
 `--set name=value` options.
 
+## Embedded and linked source
+
+MMRecode provides two explicit external-file workflows:
+
+```text
+scene load titles/lower-third.mmfx
+scene link titles/lower-third.mmfx
+scene reload
+scene unlink
+```
+
+`scene load` is a one-time import. It copies the file into the focused scene object, retains the
+file's directory as the base for relative fonts and images, and then treats the source as embedded
+project content.
+
+Like loading a different source, linking starts from the new module's declared parameter defaults
+and clears bindings from the previous source. `scene link` keeps the canonical external path and a
+last-valid source snapshot in the project.
+While the full-screen editor is running, it polls only linked files and debounces write bursts.
+After a changed file parses and type-checks with the scene's current parameter bindings, the new
+snapshot atomically replaces the old one and invalidates only that scene's render cache. A missing,
+partially written, or invalid file leaves the cached scene active and reports the problem in the
+editor. `scene reload` forces the same validation immediately. `scene unlink` embeds the current
+snapshot and stops watching.
+
+Linked source is read-only in MMRecode's internal code pane to prevent simultaneous internal and
+external writers. Edit it in the external editor, or unlink it before using `edit`. Project `save`
+persists the external path, cached snapshot, resource base, and parameter bindings, so preview and
+export can continue from the cache when the external file is unavailable. Linked paths are explicit
+absolute links; moving a project does not silently retarget them.
+
 ## Canvas and resources
 
 ```css

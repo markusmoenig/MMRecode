@@ -1056,6 +1056,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    linked_path: None,
                     parameter_bindings: Default::default(),
                 },
             )
@@ -1138,6 +1139,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    linked_path: None,
                     parameter_bindings: Default::default(),
                 },
             )

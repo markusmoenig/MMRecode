@@ -1,4 +1,4 @@
-//! Context-adaptive binary arithmetic decoding primitives.
+//! Context-adaptive binary arithmetic coding primitives.
 
 use mmrecode_bitstream::BitReader;
 use mmrecode_core::{Error, Result};
@@ -148,6 +148,171 @@ pub(crate) fn initial_contexts<const N: usize>(
     Ok(contexts)
 }
 
+/// Binary arithmetic encoder state for one CABAC slice.
+///
+/// The arithmetic registers use the normative nine-bit H.264 range. Pending
+/// opposite bits defer carry propagation while the low register lies in its
+/// middle half, matching the decoder's nine-bit initialization window.
+pub(crate) struct CabacEncoder {
+    bytes: Vec<u8>,
+    range: u16,
+    low: u32,
+    queue: i32,
+    outstanding_bytes: usize,
+    terminated: bool,
+}
+
+impl CabacEncoder {
+    /// Initializes the arithmetic registers for a new CABAC substream.
+    pub(crate) fn new() -> Self {
+        Self {
+            // A sentinel models the byte immediately before CABAC data. Carry
+            // propagation may touch it, but a valid arithmetic interval can
+            // never carry beyond it; `finish` removes it from the payload.
+            bytes: vec![0],
+            range: 510,
+            low: 0,
+            queue: -9,
+            outstanding_bytes: 0,
+            terminated: false,
+        }
+    }
+
+    /// Encodes one regular decision bin and updates its context model.
+    pub(crate) fn decision(&mut self, context: &mut ContextState, bin: bool) -> Result<()> {
+        self.ensure_active()?;
+        let state_index = usize::from(context.probability_state);
+        let range_index = usize::from((self.range >> 6) & 3);
+        let range_lps = RANGE_LPS[state_index][range_index];
+        self.range -= range_lps;
+        if bin == context.most_probable_symbol {
+            context.probability_state = TRANSITION_MPS[state_index];
+        } else {
+            self.low += u32::from(self.range);
+            self.range = range_lps;
+            if context.probability_state == 0 {
+                context.most_probable_symbol = !context.most_probable_symbol;
+            }
+            context.probability_state = TRANSITION_LPS[state_index];
+        }
+        self.renormalize()
+    }
+
+    /// Encodes one equiprobable bypass bin without a context model.
+    pub(crate) fn bypass(&mut self, bin: bool) -> Result<()> {
+        self.ensure_active()?;
+        self.low <<= 1;
+        if bin {
+            self.low += u32::from(self.range);
+        }
+        self.queue += 1;
+        self.put_byte()
+    }
+
+    /// Encodes one `end_of_slice_flag` using the termination process.
+    pub(crate) fn terminate(&mut self, end_of_slice: bool) -> Result<()> {
+        self.ensure_active()?;
+        if end_of_slice {
+            self.low += u32::from(self.range - 2);
+            self.low |= 1;
+            self.low <<= 9;
+            self.queue += 9;
+            self.put_byte()?;
+            self.put_byte()?;
+            let final_shift = u32::try_from(-self.queue)
+                .map_err(|_| Error::InvalidData("invalid H.264 CABAC final queue state".into()))?;
+            self.low <<= final_shift;
+            self.queue = 0;
+            self.put_byte()?;
+            while self.outstanding_bytes > 0 {
+                self.bytes.push(0xff);
+                self.outstanding_bytes -= 1;
+            }
+            self.terminated = true;
+        } else {
+            self.range -= 2;
+            self.renormalize()?;
+        }
+        Ok(())
+    }
+
+    /// Finishes a terminated substream and returns zero-padded bytes.
+    pub(crate) fn finish(self) -> Result<Vec<u8>> {
+        if !self.terminated {
+            return Err(Error::InvalidData(
+                "H.264 CABAC substream is missing a terminating bin".into(),
+            ));
+        }
+        debug_assert_eq!(self.bytes[0], 0, "CABAC carry reached the sentinel byte");
+        let mut bytes = self.bytes[1..].to_vec();
+        while bytes.len() < 2 {
+            bytes.push(0);
+        }
+        Ok(bytes)
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.terminated {
+            Err(Error::InvalidData(
+                "cannot encode a bin after H.264 CABAC termination".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn renormalize(&mut self) -> Result<()> {
+        let mut shift = 0;
+        while self.range < 256 {
+            self.range <<= 1;
+            shift += 1;
+        }
+        self.low <<= shift;
+        self.queue += shift;
+        self.put_byte()
+    }
+
+    fn put_byte(&mut self) -> Result<()> {
+        if self.queue < 0 {
+            return Ok(());
+        }
+        let shift = u32::try_from(self.queue + 10)
+            .map_err(|_| Error::InvalidData("invalid H.264 CABAC byte queue state".into()))?;
+        let output = self.low >> shift;
+        let retained_bits = u32::try_from(self.queue)
+            .map_err(|_| Error::InvalidData("invalid H.264 CABAC byte queue state".into()))?;
+        self.low &= (0x400_u32 << retained_bits) - 1;
+        self.queue -= 8;
+        if output & 0xff == 0xff {
+            self.outstanding_bytes = self.outstanding_bytes.checked_add(1).ok_or_else(|| {
+                Error::InvalidData("H.264 CABAC outstanding-byte count overflows".into())
+            })?;
+            return Ok(());
+        }
+
+        let carry = u8::try_from(output >> 8)
+            .map_err(|_| Error::InvalidData("H.264 CABAC carry exceeds one bit".into()))?;
+        let previous = self
+            .bytes
+            .last_mut()
+            .expect("CABAC encoder always retains its sentinel byte");
+        *previous = previous.checked_add(carry).ok_or_else(|| {
+            Error::InvalidData("H.264 CABAC carry overflowed a committed byte".into())
+        })?;
+        let outstanding_value = if carry == 0 { 0xff } else { 0x00 };
+        self.bytes.extend(std::iter::repeat_n(
+            outstanding_value,
+            self.outstanding_bytes,
+        ));
+        self.outstanding_bytes = 0;
+        self.bytes.push(
+            u8::try_from(output & 0xff)
+                .map_err(|_| Error::InvalidData("H.264 CABAC output byte overflows".into()))?,
+        );
+        Ok(())
+    }
+}
+
 /// Binary arithmetic decoder state for one CABAC slice.
 pub(crate) struct CabacDecoder<'reader, 'data> {
     bits: &'reader mut BitReader<'data>,
@@ -275,7 +440,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
 mod tests {
     use mmrecode_bitstream::BitReader;
 
-    use super::{CabacDecoder, ContextState};
+    use super::{CabacDecoder, CabacEncoder, ContextState};
 
     #[test]
     fn initializes_contexts_on_both_sides_of_the_mps_boundary() {
@@ -344,5 +509,95 @@ mod tests {
         let mut decoder = CabacDecoder::new(&mut bits).unwrap();
         let error = (0..64).find_map(|_| decoder.bypass().err());
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn encodes_regular_bypass_and_termination_bins() {
+        let regular = [
+            false, false, true, false, true, true, false, false, true, false, true, false, false,
+            true, true, true, false, true, false, false, true, true, false, true,
+        ];
+        let bypass = [true, false, true, true, false, false, true, false, true];
+        let initial_context = ContextState {
+            probability_state: 10,
+            most_probable_symbol: false,
+        };
+        let mut encoder_context = initial_context;
+        let mut encoder = CabacEncoder::new();
+        for bin in regular {
+            encoder.decision(&mut encoder_context, bin).unwrap();
+        }
+        for bin in bypass {
+            encoder.bypass(bin).unwrap();
+        }
+        encoder.terminate(false).unwrap();
+        encoder.terminate(true).unwrap();
+        let bytes = encoder.finish().unwrap();
+
+        let mut bits = BitReader::new(&bytes);
+        let mut decoder = CabacDecoder::new(&mut bits).unwrap();
+        let mut decoder_context = initial_context;
+        for expected in regular {
+            assert_eq!(decoder.decision(&mut decoder_context).unwrap(), expected);
+        }
+        for expected in bypass {
+            assert_eq!(decoder.bypass().unwrap(), expected);
+        }
+        assert!(!decoder.terminate().unwrap());
+        assert!(decoder.terminate().unwrap());
+        assert_eq!(encoder_context, decoder_context);
+    }
+
+    #[test]
+    fn cabac_encoder_round_trips_long_state_sequences() {
+        let mut source = 0x6d5a_56e9_1357_2468_u64;
+        let mut next_bit = || {
+            source ^= source << 13;
+            source ^= source >> 7;
+            source ^= source << 17;
+            source & 1 != 0
+        };
+        let operations = (0..2_000)
+            .map(|index| (index % 7 == 0, next_bit()))
+            .collect::<Vec<_>>();
+        let initial_context = ContextState::from_mn(-7, 74, 31).unwrap();
+        let mut encoder_context = initial_context;
+        let mut encoder = CabacEncoder::new();
+        for &(is_bypass, bin) in &operations {
+            if is_bypass {
+                encoder.bypass(bin).unwrap();
+            } else {
+                encoder.decision(&mut encoder_context, bin).unwrap();
+            }
+        }
+        encoder.terminate(true).unwrap();
+        let bytes = encoder.finish().unwrap();
+
+        let mut bits = BitReader::new(&bytes);
+        let mut decoder = CabacDecoder::new(&mut bits).unwrap();
+        let mut decoder_context = initial_context;
+        for (is_bypass, expected) in operations {
+            let actual = if is_bypass {
+                decoder.bypass().unwrap()
+            } else {
+                decoder.decision(&mut decoder_context).unwrap()
+            };
+            assert_eq!(actual, expected);
+        }
+        assert!(decoder.terminate().unwrap());
+        assert_eq!(encoder_context, decoder_context);
+    }
+
+    #[test]
+    fn cabac_encoder_requires_and_preserves_termination() {
+        assert!(CabacEncoder::new().finish().is_err());
+
+        let mut encoder = CabacEncoder::new();
+        encoder.terminate(true).unwrap();
+        assert!(encoder.bypass(false).is_err());
+        let bytes = encoder.finish().unwrap();
+        let mut bits = BitReader::new(&bytes);
+        let mut decoder = CabacDecoder::new(&mut bits).unwrap();
+        assert!(decoder.terminate().unwrap());
     }
 }

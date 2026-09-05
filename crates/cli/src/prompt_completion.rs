@@ -12,7 +12,9 @@ const MONITOR_TARGETS: &[&str] = &["local", "project", "toggle"];
 const PROJECT_COMMANDS: &[&str] = &["info", "match", "preset", "presets", "set"];
 const RATE_CONFORM_POLICIES: &[&str] = &["frames", "time"];
 const SCALE_MODES: &[&str] = &["fill", "fit", "native", "stretch"];
-const SCENE_COMMANDS: &[&str] = &["close", "edit", "load", "params", "reset", "save", "set"];
+const SCENE_COMMANDS: &[&str] = &[
+    "close", "edit", "link", "load", "params", "reload", "reset", "save", "set", "unlink",
+];
 
 /// A prompt replacement and the candidates that produced it.
 #[derive(Debug, Eq, PartialEq)]
@@ -116,10 +118,14 @@ fn complete_scene(
         let Some(partial) = input.strip_prefix(&prefix) else {
             continue;
         };
-        if let Some(path) = partial.strip_prefix("load ") {
+        if let Some((action, path)) = partial
+            .strip_prefix("load ")
+            .map(|path| ("load", path))
+            .or_else(|| partial.strip_prefix("link ").map(|path| ("link", path)))
+        {
             return Some(complete_path(
                 path,
-                &format!("{prefix}load "),
+                &format!("{prefix}{action} "),
                 None,
                 base_directory,
             ));
@@ -397,6 +403,10 @@ mod tests {
         assert_eq!(monitor.replacement, "monitor project ");
         let scene = complete("scene lo", &session, Path::new("."));
         assert_eq!(scene.replacement, "scene load ");
+        let reload = complete("scene rel", &session, Path::new("."));
+        assert_eq!(reload.replacement, "scene reload ");
+        let unlink = complete("scene un", &session, Path::new("."));
+        assert_eq!(unlink.replacement, "scene unlink ");
         let legacy_fx = complete("fx lo", &session, Path::new("."));
         assert_eq!(legacy_fx.replacement, "fx load ");
         let scale = complete("scale fi", &session, Path::new("."));

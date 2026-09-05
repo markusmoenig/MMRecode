@@ -62,6 +62,8 @@ const THUMBNAIL_WIDTH: u32 = 96;
 const THUMBNAIL_HEIGHT: u32 = 54;
 const MAX_TIMELINE_THUMBNAILS: usize = 128;
 const MMFX_COMPILE_DELAY: Duration = Duration::from_millis(140);
+const LINKED_SCENE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LINKED_SCENE_DEBOUNCE: Duration = Duration::from_millis(160);
 
 /// Runs the interactive terminal preview for supported MPEG-2 or H.264 media.
 pub(crate) fn run(path: &Path) -> Result<(), String> {
@@ -315,6 +317,22 @@ struct EditorUi {
     mmfx_image: Option<TimelineImageBuffer>,
     mmfx_worker: Option<MmfxCompileWorker>,
     mmfx_generation: u64,
+    linked_scene_poll_due: Option<Instant>,
+    linked_scene_watches: BTreeMap<MediaId, LinkedSceneWatch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinkedFileStamp {
+    modified: Option<SystemTime>,
+    length: u64,
+}
+
+#[derive(Default)]
+struct LinkedSceneWatch {
+    stamp: Option<LinkedFileStamp>,
+    reload_due: Option<Instant>,
+    attempted: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -652,7 +670,8 @@ fn editor_event_loop(
     let mut last_thumbnail_revision = None;
     loop {
         let now = Instant::now();
-        let mut mmfx_changed = update_mmfx_preview(editor, session, host, now);
+        let mut mmfx_changed = update_linked_scenes(editor, session, now);
+        mmfx_changed |= update_mmfx_preview(editor, session, host, now);
         mmfx_changed |= synchronize_project_compositor(editor, session, host);
         if let Some(app) = app.as_mut() {
             app.tick(now, false)?;
@@ -762,6 +781,119 @@ fn editor_event_loop(
             }
         }
     }
+}
+
+fn update_linked_scenes(editor: &mut EditorUi, session: &mut EditorSession, now: Instant) -> bool {
+    if editor.linked_scene_poll_due.is_some_and(|due| due > now) {
+        return false;
+    }
+    editor.linked_scene_poll_due = Some(now + LINKED_SCENE_POLL_INTERVAL);
+    let linked = session
+        .project()
+        .media_nodes()
+        .filter_map(|media| {
+            let source = media.mmfx.as_ref()?;
+            Some((
+                media.id,
+                source.linked_path.clone()?,
+                source.source.clone(),
+                source.parameter_bindings.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let active = linked
+        .iter()
+        .map(|(media_id, _, _, _)| *media_id)
+        .collect::<BTreeSet<_>>();
+    editor
+        .linked_scene_watches
+        .retain(|media_id, _| active.contains(media_id));
+
+    let mut ready = Vec::new();
+    let mut changed = false;
+    for (media_id, path, cached_source, bindings) in linked {
+        let state = editor.linked_scene_watches.entry(media_id).or_default();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.stamp = None;
+                state.reload_due = None;
+                state.attempted = false;
+                let message = format!(
+                    "cannot watch linked MMFX '{}': {error} (cached scene retained)",
+                    path.display()
+                );
+                if state.last_error.as_deref() != Some(&message) {
+                    state.last_error = Some(message.clone());
+                    editor.message = format!("error: {message}");
+                    changed = true;
+                }
+                continue;
+            }
+        };
+        let stamp = LinkedFileStamp {
+            modified: metadata.modified().ok(),
+            length: metadata.len(),
+        };
+        if state.stamp.as_ref() != Some(&stamp) {
+            state.stamp = Some(stamp);
+            state.reload_due = Some(now + LINKED_SCENE_DEBOUNCE);
+            state.attempted = false;
+        }
+        if !state.attempted && state.reload_due.is_some_and(|due| due <= now) {
+            state.attempted = true;
+            ready.push((media_id, path, cached_source, bindings));
+        }
+    }
+
+    for (media_id, path, cached_source, bindings) in ready {
+        let result = read_and_validate_linked_scene(&path, &bindings).and_then(|source| {
+            if source == cached_source {
+                Ok(false)
+            } else {
+                session
+                    .refresh_linked_mmfx_source(media_id, &source)
+                    .map_err(|error| error.to_string())
+            }
+        });
+        let state = editor.linked_scene_watches.entry(media_id).or_default();
+        match result {
+            Ok(refreshed) => {
+                let recovered = state.last_error.take().is_some();
+                if refreshed || recovered {
+                    editor.message = if refreshed {
+                        format!("ok: synchronized linked MMFX {}", path.display())
+                    } else {
+                        format!("ok: linked MMFX {} is available", path.display())
+                    };
+                    changed = true;
+                }
+            }
+            Err(error) => {
+                let message = format!(
+                    "linked MMFX '{}': {error} (cached scene retained)",
+                    path.display()
+                );
+                if state.last_error.as_deref() != Some(&message) {
+                    state.last_error = Some(message.clone());
+                    editor.message = format!("error: {message}");
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn read_and_validate_linked_scene(
+    path: &Path,
+    bindings: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let source =
+        std::fs::read_to_string(path).map_err(|error| format!("cannot read source: {error}"))?;
+    mmrecode_mmfx::parse_scene_with_bindings(&source, bindings)
+        .map_err(|diagnostics| format_mmfx_diagnostics(&source, diagnostics))?;
+    Ok(source)
 }
 
 fn update_mmfx_preview(
@@ -1316,6 +1448,7 @@ fn handle_mmfx_editor_key(
         let source = editor.mmfx.as_ref().map(|document| MmfxSource {
             source: document.source.clone(),
             resource_base: document.resource_base.clone(),
+            linked_path: None,
             parameter_bindings,
         });
         if let Some(source) = source
@@ -1708,6 +1841,9 @@ fn execute_editor_input(
         | EditCommand::ProjectPreset { .. }
         | EditCommand::ProjectSet { .. } => InspectorFocus::ProjectInfo,
         EditCommand::FxLoad { .. }
+        | EditCommand::SceneLink { .. }
+        | EditCommand::SceneReload
+        | EditCommand::SceneUnlink
         | EditCommand::FxSave { .. }
         | EditCommand::FxEdit
         | EditCommand::FxClose
@@ -1931,6 +2067,7 @@ fn execute_editor_input(
                         .replace_current_mmfx_source(MmfxSource {
                             source,
                             resource_base,
+                            linked_path: None,
                             parameter_bindings: BTreeMap::new(),
                         })
                         .map_err(|error| error.to_string())?;
@@ -1948,6 +2085,90 @@ fn execute_editor_input(
             }
             return Ok(false);
         }
+        CommandOutput::SceneLinkRequested { locator } => {
+            let result = crate::resolve_existing_path(host.base_directory, &locator, "MMFX source")
+                .and_then(|path| {
+                    let source = read_and_validate_linked_scene(&path, &BTreeMap::new())?;
+                    let media_id = session
+                        .current_mmfx_source()
+                        .map_err(|error| error.to_string())?
+                        .0;
+                    session
+                        .replace_current_mmfx_source(MmfxSource {
+                            source,
+                            resource_base: path.parent().map(Path::to_path_buf),
+                            linked_path: Some(path.clone()),
+                            parameter_bindings: BTreeMap::new(),
+                        })
+                        .map_err(|error| error.to_string())?;
+                    Ok((media_id, path))
+                });
+            match result {
+                Ok((media_id, path)) => {
+                    close_mmfx_pane(editor);
+                    editor.linked_scene_watches.remove(&media_id);
+                    editor.linked_scene_poll_due = None;
+                    editor.message = format!("ok: linked scene to {}", path.display());
+                }
+                Err(error) => editor.message = format!("error: {error}"),
+            }
+            return Ok(false);
+        }
+        CommandOutput::SceneReloadRequested => {
+            let current = session
+                .current_mmfx_source()
+                .map_err(|error| error.to_string())
+                .map(|(media_id, payload)| {
+                    (
+                        media_id,
+                        payload.linked_path.clone(),
+                        payload.parameter_bindings.clone(),
+                    )
+                });
+            let result = current.and_then(|(media_id, linked_path, bindings)| {
+                let path = linked_path
+                    .ok_or_else(|| "scene is embedded; use `scene link <file>` first".to_owned())?;
+                let source = read_and_validate_linked_scene(&path, &bindings)?;
+                session
+                    .refresh_linked_mmfx_source(media_id, &source)
+                    .map_err(|error| error.to_string())?;
+                Ok((media_id, path))
+            });
+            match result {
+                Ok((media_id, path)) => {
+                    editor.linked_scene_watches.remove(&media_id);
+                    editor.linked_scene_poll_due = None;
+                    editor.message = format!("ok: reloaded linked scene {}", path.display());
+                }
+                Err(error) => editor.message = format!("error: {error} (cached scene retained)"),
+            }
+            return Ok(false);
+        }
+        CommandOutput::SceneUnlinkRequested => {
+            let current = session
+                .current_mmfx_source()
+                .map_err(|error| error.to_string())
+                .map(|(media_id, payload)| (media_id, payload.clone()));
+            let result = current.and_then(|(media_id, mut embedded)| {
+                if embedded.linked_path.is_none() {
+                    return Err("scene is already embedded".into());
+                }
+                embedded.linked_path = None;
+                session
+                    .replace_current_mmfx_source(embedded)
+                    .map_err(|error| error.to_string())?;
+                Ok(media_id)
+            });
+            match result {
+                Ok(media_id) => {
+                    editor.linked_scene_watches.remove(&media_id);
+                    editor.message =
+                        "ok: unlinked scene; the cached source is now embedded and editable".into();
+                }
+                Err(error) => editor.message = format!("error: {error}"),
+            }
+            return Ok(false);
+        }
         CommandOutput::FxSaveRequested { locator } => {
             extract_mmfx_source(session, editor, &locator, host.base_directory);
             if editor.mmfx.is_some() {
@@ -1956,8 +2177,15 @@ fn execute_editor_input(
             return Ok(false);
         }
         CommandOutput::FxEditRequested => {
-            open_current_mmfx_editor(session, editor)?;
-            editor.message = "Editing the focused scene's embedded MMFX source.".into();
+            if session
+                .current_mmfx_source()
+                .is_ok_and(|(_, source)| source.linked_path.is_some())
+            {
+                editor.message = "Linked scene source is read-only inside MMRecode; edit the external file or use `scene unlink` first.".into();
+            } else {
+                open_current_mmfx_editor(session, editor)?;
+                editor.message = "Editing the focused scene's embedded MMFX source.".into();
+            }
             return Ok(false);
         }
         CommandOutput::FxCloseRequested => {
@@ -2008,7 +2236,10 @@ fn execute_editor_input(
                         .map_err(|error| error.to_string())
                 });
             match result {
-                Ok(_) => editor.message = format!("ok: scene set {name} {value}"),
+                Ok(_) => {
+                    invalidate_current_link_watch(session, editor);
+                    editor.message = format!("ok: scene set {name} {value}");
+                }
                 Err(error) => editor.message = format!("error: {error}"),
             }
             sync_open_mmfx_context(session, editor, now);
@@ -2052,6 +2283,7 @@ fn execute_editor_input(
                 });
             match result {
                 Ok(_) => {
+                    invalidate_current_link_watch(session, editor);
                     editor.message = normalized.map_or_else(
                         || "ok: restored all scene parameter defaults".into(),
                         |name| format!("ok: restored scene parameter '{name}'"),
@@ -2084,6 +2316,15 @@ fn execute_editor_input(
         }
     }
     Ok(false)
+}
+
+fn invalidate_current_link_watch(session: &EditorSession, editor: &mut EditorUi) {
+    if let Ok((media_id, source)) = session.current_mmfx_source()
+        && source.linked_path.is_some()
+    {
+        editor.linked_scene_watches.remove(&media_id);
+        editor.linked_scene_poll_due = None;
+    }
 }
 
 fn sync_open_mmfx_context(session: &EditorSession, editor: &mut EditorUi, now: Instant) {
@@ -5005,13 +5246,33 @@ fn editor_context_text(
             || "project directory".into(),
             |path| path.display().to_string(),
         );
-        let source_state = editor
-            .mmfx
-            .as_ref()
-            .map_or("closed", |document| document.compile_status.as_str());
+        let source_state = if source.linked_path.is_some() {
+            "watching external file; cached snapshot active"
+        } else {
+            editor
+                .mmfx
+                .as_ref()
+                .map_or("closed", |document| document.compile_status.as_str())
+        };
+        let (ownership, linked_file, source_action) = source.linked_path.as_ref().map_or_else(
+            || {
+                (
+                    "embedded in project",
+                    "—".into(),
+                    "`edit` opens the embedded source.",
+                )
+            },
+            |path| {
+                (
+                    "linked external; cached in project",
+                    path.display().to_string(),
+                    "Edit the external file, or use `scene unlink` for internal editing.",
+                )
+            },
+        );
         let parameters = format_mmfx_parameters(session);
         return format!(
-            "MMFX SCENE\n\nObject     {name}\nOwnership  embedded in project\nResources  {resources}\nProject    {}\nSource     {source_state}\n\n{parameters}\n\n`edit` opens the embedded source.\n`save` persists the project, source, and bindings.\n`scene save as <file>` extracts source defaults.\nUse `man scene` for the complete workflow.",
+            "MMFX SCENE\n\nObject     {name}\nOwnership  {ownership}\nLinked     {linked_file}\nResources  {resources}\nProject    {}\nSource     {source_state}\n\n{parameters}\n\n{source_action}\n`scene reload` forces a linked refresh; `scene unlink` embeds the cache.\n`save` persists the source snapshot and bindings.\n`scene save as <file>` extracts the cached source defaults.\nUse `man scene` for the complete workflow.",
             if session.is_dirty() {
                 "modified"
             } else {
@@ -5142,9 +5403,13 @@ fn editor_context_text(
     }
 
     if let Some(mmfx) = &media.mmfx {
+        let ownership = mmfx.linked_path.as_ref().map_or_else(
+            || "embedded".into(),
+            |path| format!("linked ({})", path.display()),
+        );
         let _ = write!(
             text,
-            "\nMMFX       embedded ({} bytes)\nResources  {}",
+            "\nMMFX       {ownership} ({} cached bytes)\nResources  {}",
             mmfx.source.len(),
             mmfx.resource_base.as_ref().map_or_else(
                 || "project directory".into(),
@@ -5171,7 +5436,7 @@ fn editor_context_text(
     if project_focus || media.kind.as_str() == "project" {
         text.push_str("\n\nAvailable here\nimport <file>   add scene <name> <duration>   save   export plan\nproject info|match|preset|set   ls   cd <alias>");
     } else if media.kind.is_mmfx_scene() {
-        text.push_str("\n\nAvailable here\nedit   scene params   scene set <name> <value>   scene reset [name]\nscene load <scene.mmfx>   scene save as <file>   scene close\nsave   cd ..   help   man edit");
+        text.push_str("\n\nAvailable here\nedit   scene params   scene set <name> <value>   scene reset [name]\nscene load <file>   scene link <file>   scene reload   scene unlink\nscene save as <file>   scene close   save   cd ..   help   man scene");
     } else {
         text.push_str("\n\nAvailable here\nin <time>   out <time>   scale <mode>   project match\nls   cd ..   info video   info source   help");
     }
@@ -5249,7 +5514,7 @@ fn quick_help_text(session: &EditorSession) -> String {
         "CURRENT LEVEL\n  import adds media at the project root"
     };
     format!(
-        "PROJECT\n  new <name> [using <preset>]\n  open <project>   save [as <project>]\n  project info | match | presets | preset | set\n\nHIERARCHY & MEDIA\n  import <file> [as <name>]\n  pwd   ls   cd <path>\n  in <time>   out <time>   scale <mode>\n\nMMFX SCENES\n  add scene <name> <duration> [at <start>]\n  edit   scene load <scene.mmfx>\n  scene params   scene set <name> <value>\n  scene reset [name]   scene save as <file>   scene close\n  monitor project|local|toggle\n\nOUTPUT & HISTORY\n  export plan   export <file>\n  undo   redo   help   man <cmd>   quit\n\n{local}\n\nKEYS\n  Tab / Shift-Tab                 Move focus\n  Ctrl-Space                      Complete / play\n  Ctrl-S                          Save project\n  Ctrl-Z / Ctrl-Y                 Undo / redo\n  Inspector ↑/↓/PgUp/PgDn        Scroll\n  Timeline +/-   Shift-←/→   0    Zoom / pan / fit\n\nTime: S:FF or M:SS:FF"
+        "PROJECT\n  new <name> [using <preset>]\n  open <project>   save [as <project>]\n  project info | match | presets | preset | set\n\nHIERARCHY & MEDIA\n  import <file> [as <name>]\n  pwd   ls   cd <path>\n  in <time>   out <time>   scale <mode>\n\nMMFX SCENES\n  add scene <name> <duration> [at <start>]\n  edit   scene load <scene.mmfx>\n  scene link <scene.mmfx>   scene reload   scene unlink\n  scene params   scene set <name> <value>\n  scene reset [name]   scene save as <file>   scene close\n  monitor project|local|toggle\n\nOUTPUT & HISTORY\n  export plan   export <file>\n  undo   redo   help   man <cmd>   quit\n\n{local}\n\nKEYS\n  Tab / Shift-Tab                 Move focus\n  Ctrl-Space                      Complete / play\n  Ctrl-S                          Save project\n  Ctrl-Z / Ctrl-Y                 Undo / redo\n  Inspector ↑/↓/PgUp/PgDn        Scroll\n  Timeline +/-   Shift-←/→   0    Zoom / pan / fit\n\nTime: S:FF or M:SS:FF"
     )
 }
 
@@ -5330,6 +5595,14 @@ fn quick_help_rich_text(session: &EditorSession) -> Text<'static> {
             Span::raw("   "),
             command("scene load"),
             args(" <scene.mmfx>"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("scene link"),
+            args(" <scene.mmfx>   "),
+            command("scene reload"),
+            Span::raw("   "),
+            command("scene unlink"),
         ]),
         Line::from(vec![
             Span::raw("  "),
@@ -5450,10 +5723,30 @@ fn quick_help_rich_text(session: &EditorSession) -> Text<'static> {
 
 fn source_inspector_text(media: &mmrecode_edit::MediaNode) -> String {
     match &media.origin {
-        MediaOrigin::Generated => format!(
-            "SOURCE INFO\n\nName       {}\nKind       {}\nOrigin     generated\n\nThis media has no external source file.",
-            media.name,
-            media.kind.as_str()
+        MediaOrigin::Generated => media.mmfx.as_ref().map_or_else(
+            || {
+                format!(
+                    "SOURCE INFO\n\nName       {}\nKind       {}\nOrigin     generated\n\nThis media has no external source file.",
+                    media.name,
+                    media.kind.as_str()
+                )
+            },
+            |source| {
+                format!(
+                    "SOURCE INFO\n\nName       {}\nKind       {}\nOrigin     generated\nOwnership  {}\nCached     {} bytes\nResources  {}",
+                    media.name,
+                    media.kind.as_str(),
+                    source.linked_path.as_ref().map_or_else(
+                        || "embedded in project".into(),
+                        |path| format!("linked to {}", path.display())
+                    ),
+                    source.source.len(),
+                    source.resource_base.as_ref().map_or_else(
+                        || "project directory".into(),
+                        |path| path.display().to_string()
+                    ),
+                )
+            },
         ),
         MediaOrigin::Managed { path } => format!(
             "SOURCE INFO\n\nName       {}\nKind       {}\nOrigin     managed\nFile       {}",
@@ -6988,6 +7281,165 @@ mod tests {
                 .parameter_bindings
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn linked_scene_auto_refresh_retains_cache_and_can_be_unlinked() {
+        let directory = std::env::temp_dir().join(format!(
+            "mmrecode-linked-scene-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("title.mmfx");
+        let first = "@scene first { width: 32px; height: 18px; background: #f00; }";
+        std::fs::write(&path, first).unwrap();
+        let canonical_path = std::fs::canonicalize(&path).unwrap();
+
+        let (resize_tx, _resize_rx) = mpsc::channel();
+        let picker = Picker::halfblocks();
+        let host = EditorHost {
+            resize_tx: &resize_tx,
+            picker: &picker,
+            base_directory: &directory,
+            terminal_size: Size::new(80, 24),
+        };
+        let mut session =
+            EditorSession::new(MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap());
+        session
+            .apply(EditCommand::Add {
+                kind: MediaKind::new("scene").unwrap(),
+                alias: "Title".into(),
+                duration: mmrecode_edit::FrameValue::Frames {
+                    frames: 30,
+                    relative: false,
+                },
+                start: mmrecode_edit::FrameValue::Frames {
+                    frames: 0,
+                    relative: false,
+                },
+            })
+            .unwrap();
+        session
+            .apply(EditCommand::Cd {
+                path: "Title".into(),
+            })
+            .unwrap();
+        let mut editor = EditorUi {
+            input: "scene link title.mmfx".into(),
+            ..EditorUi::default()
+        };
+        let mut history = CommandHistory::default();
+        let mut app = None;
+        let started = Instant::now();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            started,
+            &host,
+        )
+        .unwrap();
+        let linked = session.current_mmfx_source().unwrap().1;
+        assert_eq!(
+            linked.linked_path.as_deref(),
+            Some(canonical_path.as_path())
+        );
+        assert_eq!(linked.source, first);
+
+        assert!(!update_linked_scenes(&mut editor, &mut session, started));
+        let second = "@scene second { width: 32px; height: 18px; background: #00ff00; }";
+        std::fs::write(&path, second).unwrap();
+        assert!(!update_linked_scenes(
+            &mut editor,
+            &mut session,
+            started + Duration::from_millis(300)
+        ));
+        assert!(update_linked_scenes(
+            &mut editor,
+            &mut session,
+            started + Duration::from_millis(600)
+        ));
+        assert_eq!(session.current_mmfx_source().unwrap().1.source, second);
+        assert!(editor.message.contains("synchronized linked MMFX"));
+
+        std::fs::write(&path, "not valid MMFX source").unwrap();
+        assert!(!update_linked_scenes(
+            &mut editor,
+            &mut session,
+            started + Duration::from_millis(900)
+        ));
+        assert!(update_linked_scenes(
+            &mut editor,
+            &mut session,
+            started + Duration::from_millis(1_200)
+        ));
+        assert_eq!(session.current_mmfx_source().unwrap().1.source, second);
+        assert!(editor.message.contains("cached scene retained"));
+
+        let third = "@scene third { width: 32px; height: 18px; background: #00f; }";
+        std::fs::write(&path, third).unwrap();
+        editor.input = "scene reload".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            started,
+            &host,
+        )
+        .unwrap();
+        assert_eq!(session.current_mmfx_source().unwrap().1.source, third);
+        assert!(editor.message.contains("reloaded linked scene"));
+
+        editor.input = "edit".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            started,
+            &host,
+        )
+        .unwrap();
+        assert!(editor.mmfx.is_none());
+        assert!(editor.message.contains("read-only"));
+
+        editor.input = "scene unlink".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            started,
+            &host,
+        )
+        .unwrap();
+        assert!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .linked_path
+                .is_none()
+        );
+        editor.input = "edit".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            started,
+            &host,
+        )
+        .unwrap();
+        assert!(editor.mmfx.is_some());
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
