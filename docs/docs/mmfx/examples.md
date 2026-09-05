@@ -1,57 +1,227 @@
 ---
 title: Examples
-description: Runnable MMFX scenes and reference CPU-rendered output frames.
+description: Runnable MMFX source beside CPU-reference output frames.
 ---
 
 # MMFX examples
 
-The checked-in [`motion-layout.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/motion-layout.mmfx)
-uses an image resource, nested row/column layout, an entrance animation, and cover-style scrolling.
-Render representative local frames from the repository root:
+Every example below includes real source, a reproducible command, and output from the scalar CPU
+reference renderer. The code fences use CSS highlighting because MMFX Scene is deliberately a
+strict CSS-shaped language.
 
-```console
-cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-000.png --frame 0 --frames 60
-cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-023.png --frame 23 --frames 60
-cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-059.png --frame 59 --frames 60
+## Rolling credits with intrinsic layout
+
+This complete [`rolling-credits.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/rolling-credits.mmfx)
+scene does not declare a pixel height for the moving column. Each text object is shaped and
+measured, the column adds its gaps and padding, and `cover` scrolling uses that resolved height.
+
+```css title="examples/mmfx/rolling-credits.mmfx"
+@scene rolling-credits {
+    width: 960px;
+    height: 540px;
+    background: #090d14;
+
+    @font Inter {
+        src: "builtin:inter";
+    }
+
+    @text label {
+        position: absolute;
+        left: 40px;
+        top: 32px;
+        width: auto;
+        height: auto;
+        content: "MMRECODE  /  ROLLING CREDITS";
+        font-family: Inter;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1;
+        color: #42d6c7;
+        white-space: nowrap;
+    }
+
+    @group viewport {
+        position: absolute;
+        left: 100px;
+        top: 90px;
+        width: 760px;
+        height: 380px;
+        overflow: hidden;
+        border-radius: 18px;
+        background: #111a27;
+
+        @group credits {
+            display: column;
+            width: 100%;
+            height: auto;
+            min-height: 1px;
+            padding: 42px;
+            gap: 24px;
+            align-items: center;
+            mm-scroll-direction: block-start;
+            mm-scroll-range: cover;
+            mm-scroll-duration: scene;
+
+            @text title {
+                width: auto;
+                height: auto;
+                max-width: 640px;
+                content: "A FILM CUT IN THE TERMINAL";
+                font-family: Inter;
+                font-size: 34px;
+                font-weight: 700;
+                line-height: 1.1;
+                text-align: center;
+                color: #f5f8fb;
+                white-space: nowrap;
+            }
+
+            @text direction {
+                width: 100%;
+                height: auto;
+                content: "DIRECTED BY\nThe Keyboard";
+                font-family: Inter;
+                font-size: 23px;
+                font-weight: 500;
+                line-height: 1.45;
+                text-align: center;
+                color: #b8c6d8;
+            }
+
+            @text picture {
+                width: 100%;
+                height: auto;
+                content: "PICTURE AND SOUND\nExact Frames\n\nSMART RENDERING\nThe Original Bitstream";
+                font-family: Inter;
+                font-size: 23px;
+                font-weight: 500;
+                line-height: 1.45;
+                text-align: center;
+                color: #b8c6d8;
+            }
+
+            @rect rule {
+                width: 180px;
+                height: 3px;
+                background: #42d6c7;
+                border-radius: 2px;
+            }
+
+            @text thanks {
+                width: 100%;
+                height: auto;
+                content: "MADE FOR LINUX\nAND PEOPLE WHO LIKE\nTO STAY IN FLOW";
+                font-family: Inter;
+                font-size: 24px;
+                font-weight: 650;
+                line-height: 1.35;
+                text-align: center;
+                color: #f5f8fb;
+            }
+        }
+    }
+}
 ```
 
-`--frame` is zero-based. `--frames` supplies the complete local scene duration, which is necessary
-for `scene`-duration animation and scrolling. If omitted, the renderer uses the smallest duration
-that contains the requested frame.
+```console
+cargo run -p mmrecode -- render-mmfx examples/mmfx/rolling-credits.mmfx credits-059.png --frame 59 --frames 120
+```
 
-## Reference output
+### Frame 0 — content starts below the viewport
 
-These PNGs are produced by the scalar CPU reference renderer, not hand-authored mockups.
+![Rolling credits at frame 0](/img/mmfx/rolling-credits-000.png)
 
-### Frame 0 — entrance begins
+### Frame 59 — the measured column crosses the viewport
 
-![Motion layout at frame 0](/img/mmfx/motion-layout-000.png)
+![Rolling credits at frame 59](/img/mmfx/rolling-credits-059.png)
 
-### Frame 23 — entrance complete
+### Frame 119 — content has passed beyond the viewport
+
+![Rolling credits at frame 119](/img/mmfx/rolling-credits-119.png)
+
+## Animated image-and-text card
+
+The checked-in [`motion-layout.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/motion-layout.mmfx)
+uses an image resource, nested row/column layout, an entrance animation, and a horizontal ticker.
+This is its actual card and animation source; the full file also declares its 960×540 scene,
+portable Inter font, and ticker window.
+
+```css title="Excerpt from examples/mmfx/motion-layout.mmfx"
+@group card {
+    position: absolute;
+    display: flex;
+    flex-direction: row;
+    left: 50px;
+    top: 82px;
+    width: 860px;
+    height: 300px;
+    padding: 38px;
+    gap: 34px;
+    align-items: center;
+    background: #192737f2;
+    border-radius: 28px;
+    overflow: hidden;
+    animation: enter 24f ease-out;
+
+    @image mark {
+        width: 190px;
+        height: 190px;
+        src: "../../docs/static/img/mmrecode-mark.png";
+        object-fit: contain;
+    }
+
+    @group copy {
+        display: flex;
+        flex-direction: column;
+        width: 560px;
+        height: 190px;
+        gap: 12px;
+        justify-content: center;
+
+        @text title {
+            width: 100%;
+            height: 64px;
+            content: "Layout that moves.";
+            font-family: Inter;
+            font-size: 46px;
+            font-weight: 700;
+            line-height: 1.1;
+            color: #f4f7f8;
+            white-space: nowrap;
+        }
+    }
+}
+
+@keyframes enter {
+    from { opacity: 0; transform: translateY(46px) scale(0.94); }
+    70% { opacity: 1; transform: translateY(-4px) scale(1.01); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+```
+
+```console
+cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-023.png --frame 23 --frames 60
+```
 
 ![Motion layout at frame 23](/img/mmfx/motion-layout-023.png)
 
-### Frame 59 — ticker completes its cover traversal
+`--frame` is zero-based. `--frames` supplies the complete local scene duration required by
+`scene`-duration animation and scrolling.
 
-![Motion layout at frame 59](/img/mmfx/motion-layout-059.png)
-
-The smaller [`lower-third.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/lower-third.mmfx)
-is a static text-and-shape example:
+## Editing these scenes
 
 ```console
-cargo run -p mmrecode -- render-mmfx examples/mmfx/lower-third.mmfx lower-third.png
+add scene Credits 4:00
+cd Credits
+scene load examples/mmfx/rolling-credits.mmfx
+edit
 ```
 
-Inside the editor, `add scene`, `cd` into the generated object, and run `edit`. The source remains
-embedded in the project; `scene load` imports an external example as an embedded copy and `scene save as`
-extracts a reusable copy. Tab and Shift-Tab move input focus between source, timeline, inspector,
-and command panes, so the timeline can be scrubbed while source stays open. Pointer movement never
-changes keyboard focus; click a pane or use Tab to select it. The default `monitor project` view
-shows the draft scene composited over decoded media at the current project playhead. Use
-`monitor local` to isolate the current `cd` context and its descendants, or `monitor toggle` to
-switch back and forth. Local generated content uses a checkerboard background to reveal
-transparency. Switching scope preserves both mapped playheads and does not modify the project.
+The loaded source is copied into the project. The terminal editor highlights MMFX at-rules,
+properties, strings, colors, units, keywords, and comments while the preview recompiles after a
+short pause. `scene save as <file>` extracts a reusable copy; ordinary project `save` remains the
+authoritative save operation.
 
-`scene` names declarative generated timeline content. The `fx` namespace is reserved for the later
-filter, generator, transition, and kernel workflow. Legacy `add fx` and `fx load/save/close` remain
-accepted so existing projects and scripts continue to work.
+Tab and Shift-Tab move focus between source, timeline, inspector, and command panes. The default
+`monitor project` view composites the draft scene over media at the project playhead;
+`monitor local` isolates the current `cd` context and its descendants.

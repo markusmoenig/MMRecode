@@ -27,6 +27,7 @@ trait ResolveLength {
 impl ResolveLength for Length {
     fn resolve_f64(self, containing: f64) -> f64 {
         match self {
+            Self::Auto => containing,
             Self::Pixels(value) => f64::from(value),
             Self::Percent(value) => containing * f64::from(value) / 100.0,
         }
@@ -610,7 +611,12 @@ fn draw_node(
     time: SceneTime,
 ) -> Result<(), RenderError> {
     let evaluated = evaluate_node(node, scene, time);
-    let bounds = resolve_bounds(&evaluated.style, parent, assigned, time);
+    let intrinsic = if assigned.is_none() {
+        Some(measure_node(node, parent, state, resources, scene, time)?)
+    } else {
+        None
+    };
+    let bounds = resolve_bounds(&evaluated.style, parent, assigned, intrinsic, time);
     let bounds_clip = Clip::from_bounds(bounds);
     let child_clip = if evaluated.style.overflow == Overflow::Hidden {
         inherited_clip.intersect(bounds_clip)
@@ -728,14 +734,17 @@ fn draw_children(
         content.height
     };
     let base_gap = parent_style.gap.resolve_f64(main_extent).max(0.0);
-    let main_sizes = flow
+    let measured = flow
         .iter()
-        .map(|child| {
-            let style = evaluate_node(child, scene, time).style;
+        .map(|child| measure_node(child, content, state, resources, scene, time))
+        .collect::<Result<Vec<_>, _>>()?;
+    let main_sizes = measured
+        .iter()
+        .map(|size| {
             if parent_style.display == Display::Row {
-                style.width.resolve_f64(content.width).max(0.0)
+                size.width
             } else {
-                style.height.resolve_f64(content.height).max(0.0)
+                size.height
             }
         })
         .collect::<Vec<_>>();
@@ -752,12 +761,11 @@ fn draw_children(
         JustifyContent::End => (free, base_gap),
         JustifyContent::Start | JustifyContent::SpaceBetween => (0.0, base_gap),
     };
-    for (child, main_size) in flow.iter().zip(main_sizes) {
-        let style = evaluate_node(child, scene, time).style;
+    for ((child, main_size), measured) in flow.iter().zip(main_sizes).zip(measured) {
         let natural_cross = if parent_style.display == Display::Row {
-            style.height.resolve_f64(content.height).max(0.0)
+            measured.height
         } else {
-            style.width.resolve_f64(content.width).max(0.0)
+            measured.width
         };
         let cross_extent = if parent_style.align_items == AlignItems::Stretch {
             if parent_style.display == Display::Row {
@@ -831,11 +839,25 @@ fn resolve_bounds(
     style: &Style,
     parent: Bounds,
     assigned: Option<Bounds>,
+    intrinsic: Option<IntrinsicSize>,
     time: SceneTime,
 ) -> Bounds {
     let mut bounds = assigned.unwrap_or_else(|| {
-        let width = style.width.resolve_f64(parent.width).max(0.0);
-        let height = style.height.resolve_f64(parent.height).max(0.0);
+        let intrinsic = intrinsic.unwrap_or_default();
+        let width = resolve_box_axis(
+            style.width,
+            intrinsic.width,
+            parent.width,
+            style.min_width,
+            style.max_width,
+        );
+        let height = resolve_box_axis(
+            style.height,
+            intrinsic.height,
+            parent.height,
+            style.min_height,
+            style.max_height,
+        );
         let x = if let Some(left) = style.left {
             parent.x + left.resolve_f64(parent.width)
         } else if let Some(right) = style.right {
@@ -864,6 +886,192 @@ fn resolve_bounds(
         apply_scroll(&mut bounds, parent, scroll.direction, f64::from(progress));
     }
     bounds
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IntrinsicSize {
+    width: f64,
+    height: f64,
+}
+
+fn resolve_box_axis(
+    declared: Length,
+    intrinsic: f64,
+    containing: f64,
+    minimum: Option<Length>,
+    maximum: Option<Length>,
+) -> f64 {
+    let mut value = match declared {
+        Length::Auto => intrinsic,
+        length => length.resolve_f64(containing),
+    }
+    .max(0.0);
+    if let Some(minimum) = minimum {
+        value = value.max(minimum.resolve_f64(containing));
+    }
+    if let Some(maximum) = maximum {
+        value = value.min(maximum.resolve_f64(containing).max(0.0));
+    }
+    value
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn measure_node(
+    node: &Node,
+    parent: Bounds,
+    state: &mut RenderState,
+    resources: &RenderResources,
+    scene: &Scene,
+    time: SceneTime,
+) -> Result<IntrinsicSize, RenderError> {
+    let evaluated = evaluate_node(node, scene, time);
+    let style = &evaluated.style;
+    let declared_width = (!matches!(style.width, Length::Auto))
+        .then(|| style.width.resolve_f64(parent.width).max(0.0));
+    let declared_height = (!matches!(style.height, Length::Auto))
+        .then(|| style.height.resolve_f64(parent.height).max(0.0));
+    if let (Some(width), Some(height)) = (declared_width, declared_height) {
+        return Ok(IntrinsicSize {
+            width: resolve_box_axis(
+                style.width,
+                width,
+                parent.width,
+                style.min_width,
+                style.max_width,
+            ),
+            height: resolve_box_axis(
+                style.height,
+                height,
+                parent.height,
+                style.min_height,
+                style.max_height,
+            ),
+        });
+    }
+    let mut available_width = declared_width.unwrap_or(parent.width).max(0.0);
+    let mut available_height = declared_height.unwrap_or(parent.height).max(0.0);
+    if let Some(maximum) = style.max_width {
+        available_width = available_width.min(maximum.resolve_f64(parent.width).max(0.0));
+    }
+    if let Some(maximum) = style.max_height {
+        available_height = available_height.min(maximum.resolve_f64(parent.height).max(0.0));
+    }
+    let padding = style.padding.resolve_f64(available_width).max(0.0);
+    let inner = Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: (available_width - padding * 2.0).max(0.0),
+        height: (available_height - padding * 2.0).max(0.0),
+    };
+
+    let natural = match &node.kind {
+        NodeKind::Text(text) => {
+            let wrap_width = match (style.width, text.wrap) {
+                (Length::Auto, TextWrap::NoWrap) => None,
+                _ => Some(inner.width),
+            };
+            let layout = build_text_layout(
+                text,
+                evaluated.text_color.unwrap_or(text.color),
+                wrap_width,
+                state,
+            );
+            IntrinsicSize {
+                width: f64::from(layout.full_width()),
+                height: f64::from(layout.height()),
+            }
+        }
+        NodeKind::Image(image) => {
+            let resource = resources
+                .images
+                .get(&image.source)
+                .ok_or_else(|| RenderError {
+                    message: format!("image '{}' has no prepared pixels", image.source),
+                })?;
+            let aspect = f64::from(resource.width) / f64::from(resource.height);
+            match (declared_width, declared_height) {
+                (Some(width), None) => IntrinsicSize {
+                    width,
+                    height: width / aspect,
+                },
+                (None, Some(height)) => IntrinsicSize {
+                    width: height * aspect,
+                    height,
+                },
+                _ => IntrinsicSize {
+                    width: f64::from(resource.width),
+                    height: f64::from(resource.height),
+                },
+            }
+        }
+        NodeKind::Group | NodeKind::Rect => {
+            let flow = node
+                .children
+                .iter()
+                .filter(|child| evaluate_node(child, scene, time).style.position == Position::Flow)
+                .collect::<Vec<_>>();
+            let child_sizes = flow
+                .iter()
+                .map(|child| measure_node(child, inner, state, resources, scene, time))
+                .collect::<Result<Vec<_>, _>>()?;
+            let gap_extent = if style.display == Display::Row {
+                inner.width
+            } else {
+                inner.height
+            };
+            let gap = style.gap.resolve_f64(gap_extent).max(0.0);
+            let gap_count =
+                f64::from(u32::try_from(flow.len().saturating_sub(1)).unwrap_or(u32::MAX));
+            let content = match style.display {
+                Display::Row => IntrinsicSize {
+                    width: child_sizes.iter().map(|size| size.width).sum::<f64>() + gap * gap_count,
+                    height: child_sizes
+                        .iter()
+                        .map(|size| size.height)
+                        .fold(0.0, f64::max),
+                },
+                Display::Column => IntrinsicSize {
+                    width: child_sizes
+                        .iter()
+                        .map(|size| size.width)
+                        .fold(0.0, f64::max),
+                    height: child_sizes.iter().map(|size| size.height).sum::<f64>()
+                        + gap * gap_count,
+                },
+                Display::Overlay => IntrinsicSize {
+                    width: child_sizes
+                        .iter()
+                        .map(|size| size.width)
+                        .fold(0.0, f64::max),
+                    height: child_sizes
+                        .iter()
+                        .map(|size| size.height)
+                        .fold(0.0, f64::max),
+                },
+            };
+            IntrinsicSize {
+                width: content.width + padding * 2.0,
+                height: content.height + padding * 2.0,
+            }
+        }
+    };
+
+    Ok(IntrinsicSize {
+        width: resolve_box_axis(
+            style.width,
+            natural.width,
+            parent.width,
+            style.min_width,
+            style.max_width,
+        ),
+        height: resolve_box_axis(
+            style.height,
+            natural.height,
+            parent.height,
+            style.min_height,
+            style.max_height,
+        ),
+    })
 }
 
 fn apply_scroll(bounds: &mut Bounds, parent: Bounds, direction: ScrollDirection, progress: f64) {
@@ -1088,6 +1296,31 @@ fn draw_text(
     coverage_masks: &[CoverageMask],
     state: &mut RenderState,
 ) -> Result<(), RenderError> {
+    let layout = build_text_layout(text, color, Some(bounds.width), state);
+
+    for line in layout.lines() {
+        for item in line.items() {
+            if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                draw_glyph_run(
+                    surface,
+                    &glyph_run,
+                    bounds,
+                    clip,
+                    coverage_masks,
+                    &mut state.scale,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_text_layout(
+    text: &TextContent,
+    color: Color,
+    width: Option<f64>,
+    state: &mut RenderState,
+) -> Layout<Color> {
     let mut builder = state
         .layout
         .ranged_builder(&mut state.fonts, &text.content, 1.0, false);
@@ -1106,7 +1339,7 @@ fn draw_text(
     }));
     builder.push_default(StyleProperty::Brush(color));
     let mut layout: Layout<Color> = builder.build(&text.content);
-    layout.break_all_lines(Some(f64_to_f32(bounds.width)));
+    layout.break_all_lines(width.map(f64_to_f32));
     layout.align(
         match text.align {
             TextAlign::Start => Alignment::Start,
@@ -1115,22 +1348,7 @@ fn draw_text(
         },
         AlignmentOptions::default(),
     );
-
-    for line in layout.lines() {
-        for item in line.items() {
-            if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                draw_glyph_run(
-                    surface,
-                    &glyph_run,
-                    bounds,
-                    clip,
-                    coverage_masks,
-                    &mut state.scale,
-                )?;
-            }
-        }
-    }
-    Ok(())
+    layout
 }
 
 fn draw_glyph_run(
@@ -1425,6 +1643,7 @@ fn linear_u16_to_srgb(value: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::{Bounds, RenderState, measure_node};
     use crate::{
         RenderResources, SceneTime, parse_scene, prepare_scene, render, render_with_resources,
     };
@@ -1596,6 +1815,41 @@ mod tests {
             })
             .count();
         assert!(painted_rows > 40, "painted row count was {painted_rows}");
+    }
+
+    #[test]
+    fn intrinsic_column_uses_measured_text_and_gap() {
+        let scene = parse_scene(
+            r#"@scene x { width: 240px; height: 180px;
+                @font Inter { src: "Inter.ttf"; }
+                @group stack { display: column; width: 160px; height: auto; gap: 8px;
+                    @text a { width: 100%; height: auto; content: "alpha beta gamma";
+                        font-family: Inter; font-size: 24px; line-height: 1.2; color: #fff; }
+                    @text b { width: auto; max-width: 100px; height: auto;
+                        content: "delta epsilon zeta"; font-family: Inter;
+                        font-size: 20px; line-height: 1.2; color: #fff; }
+                }
+            }"#,
+        )
+        .expect("valid intrinsic scene");
+        let resources = inter_resources();
+        let mut state = RenderState::new(&scene, &resources).expect("font state");
+        let measured = measure_node(
+            &scene.children[0],
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 240.0,
+                height: 180.0,
+            },
+            &mut state,
+            &resources,
+            &scene,
+            SceneTime::default(),
+        )
+        .expect("measure scene");
+        assert_eq!(measured.width, 160.0);
+        assert!(measured.height > 70.0, "height was {}", measured.height);
     }
 
     #[test]

@@ -56,6 +56,39 @@ pub struct VuiParameters {
     pub time_scale: Option<u32>,
     /// Whether each coded picture uses a fixed frame-rate cadence.
     pub fixed_frame_rate: Option<bool>,
+    /// NAL HRD parameters, when present.
+    pub nal_hrd: Option<HrdParameters>,
+    /// VCL HRD parameters, when present.
+    pub vcl_hrd: Option<HrdParameters>,
+    /// Whether HRD removal uses the low-delay model.
+    pub low_delay_hrd: Option<bool>,
+    /// Whether picture-timing SEI may carry `pic_struct` syntax.
+    pub pic_struct_present: bool,
+}
+
+/// First coded-picture-buffer entry and delay widths from VUI HRD syntax.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HrdParameters {
+    /// Number of CPB schedule entries.
+    pub cpb_count: u8,
+    /// Bit-rate scaling exponent.
+    pub bit_rate_scale: u8,
+    /// CPB-size scaling exponent.
+    pub cpb_size_scale: u8,
+    /// Bit rate represented by the first schedule entry, in bits per second.
+    pub bit_rate: u64,
+    /// CPB size represented by the first schedule entry, in bits.
+    pub cpb_size: u64,
+    /// Whether the first schedule entry declares constant-bit-rate operation.
+    pub cbr: bool,
+    /// Width of `initial_cpb_removal_delay` syntax.
+    pub initial_cpb_removal_delay_length: u8,
+    /// Width of `cpb_removal_delay` syntax.
+    pub cpb_removal_delay_length: u8,
+    /// Width of `dpb_output_delay` syntax.
+    pub dpb_output_delay_length: u8,
+    /// Width of signed clock-timestamp offsets.
+    pub time_offset_length: u8,
 }
 
 /// Fully resolved inverse-quantization scaling matrices for 4:2:0 video.
@@ -584,7 +617,68 @@ fn parse_vui(reader: &mut SyntaxReader<'_>) -> Result<VuiParameters> {
         vui.time_scale = Some(read_u32(reader, 32, "time_scale")?);
         vui.fixed_frame_rate = Some(reader.bit()?);
     }
+    vui.nal_hrd = reader.bit()?.then(|| parse_hrd(reader)).transpose()?;
+    vui.vcl_hrd = reader.bit()?.then(|| parse_hrd(reader)).transpose()?;
+    if vui.nal_hrd.is_some() || vui.vcl_hrd.is_some() {
+        vui.low_delay_hrd = Some(reader.bit()?);
+    }
+    vui.pic_struct_present = reader.bit()?;
+    if reader.bit()? {
+        let _motion_vectors_over_pic_boundaries = reader.bit()?;
+        let _max_bytes_per_pic_denom = reader.ue()?;
+        let _max_bits_per_mb_denom = reader.ue()?;
+        let _log2_max_mv_length_horizontal = reader.ue()?;
+        let _log2_max_mv_length_vertical = reader.ue()?;
+        let _max_num_reorder_frames = reader.ue()?;
+        let _max_dec_frame_buffering = reader.ue()?;
+    }
     Ok(vui)
+}
+
+fn parse_hrd(reader: &mut SyntaxReader<'_>) -> Result<HrdParameters> {
+    let cpb_count_minus1 = reader.ue()?;
+    if cpb_count_minus1 > 31 {
+        return Err(Error::InvalidData(
+            "H.264 HRD cpb_cnt_minus1 exceeds 31".into(),
+        ));
+    }
+    let cpb_count = u8::try_from(cpb_count_minus1 + 1).expect("validated H.264 CPB count fits u8");
+    let bit_rate_scale = read_u8(reader, 4, "bit_rate_scale")?;
+    let cpb_size_scale = read_u8(reader, 4, "cpb_size_scale")?;
+    let mut bit_rate = 0;
+    let mut cpb_size = 0;
+    let mut first_cbr = false;
+    for index in 0..cpb_count {
+        let encoded_bit_rate = u64::from(reader.ue()?) + 1;
+        let encoded_cpb_size = u64::from(reader.ue()?) + 1;
+        let cbr = reader.bit()?;
+        if index == 0 {
+            bit_rate = encoded_bit_rate
+                .checked_shl(u32::from(6 + bit_rate_scale))
+                .ok_or_else(|| Error::InvalidData("H.264 HRD bit rate overflows".into()))?;
+            cpb_size = encoded_cpb_size
+                .checked_shl(u32::from(4 + cpb_size_scale))
+                .ok_or_else(|| Error::InvalidData("H.264 HRD CPB size overflows".into()))?;
+            first_cbr = cbr;
+        }
+    }
+    let initial_cpb_removal_delay_length =
+        read_u8(reader, 5, "initial_cpb_removal_delay_length_minus1")? + 1;
+    let cpb_removal_delay_length = read_u8(reader, 5, "cpb_removal_delay_length_minus1")? + 1;
+    let dpb_output_delay_length = read_u8(reader, 5, "dpb_output_delay_length_minus1")? + 1;
+    let time_offset_length = read_u8(reader, 5, "time_offset_length")?;
+    Ok(HrdParameters {
+        cpb_count,
+        bit_rate_scale,
+        cpb_size_scale,
+        bit_rate,
+        cpb_size,
+        cbr: first_cbr,
+        initial_cpb_removal_delay_length,
+        cpb_removal_delay_length,
+        dpb_output_delay_length,
+        time_offset_length,
+    })
 }
 
 fn standard_aspect_ratio(idc: u8) -> Option<AspectRatio> {
@@ -899,6 +993,21 @@ pub struct RecoveryPoint {
     pub changing_slice_group_idc: u8,
 }
 
+/// HRD delays carried by buffering-period and picture-timing SEI messages.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HrdSeiTiming {
+    /// Referenced SPS identifier from a buffering-period message.
+    pub sequence_parameter_set_id: Option<u32>,
+    /// Initial CPB removal delay for the first schedule entry.
+    pub initial_cpb_removal_delay: Option<u32>,
+    /// Initial CPB removal delay offset for the first schedule entry.
+    pub initial_cpb_removal_delay_offset: Option<u32>,
+    /// Coded-picture-buffer removal delay from a picture-timing message.
+    pub cpb_removal_delay: Option<u32>,
+    /// Decoded-picture-buffer output delay from a picture-timing message.
+    pub dpb_output_delay: Option<u32>,
+}
+
 /// One indexed coded picture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PictureUnit {
@@ -1141,6 +1250,89 @@ pub fn parse_recovery_point_sei(nal: &[u8]) -> Result<Option<RecoveryPoint>> {
         }
     }
     Ok(None)
+}
+
+/// Parses HRD buffering-period and picture-timing payloads from one SEI NAL unit.
+///
+/// # Errors
+///
+/// Returns an error when the NAL or a relevant payload is truncated or malformed.
+pub fn parse_hrd_sei(nal: &[u8], vui: &VuiParameters) -> Result<HrdSeiTiming> {
+    require_type(nal, NalUnitType::Sei)?;
+    let rbsp = remove_emulation_prevention(&nal[1..]);
+    let mut timing = HrdSeiTiming::default();
+    let mut cursor = 0_usize;
+    while cursor < rbsp.len() {
+        if cursor + 1 == rbsp.len() && rbsp[cursor] == 0x80 {
+            break;
+        }
+        let payload_type = read_sei_extended_value(&rbsp, &mut cursor, "payload type")?;
+        let payload_size = read_sei_extended_value(&rbsp, &mut cursor, "payload size")?;
+        let payload_end = cursor
+            .checked_add(payload_size)
+            .ok_or_else(|| Error::InvalidData("H.264 SEI payload range overflows".into()))?;
+        let payload = rbsp
+            .get(cursor..payload_end)
+            .ok_or_else(|| Error::InvalidData("truncated H.264 SEI payload".into()))?;
+        cursor = payload_end;
+        let mut reader = SyntaxReader::new(payload);
+        match payload_type {
+            0 => {
+                timing.sequence_parameter_set_id = Some(reader.ue()?);
+                if let Some(hrd) = vui.nal_hrd {
+                    let (delay, offset) = parse_initial_cpb_delay(&mut reader, hrd)?;
+                    timing.initial_cpb_removal_delay = Some(delay);
+                    timing.initial_cpb_removal_delay_offset = Some(offset);
+                }
+                if let Some(hrd) = vui.vcl_hrd {
+                    let (delay, offset) = parse_initial_cpb_delay(&mut reader, hrd)?;
+                    if timing.initial_cpb_removal_delay.is_none() {
+                        timing.initial_cpb_removal_delay = Some(delay);
+                        timing.initial_cpb_removal_delay_offset = Some(offset);
+                    }
+                }
+            }
+            1 => {
+                if let Some(hrd) = vui.nal_hrd.or(vui.vcl_hrd) {
+                    timing.cpb_removal_delay = Some(read_u32(
+                        &mut reader,
+                        hrd.cpb_removal_delay_length,
+                        "cpb_removal_delay",
+                    )?);
+                    timing.dpb_output_delay = Some(read_u32(
+                        &mut reader,
+                        hrd.dpb_output_delay_length,
+                        "dpb_output_delay",
+                    )?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(timing)
+}
+
+fn parse_initial_cpb_delay(
+    reader: &mut SyntaxReader<'_>,
+    hrd: HrdParameters,
+) -> Result<(u32, u32)> {
+    let mut first = (0, 0);
+    for index in 0..hrd.cpb_count {
+        let delay = read_u32(
+            reader,
+            hrd.initial_cpb_removal_delay_length,
+            "initial_cpb_removal_delay",
+        )?;
+        let offset = read_u32(
+            reader,
+            hrd.initial_cpb_removal_delay_length,
+            "initial_cpb_removal_delay_offset",
+        )?;
+        if index == 0 {
+            first = (delay, offset);
+        }
+    }
+    Ok(first)
 }
 
 fn read_sei_extended_value(data: &[u8], cursor: &mut usize, name: &str) -> Result<usize> {

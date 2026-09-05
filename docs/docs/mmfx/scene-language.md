@@ -1,9 +1,9 @@
 ---
 title: Scene language
-description: The executable MMFX Scene 0.2 syntax for layout, images, text, animation, and scrolling.
+description: The executable MMFX Scene 0.3 syntax for intrinsic layout, images, text, animation, and scrolling.
 ---
 
-# MMFX Scene 0.2
+# MMFX Scene 0.3
 
 MMFX Scene is a strict, CSS-shaped composition language. It deliberately has no DOM, selectors,
 global cascade, JavaScript, or silent recovery. Unknown and duplicate declarations are errors with
@@ -45,12 +45,14 @@ Image fitting is `contain`, `cover`, or `fill`.
 
 ## Boxes and layout
 
-Every object has a box. Lengths use `px` or `%`, with zero allowed without a unit. The shared
+Every object has a box. Lengths use `px` or `%`, with zero allowed without a unit. Object `width`
+and `height` additionally accept `auto`, which measures text, source image dimensions, or a group's
+flow children before placement. The shared
 properties currently are:
 
 | Purpose | Properties and values |
 | --- | --- |
-| Placement | `position: absolute`, `left`, `top`, `right`, `bottom`, `width`, `height` |
+| Placement | `position: absolute`, `left`, `top`, `right`, `bottom`, `width`, `height`, `min-width`, `max-width`, `min-height`, `max-height` |
 | Child layout | `display` accepts `overlay`, `row`, `column`, or `flex`; `flex-direction` accepts `row` or `column` |
 | Flow spacing | `padding`, `gap`, `align-items` (`start`, `center`, `end`, `stretch`), `justify-content` (`start`, `center`, `end`, `space-between`) |
 | Paint | `background`, `opacity: 0..1`, `border-radius`, `overflow` (`visible` or `hidden`) |
@@ -58,8 +60,12 @@ properties currently are:
 
 Children participate in their parent's row or column flow by default. An absolute child is removed
 from that flow and uses its inset properties. Overlay places children in the same containing box.
-This first bounded profile has uniform padding and gap; it does not yet have margins, min/max
-sizes, intrinsic sizing, wrapping flex rows, or a browser box model.
+This bounded profile has uniform padding and gap. In a row or column, automatic text boxes use
+Parley's shaped line metrics, automatic images use their source dimensions and preserve aspect
+ratio when only one axis is declared, and automatic groups enclose their flow children plus padding
+and gaps. Percentages inside an automatic parent resolve against the available containing box; this
+avoids circular browser-style layout. Min/max constraints are then applied to the measured result.
+The profile does not yet have margins, wrapping flex rows, or a browser box model.
 
 ## Text
 
@@ -112,7 +118,9 @@ a property across stops; mixed `px` and `%` values currently switch discretely a
 
 `mm-scroll-direction` accepts `inline-start`, `inline-end`, `block-start`, or `block-end`.
 `mm-scroll-range: cover` moves the entire object from beyond one edge of its containing box to
-beyond the opposite edge. Duration uses the same exact `Nf` or `scene` syntax as animation.
+beyond the opposite edge. Layout and intrinsic measurement happen first, so an automatic-height
+column can be used directly for rolling credits. Duration uses the same exact `Nf` or `scene`
+syntax as animation.
 
 ## Time and caching
 
@@ -125,5 +133,5 @@ Static scenes are rasterized once. Animated scenes are parsed and prepared once,
 frames are kept in a bounded cache. Fonts and images are loaded once per source/canvas revision;
 timeline scrubbing does not reparse source or resize resources for a cached frame.
 
-Current limits include no media slots, gradients, paths, borders, animation delay/repetition, style
-variables, fallback fonts, color glyphs, Kernel IR, or GPU backend.
+Current limits include no media slots, gradients, paths, borders, margins, animation
+delay/repetition, style variables, fallback fonts, color glyphs, Kernel IR, or GPU backend.

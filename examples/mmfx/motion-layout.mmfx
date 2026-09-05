@@ -1,4 +1,4 @@
-/* Scene 0.2: image resources, row/column layout, keyframes, and a ticker. */
+/* Scene 0.3: image resources, row/column layout, keyframes, and a ticker. */
 @scene motion-layout {
     width: 960px;
     height: 540px;

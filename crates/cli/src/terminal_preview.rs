@@ -4574,20 +4574,12 @@ fn draw_mmfx_source_editor(
             .scroll((u16::try_from(document.scroll).unwrap_or(u16::MAX), 0)),
         gutter,
     );
+    let mut in_comment = false;
     let source_lines = document
         .source
         .split('\n')
         .enumerate()
-        .map(|(line, text)| {
-            Line::from(Span::styled(
-                text.to_owned(),
-                if line == cursor_line {
-                    Style::default().bg(Color::Rgb(31, 39, 51))
-                } else {
-                    Style::default()
-                },
-            ))
-        })
+        .map(|(line, text)| highlight_mmfx_line(text, line == cursor_line, &mut in_comment))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(source_lines).scroll((
@@ -4613,6 +4605,130 @@ fn draw_mmfx_source_editor(
             .min(source_area.bottom().saturating_sub(1));
         editor.cursor_position = (cursor_x, cursor_y);
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn highlight_mmfx_line(text: &str, active_line: bool, in_comment: &mut bool) -> Line<'static> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    let line_background = active_line.then_some(Color::Rgb(31, 39, 51));
+    let styled = |foreground| {
+        let mut style = Style::default().fg(foreground);
+        if let Some(background) = line_background {
+            style = style.bg(background);
+        }
+        style
+    };
+    while cursor < characters.len() {
+        let start = cursor;
+        let (end, color) = if *in_comment || starts_with_chars(&characters, cursor, "/*") {
+            *in_comment = true;
+            let mut end = cursor;
+            while end < characters.len() {
+                if starts_with_chars(&characters, end, "*/") {
+                    end += 2;
+                    *in_comment = false;
+                    break;
+                }
+                end += 1;
+            }
+            (end, Color::DarkGray)
+        } else if matches!(characters[cursor], '\'' | '"') {
+            let delimiter = characters[cursor];
+            cursor += 1;
+            while cursor < characters.len() {
+                let character = characters[cursor];
+                cursor += 1;
+                if character == '\\' && cursor < characters.len() {
+                    cursor += 1;
+                } else if character == delimiter {
+                    break;
+                }
+            }
+            (cursor, Color::Green)
+        } else if characters[cursor] == '@' {
+            cursor += 1;
+            while cursor < characters.len()
+                && (characters[cursor].is_alphanumeric() || characters[cursor] == '-')
+            {
+                cursor += 1;
+            }
+            (cursor, Color::LightCyan)
+        } else if characters[cursor] == '#' {
+            cursor += 1;
+            while cursor < characters.len() && characters[cursor].is_ascii_hexdigit() {
+                cursor += 1;
+            }
+            (cursor, Color::LightMagenta)
+        } else if characters[cursor].is_ascii_digit()
+            || (characters[cursor] == '-'
+                && characters.get(cursor + 1).is_some_and(char::is_ascii_digit))
+        {
+            cursor += 1;
+            while cursor < characters.len()
+                && (characters[cursor].is_ascii_alphanumeric()
+                    || matches!(characters[cursor], '.' | '%' | '+' | '-'))
+            {
+                cursor += 1;
+            }
+            (cursor, Color::Yellow)
+        } else if characters[cursor].is_alphabetic() || characters[cursor] == '-' {
+            cursor += 1;
+            while cursor < characters.len()
+                && (characters[cursor].is_alphanumeric() || characters[cursor] == '-')
+            {
+                cursor += 1;
+            }
+            let next = characters[cursor..]
+                .iter()
+                .find(|character| !character.is_whitespace());
+            let token = characters[start..cursor].iter().collect::<String>();
+            let color = if next == Some(&':') {
+                Color::LightBlue
+            } else if matches!(
+                token.as_str(),
+                "auto"
+                    | "absolute"
+                    | "row"
+                    | "column"
+                    | "flex"
+                    | "overlay"
+                    | "hidden"
+                    | "scene"
+                    | "from"
+                    | "to"
+            ) {
+                Color::LightMagenta
+            } else {
+                Color::Gray
+            };
+            (cursor, color)
+        } else {
+            cursor += 1;
+            let color = if matches!(characters[start], '{' | '}' | ':' | ';') {
+                Color::DarkGray
+            } else {
+                Color::Gray
+            };
+            (cursor, color)
+        };
+        cursor = end;
+        spans.push(Span::styled(
+            characters[start..end].iter().collect::<String>(),
+            styled(color),
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), styled(Color::Gray)));
+    }
+    Line::from(spans)
+}
+
+fn starts_with_chars(characters: &[char], start: usize, pattern: &str) -> bool {
+    characters
+        .get(start..start.saturating_add(pattern.chars().count()))
+        .is_some_and(|candidate| candidate.iter().copied().eq(pattern.chars()))
 }
 
 fn wrapped_text_line_count(text: &str, width: u16) -> usize {
@@ -5650,6 +5766,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mmfx_highlighter_distinguishes_language_tokens_and_multiline_comments() {
+        let mut in_comment = false;
+        let line = highlight_mmfx_line(
+            "@text title { width: auto; color: #42d6c7; content: \"Hello\"; /* note",
+            false,
+            &mut in_comment,
+        );
+        assert!(in_comment);
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| { span.content == "@text" && span.style.fg == Some(Color::LightCyan) })
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| { span.content == "width" && span.style.fg == Some(Color::LightBlue) })
+        );
+        assert!(
+            line.spans.iter().any(|span| {
+                span.content == "auto" && span.style.fg == Some(Color::LightMagenta)
+            })
+        );
+        assert!(line.spans.iter().any(|span| {
+            span.content == "#42d6c7" && span.style.fg == Some(Color::LightMagenta)
+        }));
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| { span.content == "\"Hello\"" && span.style.fg == Some(Color::Green) })
+        );
+        let closing = highlight_mmfx_line("continues */ width: 20px;", true, &mut in_comment);
+        assert!(!in_comment);
+        assert!(closing.spans.iter().all(|span| span.style.bg.is_some()));
+        assert!(closing.spans.iter().any(|span| span.content == "20px"));
+    }
+
+    #[test]
     fn pointer_motion_does_not_steal_mmfx_source_focus() {
         let mut editor = EditorUi {
             pane_focus: EditorPaneFocus::Code,
@@ -6451,8 +6605,8 @@ mod tests {
 
         let motion =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mmfx/motion-layout.mmfx");
-        let source = std::fs::read_to_string(&motion).expect("read Scene 0.2 example");
-        let scene = mmrecode_mmfx::parse_scene(&source).expect("parse Scene 0.2 example");
+        let source = std::fs::read_to_string(&motion).expect("read Scene 0.3 example");
+        let scene = mmrecode_mmfx::parse_scene(&source).expect("parse Scene 0.3 example");
         let resources = crate::load_mmfx_resources(&scene, motion.parent().unwrap())
             .expect("load example image and built-in font");
         let rendered = mmrecode_mmfx::render_frame_with_resources(
@@ -6487,6 +6641,26 @@ mod tests {
             differing_pixels <= pixel_count / 10,
             "rendered reference differs in {differing_pixels} of {pixel_count} pixels"
         );
+
+        let credits =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mmfx/rolling-credits.mmfx");
+        let source = std::fs::read_to_string(&credits).expect("read intrinsic scrolling example");
+        let scene = mmrecode_mmfx::parse_scene(&source).expect("parse intrinsic scrolling example");
+        let resources = crate::load_mmfx_resources(&scene, credits.parent().unwrap())
+            .expect("load built-in credits font");
+        let rendered = mmrecode_mmfx::render_frame_with_resources(
+            &scene,
+            &resources,
+            mmrecode_mmfx::SceneTime::new(59, 120),
+        )
+        .expect("render documented rolling-credits frame");
+        let documented = image::open(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/static/img/mmfx/rolling-credits-059.png"),
+        )
+        .expect("open documented rolling-credits output")
+        .to_rgba8();
+        assert_eq!(documented.into_raw(), rendered.to_rgba8());
     }
 
     #[test]

@@ -249,10 +249,16 @@ struct RateControl {
     buffer_capacity_bits: i128,
     buffer_fullness_bits: i128,
     current_qp: i32,
+    fixed_buffer_capacity_bits: Option<i128>,
 }
 
 impl RateControl {
-    fn new(bitrate: u64, time_base: mmrecode_core::Rational, initial_qp: i32) -> Result<Self> {
+    fn new(
+        bitrate: u64,
+        time_base: mmrecode_core::Rational,
+        initial_qp: i32,
+        buffer_capacity_bits: Option<u64>,
+    ) -> Result<Self> {
         if bitrate == 0 || time_base.numerator() <= 0 || time_base.denominator() <= 0 {
             return Err(Error::Unsupported(
                 "H.264 bitrate control requires a non-zero bitrate and positive time_base".into(),
@@ -260,14 +266,17 @@ impl RateControl {
         }
         let target_bits_per_frame = Self::bits_for_interval(bitrate, 1, time_base)
             .ok_or_else(|| Error::Unsupported("H.264 target frame size overflows".into()))?;
-        let buffer_capacity_bits =
-            i128::from(target_bits_per_frame) * i128::from(RATE_CONTROL_BUFFER_FRAMES);
+        let fixed_buffer_capacity_bits = buffer_capacity_bits.map(i128::from);
+        let buffer_capacity_bits = fixed_buffer_capacity_bits.unwrap_or_else(|| {
+            i128::from(target_bits_per_frame) * i128::from(RATE_CONTROL_BUFFER_FRAMES)
+        });
         Ok(Self {
             bitrate,
             target_bits_per_frame,
             buffer_capacity_bits,
             buffer_fullness_bits: 0,
             current_qp: initial_qp,
+            fixed_buffer_capacity_bits,
         })
     }
 
@@ -299,8 +308,9 @@ impl RateControl {
                 )
             })
             .unwrap_or(self.target_bits_per_frame);
-        self.buffer_capacity_bits =
-            i128::from(target).saturating_mul(i128::from(RATE_CONTROL_BUFFER_FRAMES));
+        self.buffer_capacity_bits = self.fixed_buffer_capacity_bits.unwrap_or_else(|| {
+            i128::from(target).saturating_mul(i128::from(RATE_CONTROL_BUFFER_FRAMES))
+        });
         let half_capacity = self.buffer_capacity_bits / 2;
         self.buffer_fullness_bits = (self.buffer_fullness_bits + i128::from(encoded_bits)
             - i128::from(target))
@@ -328,6 +338,224 @@ impl RateControl {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EncoderHrd {
+    bit_rate_scale: u8,
+    bit_rate_value_minus1: u32,
+    cpb_size_scale: u8,
+    cpb_size_value_minus1: u32,
+    signalled_cpb_size: u64,
+    initial_cpb_removal_delay: u32,
+    num_units_in_tick: u32,
+    time_scale: u32,
+    b_frames: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HrdState {
+    parameters: EncoderHrd,
+    cpb_removal_delay: u32,
+    decode_index: i32,
+    cpb_fullness_bits: u64,
+}
+
+impl EncoderHrd {
+    fn new(
+        bitrate: u64,
+        buffer_milliseconds: u64,
+        time_base: mmrecode_core::Rational,
+        b_frames: usize,
+    ) -> Result<Self> {
+        if bitrate == 0 || time_base.numerator() <= 0 || time_base.denominator() <= 0 {
+            return Err(Error::Unsupported(
+                "H.264 HRD requires a non-zero bitrate and positive time_base".into(),
+            ));
+        }
+        let numerator = u64::try_from(time_base.numerator()).expect("positive time-base numerator");
+        let denominator =
+            u64::try_from(time_base.denominator()).expect("positive time-base denominator");
+        let divisor = greatest_common_divisor(numerator, denominator);
+        let num_units_in_tick = u32::try_from(numerator / divisor)
+            .map_err(|_| Error::Unsupported("H.264 HRD time-base numerator exceeds VUI".into()))?;
+        let time_scale = u32::try_from(
+            (denominator / divisor)
+                .checked_mul(2)
+                .ok_or_else(|| Error::Unsupported("H.264 HRD time scale overflows".into()))?,
+        )
+        .map_err(|_| Error::Unsupported("H.264 HRD time scale exceeds VUI".into()))?;
+        let requested_cpb_size = u128::from(bitrate)
+            .checked_mul(u128::from(buffer_milliseconds))
+            .ok_or_else(|| Error::Unsupported("H.264 VBV buffer size overflows".into()))?
+            .div_ceil(1_000)
+            .max(1)
+            .try_into()
+            .map_err(|_| Error::Unsupported("H.264 VBV buffer size overflows".into()))?;
+        let (bit_rate_scale, bit_rate_value_minus1, signalled_bit_rate) =
+            scaled_hrd_value(bitrate, 6, "bitrate")?;
+        let (cpb_size_scale, cpb_size_value_minus1, signalled_cpb_size) =
+            scaled_hrd_value(requested_cpb_size, 4, "CPB size")?;
+        let initial_cpb_removal_delay = u32::try_from(
+            u128::from(signalled_cpb_size)
+                .checked_mul(90_000)
+                .expect("u64 CPB size times 90000 fits u128")
+                .div_ceil(u128::from(signalled_bit_rate)),
+        )
+        .map_err(|_| {
+            Error::Unsupported("H.264 initial CPB removal delay exceeds 24 bits".into())
+        })?;
+        if initial_cpb_removal_delay >= 1 << 24 {
+            return Err(Error::Unsupported(
+                "H.264 initial CPB removal delay exceeds 24 bits".into(),
+            ));
+        }
+        Ok(Self {
+            bit_rate_scale,
+            bit_rate_value_minus1,
+            cpb_size_scale,
+            cpb_size_value_minus1,
+            signalled_cpb_size,
+            initial_cpb_removal_delay,
+            num_units_in_tick,
+            time_scale,
+            b_frames,
+        })
+    }
+}
+
+impl HrdState {
+    const DELAY_BITS: u8 = 24;
+    const DELAY_MODULUS: u32 = 1 << Self::DELAY_BITS;
+
+    fn new(parameters: EncoderHrd) -> Self {
+        Self {
+            parameters,
+            cpb_removal_delay: 0,
+            decode_index: 0,
+            cpb_fullness_bits: parameters.signalled_cpb_size,
+        }
+    }
+
+    fn access_unit_sei(
+        &mut self,
+        key: bool,
+        picture_order_count: i32,
+        timing: mmrecode_core::FrameTiming,
+    ) -> Result<Vec<u8>> {
+        if key {
+            self.cpb_removal_delay = 0;
+            self.decode_index = 0;
+        }
+        let duration_ticks = self.duration_clock_ticks(timing.duration)?;
+        let display_index = picture_order_count / 2;
+        let output_delay_frames = display_index - self.decode_index
+            + i32::try_from(self.parameters.b_frames).expect("bounded B-frame count fits i32");
+        let dpb_output_delay = u32::try_from(output_delay_frames.max(0))
+            .ok()
+            .and_then(|frames| frames.checked_mul(duration_ticks))
+            .ok_or_else(|| Error::Unsupported("H.264 DPB output delay overflows".into()))?;
+        if dpb_output_delay >= Self::DELAY_MODULUS {
+            return Err(Error::Unsupported(
+                "H.264 DPB output delay exceeds 24 bits".into(),
+            ));
+        }
+        let sei = encode_hrd_sei(
+            &self.parameters,
+            key,
+            self.cpb_removal_delay,
+            dpb_output_delay,
+        )?;
+        self.cpb_removal_delay =
+            self.cpb_removal_delay.wrapping_add(duration_ticks) % Self::DELAY_MODULUS;
+        self.decode_index += 1;
+        Ok(sei)
+    }
+
+    fn remove_access_unit(
+        &mut self,
+        key: bool,
+        duration: Option<mmrecode_core::Timestamp>,
+        access_unit_bits: u64,
+    ) -> Result<()> {
+        if key {
+            self.cpb_fullness_bits = self.parameters.signalled_cpb_size;
+        } else {
+            let duration_ticks = self.duration_clock_ticks(duration)?;
+            let arrived = u128::from(self.parameters.signalled_bit_rate())
+                .checked_mul(u128::from(duration_ticks))
+                .and_then(|value| value.checked_mul(u128::from(self.parameters.num_units_in_tick)))
+                .ok_or_else(|| Error::Unsupported("H.264 CPB arrival size overflows".into()))?
+                .div_ceil(u128::from(self.parameters.time_scale));
+            let arrived = u64::try_from(arrived)
+                .map_err(|_| Error::Unsupported("H.264 CPB arrival size overflows".into()))?;
+            self.cpb_fullness_bits = self
+                .cpb_fullness_bits
+                .saturating_add(arrived)
+                .min(self.parameters.signalled_cpb_size);
+        }
+        if access_unit_bits > self.cpb_fullness_bits {
+            return Err(Error::InvalidData(format!(
+                "H.264 access unit requires {access_unit_bits} bits but only {} bits are available in the configured CPB",
+                self.cpb_fullness_bits
+            )));
+        }
+        self.cpb_fullness_bits -= access_unit_bits;
+        Ok(())
+    }
+
+    fn duration_clock_ticks(&self, duration: Option<mmrecode_core::Timestamp>) -> Result<u32> {
+        let Some(duration) = duration.filter(|duration| duration.value > 0) else {
+            return Ok(2);
+        };
+        if duration.time_base.numerator() <= 0 || duration.time_base.denominator() <= 0 {
+            return Err(Error::InvalidData(
+                "H.264 HRD frame duration must use a positive time base".into(),
+            ));
+        }
+        let ticks = u128::try_from(duration.value)
+            .expect("positive duration")
+            .checked_mul(
+                u128::try_from(duration.time_base.numerator()).expect("positive numerator"),
+            )
+            .and_then(|value| value.checked_mul(u128::from(self.parameters.time_scale)))
+            .ok_or_else(|| Error::Unsupported("H.264 HRD duration overflows".into()))?
+            .div_ceil(
+                u128::try_from(duration.time_base.denominator()).expect("positive denominator")
+                    * u128::from(self.parameters.num_units_in_tick),
+            )
+            .max(1);
+        u32::try_from(ticks)
+            .map_err(|_| Error::Unsupported("H.264 HRD duration exceeds delay syntax".into()))
+    }
+}
+
+impl EncoderHrd {
+    fn signalled_bit_rate(self) -> u64 {
+        (u64::from(self.bit_rate_value_minus1) + 1) << (6 + self.bit_rate_scale)
+    }
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+fn scaled_hrd_value(value: u64, base_shift: u8, name: &str) -> Result<(u8, u32, u64)> {
+    for scale in 0..=15 {
+        let unit = 1_u64 << (base_shift + scale);
+        let units = value.div_ceil(unit);
+        if let Ok(units) = u32::try_from(units)
+            && let Some(signalled) = u64::from(units).checked_mul(unit)
+        {
+            return Ok((scale, units - 1, signalled));
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "H.264 HRD {name} cannot be represented"
+    )))
+}
+
 /// Stateful deterministic H.264/AVC encoder foundation.
 ///
 /// This encoder emits one Baseline-profile, CAVLC IDR access unit for every input frame. Its
@@ -339,7 +567,8 @@ impl RateControl {
 /// and optional scene-cut IDRs. The `qp` option selects a luma QP from 0 through 51. When the
 /// generic `bitrate` setting is present, it becomes the initial QP for a deterministic frame-level
 /// virtual-buffer controller. `aq_strength=1..12` redistributes that picture QP between quiet and
-/// textured macroblocks while preserving normative QP-delta state.
+/// textured macroblocks while preserving normative QP-delta state. `vbv_buffer_ms` activates
+/// single-CPB NAL HRD signalling and checked removal scheduling.
 #[derive(Debug, Default)]
 pub struct H264Encoder {
     configuration: Option<Configuration>,
@@ -349,6 +578,7 @@ pub struct H264Encoder {
     pending_b_frames: VecDeque<PendingBFrame>,
     decode_timestamps: VecDeque<Option<mmrecode_core::Timestamp>>,
     rate_control: Option<RateControl>,
+    hrd_state: Option<HrdState>,
     next_frame_num: u8,
     frames_since_idr: usize,
     flushed: bool,
@@ -397,14 +627,23 @@ impl H264Encoder {
             reference_l0_poc,
             macroblock_intra,
         } = encoded;
-        let nal_length = u32::try_from(nal.len())
-            .map_err(|_| Error::InvalidData("H.264 encoded NAL exceeds four-byte length".into()))?;
-        let mut data = Vec::with_capacity(4 + nal.len());
-        data.extend_from_slice(&nal_length.to_be_bytes());
-        data.extend_from_slice(&nal);
+        let mut next_hrd_state = self.hrd_state.clone();
+        let sei = next_hrd_state
+            .as_mut()
+            .map(|state| state.access_unit_sei(key, picture_order_count, timing))
+            .transpose()?;
+        let mut data =
+            Vec::with_capacity(4 + nal.len() + sei.as_ref().map_or(0, |sei| 4 + sei.len()));
+        if let Some(sei) = &sei {
+            append_length_prefixed_nal(&mut data, sei)?;
+        }
+        append_length_prefixed_nal(&mut data, &nal)?;
         let encoded_bits = u64::try_from(data.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(8);
+        if let Some(state) = &mut next_hrd_state {
+            state.remove_access_unit(key, timing.duration, encoded_bits)?;
+        }
         let dts = self.decode_timestamps.pop_front().ok_or_else(|| {
             Error::InvalidState("H.264 encoder decode-timestamp queue is empty".into())
         })?;
@@ -438,6 +677,7 @@ impl H264Encoder {
         if let Some(rate_control) = &mut self.rate_control {
             rate_control.observe(encoded_bits, timing.duration);
         }
+        self.hrd_state = next_hrd_state;
         Ok(())
     }
 
@@ -599,6 +839,7 @@ impl Encoder for H264Encoder {
         let mut b_frames = 0;
         let mut b_direct_mode = BDirectMode::Spatial;
         let mut aq_strength = 0;
+        let mut vbv_buffer_milliseconds = None;
         for (name, value) in &settings.options {
             match name.as_str() {
                 "mode" => {
@@ -696,6 +937,19 @@ impl Encoder for H264Encoder {
                             ))
                         })?;
                 }
+                "vbv_buffer_ms" => {
+                    vbv_buffer_milliseconds = Some(
+                        value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|milliseconds| (1..=60_000).contains(milliseconds))
+                            .ok_or_else(|| {
+                                Error::Unsupported(format!(
+                                    "invalid H.264 vbv_buffer_ms {value}; expected 1..=60000"
+                                ))
+                            })?,
+                    );
+                }
                 _ => {
                     return Err(Error::Unsupported(format!(
                         "unsupported H.264 encoder option {name}={value}"
@@ -732,6 +986,17 @@ impl Encoder for H264Encoder {
                 "H.264 aq_strength requires mode=intra16, intra4, or inter".into(),
             ));
         }
+        if vbv_buffer_milliseconds.is_some() && settings.bitrate.is_none() {
+            return Err(Error::Unsupported(
+                "H.264 vbv_buffer_ms requires a target bitrate".into(),
+            ));
+        }
+        let hrd = vbv_buffer_milliseconds
+            .zip(settings.bitrate)
+            .map(|(milliseconds, bitrate)| {
+                EncoderHrd::new(bitrate, milliseconds, settings.time_base, b_frames)
+            })
+            .transpose()?;
         let rate_control = settings
             .bitrate
             .map(|bitrate| {
@@ -740,7 +1005,12 @@ impl Encoder for H264Encoder {
                         "H.264 bitrate control requires mode=intra16, intra4, or inter".into(),
                     ));
                 }
-                RateControl::new(bitrate, settings.time_base, qp)
+                RateControl::new(
+                    bitrate,
+                    settings.time_base,
+                    qp,
+                    hrd.map(|parameters| parameters.signalled_cpb_size),
+                )
             })
             .transpose()?;
         let decoded_picture_buffer_size = max_references.max(if b_frames == 0 { 1 } else { 2 });
@@ -751,6 +1021,7 @@ impl Encoder for H264Encoder {
             coded_height,
             decoded_picture_buffer_size,
             b_frames != 0,
+            hrd.as_ref(),
         )?;
         let pps = encode_pps()?;
         let descriptor = CodecDescriptor {
@@ -776,6 +1047,7 @@ impl Encoder for H264Encoder {
             pic_order_cnt_type0: b_frames != 0,
         });
         self.rate_control = rate_control;
+        self.hrd_state = hrd.map(HrdState::new);
         self.packets.clear();
         self.reconstructions.clear();
         self.references.clear();
@@ -914,6 +1186,7 @@ fn encode_sps(
     coded_height: usize,
     max_references: usize,
     pic_order_cnt_type0: bool,
+    hrd: Option<&EncoderHrd>,
 ) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
     writer.write_bits(u64::from(PROFILE_BASELINE), 8)?;
@@ -941,7 +1214,32 @@ fn encode_sps(
         write_ue(&mut writer, 0)?; // frame_crop_top_offset
         write_ue(&mut writer, ((coded_height - height) / 2) as u64)?;
     }
-    writer.write_bit(false)?; // vui_parameters_present_flag
+    writer.write_bit(hrd.is_some())?; // vui_parameters_present_flag
+    if let Some(hrd) = hrd {
+        writer.write_bit(false)?; // aspect_ratio_info_present_flag
+        writer.write_bit(false)?; // overscan_info_present_flag
+        writer.write_bit(false)?; // video_signal_type_present_flag
+        writer.write_bit(false)?; // chroma_loc_info_present_flag
+        writer.write_bit(true)?; // timing_info_present_flag
+        writer.write_bits(u64::from(hrd.num_units_in_tick), 32)?;
+        writer.write_bits(u64::from(hrd.time_scale), 32)?;
+        writer.write_bit(false)?; // fixed_frame_rate_flag
+        writer.write_bit(true)?; // nal_hrd_parameters_present_flag
+        write_ue(&mut writer, 0)?; // cpb_cnt_minus1
+        writer.write_bits(u64::from(hrd.bit_rate_scale), 4)?;
+        writer.write_bits(u64::from(hrd.cpb_size_scale), 4)?;
+        write_ue(&mut writer, u64::from(hrd.bit_rate_value_minus1))?;
+        write_ue(&mut writer, u64::from(hrd.cpb_size_value_minus1))?;
+        writer.write_bit(false)?; // cbr_flag
+        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+        writer.write_bits(0, 5)?; // time_offset_length
+        writer.write_bit(false)?; // vcl_hrd_parameters_present_flag
+        writer.write_bit(false)?; // low_delay_hrd_flag
+        writer.write_bit(false)?; // pic_struct_present_flag
+        writer.write_bit(false)?; // bitstream_restriction_flag
+    }
     finish_rbsp(&mut writer)?;
     Ok(make_nal(0x67, writer.into_bytes()))
 }
@@ -4877,6 +5175,58 @@ fn make_nal(header: u8, rbsp: Vec<u8>) -> Vec<u8> {
     output
 }
 
+fn append_length_prefixed_nal(output: &mut Vec<u8>, nal: &[u8]) -> Result<()> {
+    let length = u32::try_from(nal.len())
+        .map_err(|_| Error::InvalidData("H.264 encoded NAL exceeds four-byte length".into()))?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(nal);
+    Ok(())
+}
+
+fn encode_hrd_sei(
+    hrd: &EncoderHrd,
+    buffering_period: bool,
+    cpb_removal_delay: u32,
+    dpb_output_delay: u32,
+) -> Result<Vec<u8>> {
+    let mut rbsp = Vec::new();
+    if buffering_period {
+        let mut payload = BitWriter::new();
+        write_ue(&mut payload, 0)?; // seq_parameter_set_id
+        payload.write_bits(
+            u64::from(hrd.initial_cpb_removal_delay),
+            HrdState::DELAY_BITS,
+        )?;
+        payload.write_bits(0, HrdState::DELAY_BITS)?; // initial_cpb_removal_delay_offset
+        payload.write_bit(true)?; // payload_bit_equal_to_one
+        payload.align_to_byte();
+        append_sei_payload(&mut rbsp, 0, &payload.into_bytes());
+    }
+
+    let mut payload = BitWriter::new();
+    payload.write_bits(u64::from(cpb_removal_delay), HrdState::DELAY_BITS)?;
+    payload.write_bits(u64::from(dpb_output_delay), HrdState::DELAY_BITS)?;
+    payload.write_bit(true)?; // payload_bit_equal_to_one
+    payload.align_to_byte();
+    append_sei_payload(&mut rbsp, 1, &payload.into_bytes());
+    rbsp.push(0x80); // rbsp_trailing_bits
+    Ok(make_nal(0x06, rbsp))
+}
+
+fn append_sei_payload(rbsp: &mut Vec<u8>, payload_type: usize, payload: &[u8]) {
+    append_sei_extended_value(rbsp, payload_type);
+    append_sei_extended_value(rbsp, payload.len());
+    rbsp.extend_from_slice(payload);
+}
+
+fn append_sei_extended_value(output: &mut Vec<u8>, mut value: usize) {
+    while value >= 0xff {
+        output.push(0xff);
+        value -= 0xff;
+    }
+    output.push(u8::try_from(value).expect("SEI extended-value remainder fits u8"));
+}
+
 fn write_ue(writer: &mut BitWriter, value: u64) -> Result<()> {
     let code_num = value
         .checked_add(1)
@@ -5015,6 +5365,8 @@ mod tests {
             ("b_frames", "4"),
             ("b_direct", "diagonal"),
             ("aq_strength", "13"),
+            ("vbv_buffer_ms", "0"),
+            ("vbv_buffer_ms", "60001"),
         ] {
             let mut invalid_option = settings(16, 16);
             invalid_option.options.insert(name.into(), value.into());
@@ -5036,6 +5388,11 @@ mod tests {
         let mut lossless_aq = settings(16, 16);
         lossless_aq.options.insert("aq_strength".into(), "1".into());
         assert!(encoder.configure(&lossless_aq).is_err());
+        let mut vbv_without_bitrate = settings(16, 16);
+        vbv_without_bitrate
+            .options
+            .insert("vbv_buffer_ms".into(), "1000".into());
+        assert!(encoder.configure(&vbv_without_bitrate).is_err());
 
         let mut lossless_bitrate = settings(16, 16);
         lossless_bitrate.bitrate = Some(100_000);
@@ -5058,7 +5415,7 @@ mod tests {
     #[test]
     fn rate_control_tracks_packet_pressure_and_resets_on_reconfigure() {
         let time_base = Rational::new(1, 25).unwrap();
-        let mut rate_control = RateControl::new(25_000, time_base, 26).unwrap();
+        let mut rate_control = RateControl::new(25_000, time_base, 26, None).unwrap();
         assert_eq!(rate_control.target_bits_per_frame, 1_000);
         for _ in 0..4 {
             rate_control.observe(4_000, None);
@@ -5073,7 +5430,7 @@ mod tests {
         assert_eq!(rate_control.buffer_fullness_bits, -4_000);
 
         let clock = Rational::new(1, 90_000).unwrap();
-        let mut duration_aware = RateControl::new(25_000, clock, 26).unwrap();
+        let mut duration_aware = RateControl::new(25_000, clock, 26, None).unwrap();
         duration_aware.observe(
             4_000,
             Some(Timestamp {
@@ -5153,6 +5510,118 @@ mod tests {
             let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
             verify_sequence_with_ffmpeg(&avcc, packets, reconstructions);
         }
+    }
+
+    #[test]
+    fn hrd_vbv_signals_and_schedules_reordered_picture_delays() {
+        let mut encoder_settings = settings(32, 16);
+        encoder_settings
+            .options
+            .insert("mode".into(), "inter".into());
+        encoder_settings
+            .options
+            .insert("b_frames".into(), "1".into());
+        encoder_settings
+            .options
+            .insert("search_range".into(), "0".into());
+        encoder_settings
+            .options
+            .insert("vbv_buffer_ms".into(), "1000".into());
+        encoder_settings.bitrate = Some(25_000);
+        encoder_settings.time_base = Rational::new(1, 90_000).unwrap();
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&encoder_settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        let sps = parse_sps(&avcc.sequence_parameter_sets[0]).unwrap();
+        let vui = sps.vui.unwrap();
+        assert_eq!(vui.num_units_in_tick, Some(1));
+        assert_eq!(vui.time_scale, Some(180_000));
+        assert_eq!(vui.fixed_frame_rate, Some(false));
+        let hrd = vui.nal_hrd.unwrap();
+        assert_eq!(hrd.cpb_count, 1);
+        assert!((25_000..25_064).contains(&hrd.bit_rate));
+        assert!((25_000..25_016).contains(&hrd.cpb_size));
+        assert!(!hrd.cbr);
+        assert_eq!(hrd.initial_cpb_removal_delay_length, 24);
+        assert_eq!(hrd.cpb_removal_delay_length, 24);
+        assert_eq!(hrd.dpb_output_delay_length, 24);
+        assert_eq!(
+            encoder.rate_control.as_ref().unwrap().buffer_capacity_bits,
+            i128::from(hrd.cpb_size)
+        );
+
+        let first = frame_with_pts(patterned_frame(32, 16), 0);
+        let middle = shifted_frame(&first, 1, 0, 1);
+        let future = shifted_frame(&first, 2, 0, 2);
+        encoder.send_frame(first).unwrap();
+        let idr_packet = encoder.receive_packet().unwrap().unwrap();
+        let idr_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        encoder.send_frame(middle).unwrap();
+        encoder.send_frame(future).unwrap();
+        let p_packet = encoder.receive_packet().unwrap().unwrap();
+        let b_packet = encoder.receive_packet().unwrap().unwrap();
+        let p_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        let b_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+
+        let packets = [idr_packet, p_packet, b_packet];
+        let expected_delays = [(0, 7_200), (7_200, 14_400), (14_400, 0)];
+        for (index, (packet, (expected_cpb, expected_dpb))) in
+            packets.iter().zip(expected_delays).enumerate()
+        {
+            let units = crate::length_prefixed_nal_units(&packet.data, 4).unwrap();
+            assert_eq!(units.len(), 2);
+            assert_eq!(units[0].header.unit_type, NalUnitType::Sei);
+            let timing = crate::parse_hrd_sei(units[0].data, &vui).unwrap();
+            assert_eq!(timing.cpb_removal_delay, Some(expected_cpb));
+            assert_eq!(timing.dpb_output_delay, Some(expected_dpb));
+            if index == 0 {
+                assert_eq!(timing.sequence_parameter_set_id, Some(0));
+                assert_eq!(
+                    timing.initial_cpb_removal_delay,
+                    Some(
+                        encoder
+                            .hrd_state
+                            .as_ref()
+                            .unwrap()
+                            .parameters
+                            .initial_cpb_removal_delay
+                    )
+                );
+            } else {
+                assert_eq!(timing.sequence_parameter_set_id, None);
+            }
+        }
+
+        let decode_order = [
+            idr_reconstruction.clone(),
+            p_reconstruction.clone(),
+            b_reconstruction.clone(),
+        ];
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        for (packet, expected) in packets.iter().cloned().zip(&decode_order) {
+            decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+        }
+        verify_sequence_with_ffmpeg(
+            &avcc,
+            &packets,
+            &[idr_reconstruction, b_reconstruction, p_reconstruction],
+        );
+    }
+
+    #[test]
+    fn hrd_vbv_rejects_an_access_unit_larger_than_the_cpb() {
+        let mut undersized = settings(16, 16);
+        undersized.options.insert("mode".into(), "intra4".into());
+        undersized
+            .options
+            .insert("vbv_buffer_ms".into(), "1".into());
+        undersized.bitrate = Some(1_000);
+        let mut constrained = H264Encoder::default();
+        constrained.configure(&undersized).unwrap();
+        assert!(constrained.send_frame(patterned_frame(16, 16)).is_err());
+        assert!(constrained.receive_packet().unwrap().is_none());
     }
 
     #[test]

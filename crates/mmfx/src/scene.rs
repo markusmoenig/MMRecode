@@ -178,6 +178,14 @@ pub struct Style {
     pub width: Length,
     /// Object height. Defaults to 100 percent.
     pub height: Length,
+    /// Optional lower bound for the resolved object width.
+    pub min_width: Option<Length>,
+    /// Optional upper bound for the resolved object width.
+    pub max_width: Option<Length>,
+    /// Optional lower bound for the resolved object height.
+    pub min_height: Option<Length>,
+    /// Optional upper bound for the resolved object height.
+    pub max_height: Option<Length>,
     /// Uniform inset applied to child layout.
     pub padding: Length,
     /// Space inserted between flow children.
@@ -213,6 +221,10 @@ impl Default for Style {
             bottom: None,
             width: Length::Percent(100.0),
             height: Length::Percent(100.0),
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             padding: Length::Pixels(0.0),
             gap: Length::Pixels(0.0),
             align_items: AlignItems::Start,
@@ -281,6 +293,8 @@ pub enum JustifyContent {
 /// A CSS-like length resolved relative to the containing object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Length {
+    /// Size the box from its text, image, or child layout.
+    Auto,
     /// Device-independent output pixels.
     Pixels(f32),
     /// Percentage of the corresponding containing dimension.
@@ -292,6 +306,7 @@ impl Length {
     #[must_use]
     pub fn resolve(self, containing: f32) -> f32 {
         match self {
+            Self::Auto => containing,
             Self::Pixels(value) => value,
             Self::Percent(value) => containing * value / 100.0,
         }

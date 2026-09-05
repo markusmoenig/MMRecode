@@ -94,7 +94,9 @@ shape. Rectangle, rounded-rectangle, and clip coverage is rasterized through pin
 with 256-level antialiasing; fractional edges feed coverage directly into the linear compositor.
 Static Unicode text uses Parley 0.9 for shaping, bidirectional analysis, wrapping, line metrics, and
 alignment, then Swash 0.2.10 with Zeno coverage for hinted glyph rasterization. Exact-frame named
-keyframes and cover-style scrolling evaluate in the scene object's source-local time. Font files are
+keyframes and cover-style scrolling evaluate in the scene object's source-local time. Scene 0.3
+also measures `auto` text, image, and flow-group boxes before placement, applies min/max constraints,
+and uses the resulting content extent for cover scrolling. Font files are
 explicit module resources; the CPU render context disables system fonts so the same project cannot
 silently select different export fonts on another machine. The CLI proof is:
 
@@ -114,7 +116,7 @@ Decoders remain outside the compositor so interactive hosts can discard obsolete
 export hosts decode sequentially.
 
 This is intentionally narrower than the target profile below. It does not yet define fallback font
-chains, color glyphs, text decorations, media slots, intrinsic sizing, richer timing controls, or
+chains, color glyphs, text decorations, media slots, reusable parameters/styles, richer timing controls, or
 Kernel IR. The current direct YUV delivery blend is the optimized SDR path; the
 high-precision linear project-frame path, tiled/SIMD execution, and differential tests remain
 required before treating it as the final color pipeline. Those features should extend the typed
@@ -717,7 +719,7 @@ tested as explicit modes rather than accepted as undocumented differences.
 - [x] Implement exact local animation time and keyframes.
 - [x] Implement the initial `mm-scroll-*` cover profile.
 - [x] Prove titles, subtitles, and a horizontal ticker in checked-in examples and output frames.
-- [ ] Add a complete rolling-credits example after intrinsic text sizing is available.
+- [x] Add a complete rolling-credits example driven by intrinsic text and group sizing.
 
 ### Slice 4: CSS source and live editor
 
@@ -725,7 +727,8 @@ tested as explicit modes rather than accepted as undocumented differences.
 - [x] Surface source-spanned diagnostics in the editor.
 - [x] Embed a multiline code editor in the inspector area for internal and file-backed sources.
 - [x] Debounce/coalesce compilation and retain the last-good preview.
-- [ ] Add compiler-driven syntax/semantic highlighting metadata and targeted frame-cache invalidation.
+- [x] Add an initial MMFX-aware syntax highlighter to the terminal source editor and highlighted website examples.
+- [ ] Add compiler-driven semantic metadata and targeted frame-cache invalidation.
 
 ### Slice 5: built-in Markdown generator
 

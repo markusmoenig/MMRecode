@@ -20,9 +20,10 @@ pub use nal::{
     length_prefixed_nal_units, nal_units_to_annex_b, remove_emulation_prevention,
 };
 pub use syntax::{
-    AspectRatio, H264AccessUnit, H264StreamIndex, H264StreamIndexer, PictureOrderCountType,
-    PictureTiming, PictureType, PictureUnit, Pps, RecoveryPoint, ScalingMatrices, SliceHeader, Sps,
-    VuiParameters, parse_pps, parse_recovery_point_sei, parse_slice_header, parse_sps,
+    AspectRatio, H264AccessUnit, H264StreamIndex, H264StreamIndexer, HrdParameters, HrdSeiTiming,
+    PictureOrderCountType, PictureTiming, PictureType, PictureUnit, Pps, RecoveryPoint,
+    ScalingMatrices, SliceHeader, Sps, VuiParameters, parse_hrd_sei, parse_pps,
+    parse_recovery_point_sei, parse_slice_header, parse_sps,
 };
 
 /// Canonical `MMRecode` codec identifier for H.264/AVC.

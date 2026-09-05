@@ -408,8 +408,11 @@ deterministic frame-level QP controller across IDR, P, and reordered B pictures.
 size, positive declared frame duration, and a bounded eight-frame virtual buffer; the configured QP
 is its starting point. Optional macroblock AQ measures mean absolute luma activity, favors quiet
 regions, spends fewer bits on textured regions, and carries modulo-52 QP deltas only through
-macroblocks whose syntax permits a change. Normative HRD/VBV scheduling and signalling remain
-separate follow-on work.
+macroblocks whose syntax permits a change. An opt-in single-entry NAL HRD/VBV path quantizes the
+declared bitrate and CPB size into SPS VUI syntax, emits buffering-period and per-picture timing
+SEI, derives removal clocks from exact frame durations, accounts for reordered output delay, and
+pauses VBR arrivals at capacity while rejecting oversized or underfunded removals. Broader
+profile/tool support remains follow-on work.
 Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
 window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
 reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;

@@ -33,7 +33,10 @@ AVC. It currently provides:
   starting value using each packet's size and declared frame duration;
 - optional `aq_strength=1..12` macroblock adaptive quantization. Mean absolute luma activity lowers
   QP in quiet regions and raises it in textured regions relative to the picture QP; zero is the
-  default and disables AQ.
+  default and disables AQ;
+- opt-in single-CPB NAL HRD/VBV signalling through `vbv_buffer_ms=1..60000` when `bitrate` is set.
+  The SPS carries VUI timing and scaled HRD rate/size values; buffering-period and picture-timing
+  SEI carry 24-bit removal/output delays, including reordered B-picture output timing.
 
 The crate does not parse MP4/MOV. Its native decoder foundation reconstructs
 frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC `Intra_16x16`, or
@@ -111,9 +114,10 @@ frame-level rate control; `qp` is then its initial value. A positive frame durat
 picture's bit budget, otherwise one configured time-base tick is used. `aq_strength=0..12` then
 redistributes the resulting picture QP across macroblocks according to relative luma activity.
 Macroblock QP deltas advance only where AVC syntax permits, including across skipped and
-zero-residual inter blocks. This controller is bounded and deterministic, but does not yet provide
-HRD signalling or a strict decoder-buffer guarantee. Bitrate control and AQ with fixed-size
-lossless `I_PCM` are rejected.
+zero-residual inter blocks. `vbv_buffer_ms` makes the virtual capacity explicit and activates a
+single-entry VBR NAL HRD model. Access-unit arrivals and removals are checked against that CPB;
+units which cannot fit or be removed at the declared cadence are rejected instead of silently
+violating the signal. Bitrate control and AQ with fixed-size lossless `I_PCM` are rejected.
 
 The editor's first usable H.264 preview keeps pixel decoding behind `mmrecode-playback`'s bounded
 request/event and decode-executor interfaces. Access-unit-sized jobs publish frames incrementally,

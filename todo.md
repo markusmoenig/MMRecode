@@ -423,7 +423,9 @@ handling, temporal direct with POC-scaled colocated motion, and B-skip are also 
 frame-level target-bitrate control now adjusts QP across all compressed picture types from packet
 size, frame duration, and a bounded virtual buffer. Optional activity-based macroblock AQ also
 redistributes each picture target between quiet and textured regions with normative QP-delta state.
-Normative HRD/VBV scheduling remains follow-on work.
+Opt-in single-CPB NAL HRD/VBV signalling and scheduling writes VUI plus buffering/picture-timing
+SEI and rejects access units that violate the declared buffer. Broader coding tools remain
+follow-on work.
 Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
 in-loop deblocking and default-list multiple-reference CAVLC P slices are also implemented, including skip,
@@ -629,8 +631,11 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Add opt-in activity-based macroblock AQ across Intra16, Intra4, P, and B pictures with
   modulo-52 QP deltas, correct skipped/zero-residual state carry, and native plus FFmpeg pixel
   verification of mixed quiet and textured regions.
-- [ ] Add normative HRD/VBV scheduling and signalling, and broader profile/tool support only after
-  the adaptive frame/macroblock controller is mature.
+- [x] Add opt-in single-entry NAL HRD/VBV scheduling with scaled SPS rate/CPB syntax, 24-bit
+  buffering-period and picture-timing SEI delays, duration-aware removal clocks, reordered B output
+  delays, shared rate-controller capacity, and explicit CPB violation errors.
+- [ ] Add broader profile/tool support only after the adaptive and buffer-constrained controller is
+  mature.
 - [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
   Treat a production-quality encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.

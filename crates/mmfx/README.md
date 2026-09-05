@@ -5,13 +5,13 @@ scalar CPU reference renderer. Source must parse and validate into typed values 
 can execute it. Static text is shaped and laid out with Parley, rasterized through Swash/Zeno, and
 composited by the same linear-light backend as vector shapes.
 
-The executable Scene 0.2 foundation supports:
+The executable Scene 0.3 foundation supports:
 
 - `@scene`, `@group`, `@rect`, and `@image` objects
 - explicit `@font` resources and typed `@text` objects
 - nested overlay, row, and column layout with absolute children, uniform padding/gap, alignment,
   and justification
-- `px` and `%` lengths
+- `px`, `%`, and content-measured `auto` sizes with min/max constraints
 - hexadecimal sRGBA colors
 - opacity and true group compositing
 - image `contain`, `cover`, and `fill` fitting
@@ -32,6 +32,7 @@ Render the checked-in example from the workspace root:
 ```console
 cargo run -p mmrecode -- render-mmfx examples/mmfx/lower-third.mmfx output.png
 cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-23.png --frame 23 --frames 60
+cargo run -p mmrecode -- render-mmfx examples/mmfx/rolling-credits.mmfx credits.png --frame 59 --frames 120
 ```
 
 Example source:
@@ -109,7 +110,7 @@ FX layers into MPEG-2/TS export, including FX-only output. It maps parent time t
 animation time, prepares source and resources once, rasterizes static scenes once, and retains a
 bounded cache of animated frame overlays.
 
-Font fallback chains, color glyphs, text decorations, media slots, intrinsic sizing, richer timing,
+Font fallback chains, color glyphs, text decorations, media slots, reusable parameters/styles, richer timing,
 compiler highlighting metadata, Kernel IR, tiled/SIMD CPU backends, and GPU preview are deliberately
 later slices. See the
 workspace [`mmfx-concept.md`](../../mmfx-concept.md) for the complete direction.

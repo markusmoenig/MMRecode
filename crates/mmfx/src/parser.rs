@@ -617,10 +617,10 @@ fn lower_keyframes(raw: RawBlock, diagnostics: &mut Vec<Diagnostic>) -> Option<K
                     .and_then(|property| parse_signed_length(property, diagnostics)),
                 width: properties
                     .get("width")
-                    .and_then(|property| parse_length(property, diagnostics)),
+                    .and_then(|property| parse_box_length(property, diagnostics)),
                 height: properties
                     .get("height")
-                    .and_then(|property| parse_length(property, diagnostics)),
+                    .and_then(|property| parse_box_length(property, diagnostics)),
                 background: properties
                     .get("background")
                     .and_then(|property| parse_color(property, diagnostics)),
@@ -776,6 +776,10 @@ const COMMON_STYLE_PROPERTIES: &[&str] = &[
     "bottom",
     "width",
     "height",
+    "min-width",
+    "max-width",
+    "min-height",
+    "max-height",
     "padding",
     "gap",
     "align-items",
@@ -866,15 +870,27 @@ fn lower_style(
         ));
     }
     if let Some(property) = properties.get("width")
-        && let Some(value) = parse_length(property, diagnostics)
+        && let Some(value) = parse_box_length(property, diagnostics)
     {
         style.width = value;
     }
     if let Some(property) = properties.get("height")
-        && let Some(value) = parse_length(property, diagnostics)
+        && let Some(value) = parse_box_length(property, diagnostics)
     {
         style.height = value;
     }
+    style.min_width = properties
+        .get("min-width")
+        .and_then(|property| parse_length(property, diagnostics));
+    style.max_width = properties
+        .get("max-width")
+        .and_then(|property| parse_length(property, diagnostics));
+    style.min_height = properties
+        .get("min-height")
+        .and_then(|property| parse_length(property, diagnostics));
+    style.max_height = properties
+        .get("max-height")
+        .and_then(|property| parse_length(property, diagnostics));
     if let Some(property) = properties.get("padding")
         && let Some(value) = parse_length(property, diagnostics)
     {
@@ -1429,6 +1445,14 @@ fn parse_length(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Op
     parse_length_value(property, false, diagnostics)
 }
 
+fn parse_box_length(property: &RawProperty, diagnostics: &mut Vec<Diagnostic>) -> Option<Length> {
+    if property.value.trim() == "auto" {
+        Some(Length::Auto)
+    } else {
+        parse_length(property, diagnostics)
+    }
+}
+
 fn parse_signed_length(
     property: &RawProperty,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1747,6 +1771,21 @@ mod tests {
             group.children[0].style.background,
             Color::rgba(0xe8, 0x3a, 0x72, 0xcc)
         );
+    }
+
+    #[test]
+    fn parses_intrinsic_box_sizes_and_constraints() {
+        let scene = parse_scene(
+            "@scene x { width: 640px; height: 360px; @group stack { width: auto; \
+             height: auto; min-width: 80px; max-width: 50%; min-height: 12px; } }",
+        )
+        .expect("valid intrinsic sizing");
+        let style = &scene.children[0].style;
+        assert_eq!(style.width, Length::Auto);
+        assert_eq!(style.height, Length::Auto);
+        assert_eq!(style.min_width, Some(Length::Pixels(80.0)));
+        assert_eq!(style.max_width, Some(Length::Percent(50.0)));
+        assert_eq!(style.min_height, Some(Length::Pixels(12.0)));
     }
 
     #[test]

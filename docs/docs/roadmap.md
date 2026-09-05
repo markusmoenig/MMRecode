@@ -12,7 +12,7 @@ MMRecode grows through bounded, verifiable slices rather than attempting broad f
 1. Validate native AAC-LC playback with representative real-world media, then add bounded buffering and seek preroll.
 2. Add media fingerprints, relinking, and portable project collection.
 3. Extend recursive preview/export composition from video and MMFX into audio and later transitions.
-4. Extend the implemented MMFX image, row/column layout, exact animation, and scrolling slice with media slots, intrinsic sizing, and richer timing controls.
+4. Extend the implemented MMFX intrinsic layout, exact animation, and scrolling slice with media slots, reusable parameters/styles, and richer timing controls.
 5. Strengthen H.264 dependency analysis for arbitrary edit boundaries and extend the encoder with inter-frame tools.
 6. Improve incremental MPEG-TS demuxing, streaming audio, buffering, and backpressure.
 
@@ -22,10 +22,10 @@ The immediate editor work is dependable project handling and composition rather 
 
 ## MMFX progression
 
-MMFX now has a typed Scene 0.2 foundation with text, images, row/column/overlay layout, exact-frame
-keyframes, scrolling, and recursive placement-time preview/export. The next progression is:
+MMFX now has a typed Scene 0.3 foundation with text, images, intrinsic row/column/overlay layout,
+exact-frame keyframes, scrolling, and recursive placement-time preview/export. The next progression is:
 
-1. intrinsic layout, richer scene objects, media slots, parameters, and reusable styles;
+1. richer scene objects, media slots, parameters, and reusable styles;
 2. animation delay/repetition and more timing controls;
 3. a safe scalar Kernel IR;
 4. transitions and neighborhood effects;

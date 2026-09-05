@@ -1,0 +1,106 @@
+/* Scene 0.3: intrinsic text/group sizing drives a vertical cover scroll. */
+@scene rolling-credits {
+    width: 960px;
+    height: 540px;
+    background: #090d14;
+
+    @font Inter {
+        src: "builtin:inter";
+    }
+
+    @text label {
+        position: absolute;
+        left: 40px;
+        top: 32px;
+        width: auto;
+        height: auto;
+        content: "MMRECODE  /  ROLLING CREDITS";
+        font-family: Inter;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1;
+        color: #42d6c7;
+        white-space: nowrap;
+    }
+
+    @group viewport {
+        position: absolute;
+        left: 100px;
+        top: 90px;
+        width: 760px;
+        height: 380px;
+        overflow: hidden;
+        border-radius: 18px;
+        background: #111a27;
+
+        @group credits {
+            display: column;
+            width: 100%;
+            height: auto;
+            min-height: 1px;
+            padding: 42px;
+            gap: 24px;
+            align-items: center;
+            mm-scroll-direction: block-start;
+            mm-scroll-range: cover;
+            mm-scroll-duration: scene;
+
+            @text title {
+                width: auto;
+                height: auto;
+                max-width: 640px;
+                content: "A FILM CUT IN THE TERMINAL";
+                font-family: Inter;
+                font-size: 34px;
+                font-weight: 700;
+                line-height: 1.1;
+                text-align: center;
+                color: #f5f8fb;
+                white-space: nowrap;
+            }
+
+            @text direction {
+                width: 100%;
+                height: auto;
+                content: "DIRECTED BY\nThe Keyboard";
+                font-family: Inter;
+                font-size: 23px;
+                font-weight: 500;
+                line-height: 1.45;
+                text-align: center;
+                color: #b8c6d8;
+            }
+
+            @text picture {
+                width: 100%;
+                height: auto;
+                content: "PICTURE AND SOUND\nExact Frames\n\nSMART RENDERING\nThe Original Bitstream";
+                font-family: Inter;
+                font-size: 23px;
+                font-weight: 500;
+                line-height: 1.45;
+                text-align: center;
+                color: #b8c6d8;
+            }
+
+            @rect rule {
+                width: 180px;
+                height: 3px;
+                background: #42d6c7;
+                border-radius: 2px;
+            }
+
+            @text thanks {
+                width: 100%;
+                height: auto;
+                content: "MADE FOR LINUX\nAND PEOPLE WHO LIKE\nTO STAY IN FLOW";
+                font-family: Inter;
+                font-size: 24px;
+                font-weight: 650;
+                line-height: 1.35;
+                text-align: center;
+                color: #f5f8fb;
+            }
+        }
+    }
+}
