@@ -8,6 +8,8 @@
 *.mp4
 *.mxf
 *.ts
+!testdata/mpegts/valid/single-program-mpeg2.ts
+!testdata/mpegts/valid/single-program-mpeg2-mp2.ts
 
 # The documentation site uses TypeScript configuration and page sources.
 !docs/**/*.ts
