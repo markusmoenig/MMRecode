@@ -27,7 +27,7 @@ AVC. It currently provides:
 - an optional `b_frames=1..3` reorder path using type-0 picture order, B16x16/B16x8/B8x16
   list-0/list-1/bi motion combinations, all thirteen `B_8x8` sub-macroblock types, spatial and
   temporal direct prediction, B-skip decisions, CAVLC residuals, presentation PTS, decode-order
-  DTS, and flush-safe delayed-frame draining;
+  DTS, flush-safe delayed-frame draining, and automatic Main Profile signalling;
 - deterministic frame-level bitrate control for every compressed picture mode. The generic
   `bitrate` setting drives a bounded eight-frame virtual buffer and adjusts QP from the configured
   starting value using each packet's size and declared frame duration;
@@ -118,6 +118,16 @@ zero-residual inter blocks. `vbv_buffer_ms` makes the virtual capacity explicit 
 single-entry VBR NAL HRD model. Access-unit arrivals and removals are checked against that CPB;
 units which cannot fit or be removed at the declared cadence are rejected instead of silently
 violating the signal. Bitrate control and AQ with fixed-size lossless `I_PCM` are rejected.
+`profile=auto|baseline|main` defaults to Baseline for I/P-only streams and Main when B pictures are
+enabled. Explicit Baseline+B configurations are rejected, and the `avcC` profile/compatibility
+bytes are copied from the encoded SPS. `level=auto|1|1b|1.1..6.2` checks the Annex A frame-size,
+macroblock-rate, decoded-picture-buffer, target-bitrate, and optional CPB limits; automatic mode
+selects the lowest conforming level and `avcC` mirrors the SPS level byte. One `time_base` tick is
+the default frame interval used during configuration. Containers whose timestamp clock is finer
+than one frame should set `frame_duration_ticks` to the nominal positive frame duration. Submitted
+frames are checked again using their actual duration, so a faster variable-rate frame cannot
+silently violate the declared level. Without a target bitrate, level selection covers structural
+and cadence limits but cannot promise a bound for fixed-QP output size.
 
 The editor's first usable H.264 preview keeps pixel decoding behind `mmrecode-playback`'s bounded
 request/event and decode-executor interfaces. Access-unit-sized jobs publish frames incrementally,

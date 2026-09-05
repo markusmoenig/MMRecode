@@ -131,11 +131,12 @@ fn run() -> Result<(), String> {
 fn render_mmfx_command(
     arguments: &mut impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<(), String> {
-    let usage = "usage: mmrecode render-mmfx <scene.mmfx> <output.png> [--frame <index>] [--frames <count>]";
+    let usage = "usage: mmrecode render-mmfx <scene.mmfx> <output.png> [--frame <index>] [--frames <count>] [--set <name>=<value>]...";
     let input = arguments.next().ok_or_else(|| usage.to_owned())?;
     let output = arguments.next().ok_or_else(|| usage.to_owned())?;
     let mut frame = 0_u64;
     let mut frame_count = None;
+    let mut parameter_bindings = std::collections::BTreeMap::new();
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--frame") => {
@@ -153,6 +154,18 @@ fn render_mmfx_command(
                         .ok_or_else(|| usage.to_owned())?,
                 );
             }
+            Some("--set") => {
+                let binding = arguments
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or_else(|| usage.to_owned())?;
+                let (name, value) = binding.split_once('=').ok_or_else(|| usage.to_owned())?;
+                let name = name.strip_prefix("--").unwrap_or(name);
+                if name.is_empty() {
+                    return Err(usage.to_owned());
+                }
+                parameter_bindings.insert(name.to_owned(), value.to_owned());
+            }
             _ => return Err(usage.to_owned()),
         }
     }
@@ -160,23 +173,25 @@ fn render_mmfx_command(
     let output_path = std::path::Path::new(&output);
     let source = std::fs::read_to_string(input_path)
         .map_err(|error| format!("cannot read {}: {error}", input_path.display()))?;
-    let scene = mmrecode_mmfx::parse_scene(&source).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                let (line, column) = diagnostic.span.line_column(&source);
-                let help = diagnostic
-                    .help
-                    .map_or_else(String::new, |help| format!("\n  help: {help}"));
-                format!(
-                    "{}:{line}:{column}: {}{help}",
-                    input_path.display(),
-                    diagnostic.message
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let scene = mmrecode_mmfx::parse_scene_with_bindings(&source, &parameter_bindings).map_err(
+        |diagnostics| {
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| {
+                    let (line, column) = diagnostic.span.line_column(&source);
+                    let help = diagnostic
+                        .help
+                        .map_or_else(String::new, |help| format!("\n  help: {help}"));
+                    format!(
+                        "{}:{line}:{column}: {}{help}",
+                        input_path.display(),
+                        diagnostic.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+    )?;
     let module_directory = input_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -2422,7 +2437,7 @@ fn print_help() {
              Validate and explain one MPEG-2 replacement render without writing a container\n  \
          render <m2v> <ts> --replace <frame> <y4m> [--audio <mp2>] [--audio-end <policy>]\n  \
              Smart-render one MPEG-2 replacement into MPEG-TS\n  \
-         render-mmfx <scene.mmfx> <output.png> [--frame N] [--frames N]\n  \
+         render-mmfx <scene.mmfx> <output.png> [--frame N] [--frames N] [--set name=value]...\n  \
              Render an exact local MMFX frame with the CPU reference backend\n  \
          encode <y4m> <mjpg> [quality]  Encode Y4M frame(s) as baseline JPEG\n  \
          verify <media> [reference.y4m]  Verify JPEG/MJPEG or MPEG-2 ES/TS reconstruction and quality\n  \

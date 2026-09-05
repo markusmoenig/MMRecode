@@ -18,7 +18,7 @@ MMRecode is under active development. Its codec, editor, playback, rendering, an
 | Audio | Native mono/stereo AAC-LC reconstruction plus MPEG-1 Layer II framing and pass-through |
 | Containers | Y4M, 188-byte MPEG-TS demux/mux, and non-fragmented ISO-BMFF/QuickTime sample-table demuxing |
 | Editing | Recursive media graph, typed commands, exact time, undo/redo, versioned projects, terminal workspace, and initial MPEG-2 export |
-| MMFX | Strict typed scenes, intrinsic row/column/overlay layout, images, Unicode text, exact-frame animation and scrolling, highlighted live editing, scalar CPU rendering, and recursive timeline preview/export composition |
+| MMFX | Strict typed scenes and public parameters, intrinsic row/column/overlay layout, images, Unicode text, exact-frame animation and scrolling, highlighted live editing, scalar CPU rendering, and recursive timeline preview/export composition |
 | Integration | Main CLI, native viewer, quality utilities, playback scheduling, and an experimental one-shot C API |
 
 ## Important limits
@@ -29,7 +29,7 @@ MMRecode is under active development. Its codec, editor, playback, rendering, an
 - MPEG Layer II is framed for transport but not decoded by the reusable codec crate.
 - Final export recursively composites nested generated MMFX content; broader generated media, transitions, and audio composition remain incomplete.
 - Multi-clip audio editing, mixing, resampling, and sample-domain boundary handling are incomplete.
-- MMFX does not yet have media slots, reusable parameters/styles, richer animation controls, Kernel IR, transitions, or optimized CPU/GPU backends.
+- MMFX does not yet have media slots, named reusable styles, richer animation controls, Kernel IR, transitions, or optimized CPU/GPU backends.
 - Incremental streaming, broad metadata preservation, fuzzing, performance baselines, packaging, and compatibility policies remain future work.
 
 ## Verification approach
@@ -38,4 +38,4 @@ The repository includes deterministic test vectors, parser damage cases, frame a
 
 ## Source of truth
 
-This page is a readable snapshot, not a generated compatibility matrix. For the most detailed live status, consult the root [`README.md`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/README.md), crate READMEs, and [`todo.md`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/todo.md).
+This page is a readable snapshot, not a generated compatibility matrix. For the most detailed live status, consult the root [`README.md`](https://github.com/markusmoenig/MMRecode/blob/main/README.md), crate READMEs, and [`todo.md`](https://github.com/markusmoenig/MMRecode/blob/main/todo.md).

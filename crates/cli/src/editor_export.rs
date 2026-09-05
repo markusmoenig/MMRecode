@@ -1056,6 +1056,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    parameter_bindings: Default::default(),
                 },
             )
             .unwrap();
@@ -1137,6 +1138,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    parameter_bindings: Default::default(),
                 },
             )
             .unwrap();

@@ -1,9 +1,9 @@
 ---
 title: Scene language
-description: The executable MMFX Scene 0.3 syntax for intrinsic layout, images, text, animation, and scrolling.
+description: The executable MMFX Scene 0.4 syntax for typed parameters, intrinsic layout, text, animation, and scrolling.
 ---
 
-# MMFX Scene 0.3
+# MMFX Scene 0.4
 
 MMFX Scene is a strict, CSS-shaped composition language. It deliberately has no DOM, selectors,
 global cascade, JavaScript, or silent recovery. Unknown and duplicate declarations are errors with
@@ -13,9 +13,63 @@ This page documents executable behavior only. Proposed syntax stays in the MMFX 
 until it has parser, renderer, and test coverage; visual additions also ship with runnable examples
 and CPU-reference output frames.
 
-One module contains exactly one `@scene` and may contain `@keyframes` blocks. The scene may contain
+One module contains exactly one `@scene` and may contain `@param` and `@keyframes` blocks. The scene may contain
 `@group`, `@rect`, `@text`, and `@image` objects. Only groups may contain children, and later
 siblings paint over earlier siblings.
+
+## Typed parameters
+
+Reusable scenes declare public inputs before `@scene`. A reference occupies one complete property
+value, so the receiving property determines and validates its final MMFX type.
+
+```css
+@param --title {
+    type: text;
+    default: "Default title";
+}
+
+@param --accent {
+    type: color;
+    default: #42d6c7;
+}
+
+@param --alignment {
+    type: choice;
+    default: start;
+    choices: "start, center, end";
+}
+
+@scene reusable-title {
+    width: 960px;
+    height: 540px;
+
+    @font Inter {
+        src: "builtin:inter";
+    }
+
+    @text title {
+        width: auto;
+        height: auto;
+        content: var(--title);
+        color: var(--accent);
+        text-align: var(--alignment);
+        font-family: Inter;
+    }
+}
+```
+
+Parameter types are `text`, `color`, `length`, `number`, `boolean`, and `choice`. Text defaults are
+quoted; colors use hexadecimal notation; lengths use `px`, `%`, or `auto`; numbers must be finite;
+booleans are `true` or `false`; choices require a quoted comma-separated `choices` list. Unknown,
+duplicate, and mistyped bindings are errors. Embedded expressions such as
+`translateX(var(--offset))` are deliberately not accepted yet; write `left: var(--offset)` so one
+typed value maps to one typed property.
+
+In the editor, use `scene params`, `scene set <name> <value>`, and `scene reset [name]`. Quote text
+containing spaces. Bindings participate in undo/redo, project persistence, preview, export, and
+scene cache signatures. `scene save as` extracts reusable source with its declared defaults rather
+than baking project bindings into the file. The standalone renderer accepts repeated
+`--set name=value` options.
 
 ## Canvas and resources
 
@@ -134,4 +188,4 @@ frames are kept in a bounded cache. Fonts and images are loaded once per source/
 timeline scrubbing does not reparse source or resize resources for a cached frame.
 
 Current limits include no media slots, gradients, paths, borders, margins, animation
-delay/repetition, style variables, fallback fonts, color glyphs, Kernel IR, or GPU backend.
+delay/repetition, named reusable styles, fallback fonts, color glyphs, Kernel IR, or GPU backend.

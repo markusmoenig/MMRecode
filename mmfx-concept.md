@@ -94,9 +94,10 @@ shape. Rectangle, rounded-rectangle, and clip coverage is rasterized through pin
 with 256-level antialiasing; fractional edges feed coverage directly into the linear compositor.
 Static Unicode text uses Parley 0.9 for shaping, bidirectional analysis, wrapping, line metrics, and
 alignment, then Swash 0.2.10 with Zeno coverage for hinted glyph rasterization. Exact-frame named
-keyframes and cover-style scrolling evaluate in the scene object's source-local time. Scene 0.3
+keyframes and cover-style scrolling evaluate in the scene object's source-local time. Scene 0.4
 also measures `auto` text, image, and flow-group boxes before placement, applies min/max constraints,
-and uses the resulting content extent for cover scrolling. Font files are
+uses the resulting content extent for cover scrolling, and adds typed `@param` declarations with
+strict `var(--name)` references and persisted host bindings. Font files are
 explicit module resources; the CPU render context disables system fonts so the same project cannot
 silently select different export fonts on another machine. The CLI proof is:
 
@@ -116,7 +117,7 @@ Decoders remain outside the compositor so interactive hosts can discard obsolete
 export hosts decode sequentially.
 
 This is intentionally narrower than the target profile below. It does not yet define fallback font
-chains, color glyphs, text decorations, media slots, reusable parameters/styles, richer timing controls, or
+chains, color glyphs, text decorations, media slots, named reusable styles, richer timing controls, or
 Kernel IR. The current direct YUV delivery blend is the optimized SDR path; the
 high-precision linear project-frame path, tiled/SIMD execution, and differential tests remain
 required before treating it as the final color pipeline. Those features should extend the typed
@@ -228,19 +229,23 @@ browser DOM.
 
 ### Parameters and reusable scenes
 
-Modules expose typed parameters with defaults and optional editor metadata. Exact declaration
-syntax remains to be selected, but the schema must distinguish at least:
+Scene 0.4 exposes initial typed parameters as
+`@param --name { type: <kind>; default: <value>; }` and consumes them through a complete-property
+`var(--name)` reference. The executable kinds are text, color, length, number, boolean, and an
+enumerated choice with a comma-separated `choices` declaration. The broader module schema should
+eventually add:
 
-- Boolean and integer values
-- Scalar and bounded unit values
-- Length, percentage, angle, and duration
-- Text and rich text
-- Color and gradient
+- Integer and bounded scalar values
+- Angle and duration values
+- Rich text
+- Gradients
 - Image/media resource references
-- Enumerated choices
 
-Project instances store typed parameter bindings rather than string maps. Terminal commands,
-future graphical controls, plugins, and source code all operate on the same parameter schema.
+The codec-independent project record stores canonical binding input alongside the embedded scene;
+the MMFX compiler immediately validates and lowers every value to the typed `SceneParameter` model
+before preview or export. Terminal commands, future graphical controls, plugins, and source code
+therefore operate against one compiler-owned schema without making the edit graph depend on a
+rendering backend. A future public interchange API may serialize the typed values directly.
 
 General functions, loops, and mutable state are not part of the initial scene language. Repeated or
 data-driven content can initially be produced by composition plugins which emit typed Scene IR.
@@ -728,6 +733,7 @@ tested as explicit modes rather than accepted as undocumented differences.
 - [x] Embed a multiline code editor in the inspector area for internal and file-backed sources.
 - [x] Debounce/coalesce compilation and retain the last-good preview.
 - [x] Add an initial MMFX-aware syntax highlighter to the terminal source editor and highlighted website examples.
+- [x] Add typed public scene parameters, persisted bindings, editor commands, completion, and cache invalidation.
 - [ ] Add compiler-driven semantic metadata and targeted frame-cache invalidation.
 
 ### Slice 5: built-in Markdown generator
@@ -780,7 +786,7 @@ new codec implementation.
 
 The following should remain explicit design questions until implementation evidence is available:
 
-- Exact parameter and named-style syntax
+- Named-style syntax and broader parameter editor metadata
 - Whether restrained component/repetition syntax belongs in Scene CSS
 - The first normative working-surface precision
 - Font packaging, fallback, and substitution policy

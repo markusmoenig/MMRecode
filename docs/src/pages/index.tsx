@@ -216,7 +216,7 @@ export default function Home(): ReactNode {
                 The source license does not replace any third-party patent
                 licenses that may apply to standardized media formats.
               </p>
-              <a href="https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/LICENSE">
+              <a href="https://github.com/markusmoenig/MMRecode/blob/main/LICENSE">
                 Read the license →
               </a>
             </div>

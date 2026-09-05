@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     AlignItems, AnimatedStyle, Animation, AnimationDuration, Color, Display, FontResource,
     ImageContent, JustifyContent, Keyframe, Keyframes, Length, Node, NodeKind, ObjectFit, Overflow,
-    Position, Scene, Scroll, ScrollDirection, Style, TextAlign, TextContent, TextLineHeight,
-    TextWrap, TimingFunction, Transform,
+    ParameterKind, ParameterValue, Position, Scene, SceneParameter, Scroll, ScrollDirection, Style,
+    TextAlign, TextContent, TextLineHeight, TextWrap, TimingFunction, Transform,
 };
 
 /// Half-open byte range in MMFX source text.
@@ -69,6 +69,23 @@ impl Diagnostic {
 /// Returns source-spanned diagnostics when the document has invalid syntax or
 /// cannot be lowered to a fully typed scene.
 pub fn parse_scene(source: &str) -> Result<Scene, Vec<Diagnostic>> {
+    parse_scene_with_bindings(source, &BTreeMap::new())
+}
+
+/// Parse and validate a scene with host-provided parameter bindings.
+///
+/// Binding names omit the source-level `--` prefix. Values use command-friendly spelling: text is
+/// accepted directly, while colors, lengths, numbers, booleans, and choices use their MMFX source
+/// spelling.
+///
+/// # Errors
+///
+/// Returns source-spanned diagnostics for invalid source, unknown bindings, or values that do not
+/// match their declared parameter type.
+pub fn parse_scene_with_bindings(
+    source: &str,
+    bindings: &BTreeMap<String, String>,
+) -> Result<Scene, Vec<Diagnostic>> {
     let mut parser = Parser::new(source);
     let raw = parser.parse_document();
     if !parser.diagnostics.is_empty() {
@@ -82,7 +99,7 @@ pub fn parse_scene(source: &str) -> Result<Scene, Vec<Diagnostic>> {
         )]);
     }
     let mut diagnostics = Vec::new();
-    let scene = lower_document(raw, &mut diagnostics);
+    let scene = lower_document(raw, bindings, &mut diagnostics);
     if !diagnostics.is_empty() {
         Err(diagnostics)
     } else if let Some(scene) = scene {
@@ -455,9 +472,14 @@ fn is_ident_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
-fn lower_document(raw: Vec<RawBlock>, diagnostics: &mut Vec<Diagnostic>) -> Option<Scene> {
+fn lower_document(
+    raw: Vec<RawBlock>,
+    bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Scene> {
     let mut scene = None;
     let mut keyframe_blocks = Vec::new();
+    let mut parameter_blocks = Vec::new();
     for block in raw {
         match block.kind.as_str() {
             "scene" if scene.is_none() => scene = Some(block),
@@ -466,10 +488,11 @@ fn lower_document(raw: Vec<RawBlock>, diagnostics: &mut Vec<Diagnostic>) -> Opti
                 block.span,
             )),
             "keyframes" => keyframe_blocks.push(block),
+            "param" => parameter_blocks.push(block),
             _ => diagnostics.push(
                 Diagnostic::new(
                     format!(
-                        "top-level object must be @scene or @keyframes, not @{}",
+                        "top-level object must be @scene, @param, or @keyframes, not @{}",
                         block.kind
                     ),
                     block.span,
@@ -478,6 +501,49 @@ fn lower_document(raw: Vec<RawBlock>, diagnostics: &mut Vec<Diagnostic>) -> Opti
             ),
         }
     }
+    let mut parameters = BTreeMap::new();
+    for block in parameter_blocks {
+        if let Some(parameter) = lower_parameter(block, bindings, diagnostics) {
+            if parameters.contains_key(&parameter.name) {
+                diagnostics.push(Diagnostic::new(
+                    format!("duplicate @param --{}", parameter.name),
+                    SourceSpan::default(),
+                ));
+            } else {
+                parameters.insert(parameter.name.clone(), parameter);
+            }
+        }
+    }
+    for name in bindings.keys() {
+        let name = name.strip_prefix("--").unwrap_or(name);
+        if !parameters.contains_key(name) {
+            diagnostics.push(
+                Diagnostic::new(
+                    format!("binding '--{name}' has no matching @param declaration"),
+                    SourceSpan::default(),
+                )
+                .with_help(format!(
+                    "declare @param --{name} or remove the stored binding"
+                )),
+            );
+        }
+    }
+    let values = parameters
+        .iter()
+        .map(|(name, parameter)| (name.clone(), parameter_value_source(&parameter.value)))
+        .collect::<BTreeMap<_, _>>();
+    let Some(mut scene) = scene else {
+        diagnostics.push(Diagnostic::new(
+            "expected one top-level @scene block",
+            SourceSpan::default(),
+        ));
+        return None;
+    };
+    substitute_block_variables(&mut scene, &values, diagnostics);
+    for block in &mut keyframe_blocks {
+        substitute_block_variables(block, &values, diagnostics);
+    }
+
     let animations = keyframe_blocks
         .into_iter()
         .filter_map(|block| lower_keyframes(block, diagnostics))
@@ -491,18 +557,242 @@ fn lower_document(raw: Vec<RawBlock>, diagnostics: &mut Vec<Diagnostic>) -> Opti
             ));
         }
     }
-    let Some(scene) = scene else {
+    lower_scene(
+        scene,
+        parameters.into_values().collect(),
+        animations,
+        &animation_names,
+        diagnostics,
+    )
+}
+
+fn lower_parameter(
+    raw: RawBlock,
+    bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<SceneParameter> {
+    if !raw.children.is_empty() {
+        diagnostics.push(Diagnostic::new("@param cannot contain blocks", raw.span));
+    }
+    let Some(name) = raw.name.strip_prefix("--").filter(|name| !name.is_empty()) else {
+        diagnostics.push(
+            Diagnostic::new("@param names must begin with '--'", raw.span)
+                .with_help("example: @param --title { type: text; default: \"Title\"; }"),
+        );
+        return None;
+    };
+    let properties = collect_properties(raw.properties, diagnostics);
+    reject_unknown(&properties, &["type", "default", "choices"], diagnostics);
+    let Some(kind_property) = properties.get("type") else {
         diagnostics.push(Diagnostic::new(
-            "expected one top-level @scene block",
-            SourceSpan::default(),
+            "@param requires a 'type' property",
+            raw.span,
         ));
         return None;
     };
-    lower_scene(scene, animations, &animation_names, diagnostics)
+    let kind = match kind_property.value.as_str() {
+        "text" => ParameterKind::Text,
+        "color" => ParameterKind::Color,
+        "length" => ParameterKind::Length,
+        "number" => ParameterKind::Number,
+        "boolean" => ParameterKind::Boolean,
+        "choice" => ParameterKind::Choice,
+        _ => {
+            diagnostics.push(Diagnostic::new(
+                "parameter type must be text, color, length, number, boolean, or choice",
+                kind_property.value_span,
+            ));
+            return None;
+        }
+    };
+    let choices = if kind == ParameterKind::Choice {
+        let Some(property) = properties.get("choices") else {
+            diagnostics.push(Diagnostic::new(
+                "choice @param requires a 'choices' property",
+                raw.span,
+            ));
+            return None;
+        };
+        let choices = parse_string(property, diagnostics)?;
+        let choices = choices
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if choices.is_empty() {
+            diagnostics.push(Diagnostic::new(
+                "choice parameter requires at least one comma-separated choice",
+                property.value_span,
+            ));
+            return None;
+        }
+        choices
+    } else {
+        if let Some(property) = properties.get("choices") {
+            diagnostics.push(Diagnostic::new(
+                "only choice parameters accept a 'choices' property",
+                property.name_span,
+            ));
+        }
+        Vec::new()
+    };
+    let Some(default_property) = properties.get("default") else {
+        diagnostics.push(Diagnostic::new(
+            "@param requires a 'default' property",
+            raw.span,
+        ));
+        return None;
+    };
+    let default = parse_parameter_value(kind, default_property, &choices, false, diagnostics)?;
+    let binding = bindings
+        .get(name)
+        .or_else(|| bindings.get(&format!("--{name}")));
+    let value = binding.map_or_else(
+        || Some(default.clone()),
+        |value| {
+            let property = RawProperty {
+                name: format!("binding --{name}"),
+                name_span: raw.span,
+                value: value.clone(),
+                value_span: raw.span,
+            };
+            parse_parameter_value(kind, &property, &choices, true, diagnostics)
+        },
+    )?;
+    Some(SceneParameter {
+        name: name.to_owned(),
+        kind,
+        default,
+        value,
+        choices,
+    })
+}
+
+fn parse_parameter_value(
+    kind: ParameterKind,
+    property: &RawProperty,
+    choices: &[String],
+    host_binding: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<ParameterValue> {
+    match kind {
+        ParameterKind::Text if host_binding => Some(ParameterValue::Text(property.value.clone())),
+        ParameterKind::Text => parse_string(property, diagnostics).map(ParameterValue::Text),
+        ParameterKind::Color => parse_color(property, diagnostics).map(ParameterValue::Color),
+        ParameterKind::Length => {
+            parse_box_length(property, diagnostics).map(ParameterValue::Length)
+        }
+        ParameterKind::Number => match property.value.parse::<f32>() {
+            Ok(value) if value.is_finite() => Some(ParameterValue::Number(value)),
+            _ => {
+                diagnostics.push(Diagnostic::new(
+                    "number parameter must be finite",
+                    property.value_span,
+                ));
+                None
+            }
+        },
+        ParameterKind::Boolean => match property.value.as_str() {
+            "true" => Some(ParameterValue::Boolean(true)),
+            "false" => Some(ParameterValue::Boolean(false)),
+            _ => {
+                diagnostics.push(Diagnostic::new(
+                    "boolean parameter must be true or false",
+                    property.value_span,
+                ));
+                None
+            }
+        },
+        ParameterKind::Choice => {
+            let value = if host_binding {
+                property.value.clone()
+            } else {
+                parse_identifier_or_string(property, diagnostics)?
+            };
+            if choices.contains(&value) {
+                Some(ParameterValue::Choice(value))
+            } else {
+                diagnostics.push(
+                    Diagnostic::new(
+                        format!("choice must be one of {}", choices.join(", ")),
+                        property.value_span,
+                    )
+                    .with_help(format!("try {}", choices.join(" or "))),
+                );
+                None
+            }
+        }
+    }
+}
+
+fn parameter_value_source(value: &ParameterValue) -> String {
+    match value {
+        ParameterValue::Text(value) => format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t")
+        ),
+        ParameterValue::Color(value) => format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            value.red, value.green, value.blue, value.alpha
+        ),
+        ParameterValue::Length(value) => ParameterValue::Length(*value).display(),
+        ParameterValue::Number(value) => value.to_string(),
+        ParameterValue::Boolean(value) => value.to_string(),
+        ParameterValue::Choice(value) => value.clone(),
+    }
+}
+
+fn substitute_block_variables(
+    block: &mut RawBlock,
+    values: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for property in &mut block.properties {
+        let value = property.value.trim();
+        if !value.contains("var(") {
+            continue;
+        }
+        let Some(name) = value
+            .strip_prefix("var(")
+            .and_then(|value| value.strip_suffix(')'))
+            .map(str::trim)
+            .and_then(|name| name.strip_prefix("--"))
+        else {
+            diagnostics.push(
+                Diagnostic::new(
+                    "a typed var() reference must occupy the complete property value",
+                    property.value_span,
+                )
+                .with_help("example: color: var(--accent);"),
+            );
+            continue;
+        };
+        if let Some(value) = values.get(name) {
+            property.value.clone_from(value);
+        } else {
+            diagnostics.push(
+                Diagnostic::new(
+                    format!("unknown scene parameter '--{name}'"),
+                    property.value_span,
+                )
+                .with_help(format!("declare @param --{name} before the scene")),
+            );
+        }
+    }
+    for child in &mut block.children {
+        substitute_block_variables(child, values, diagnostics);
+    }
 }
 
 fn lower_scene(
     raw: RawBlock,
+    parameters: Vec<SceneParameter>,
     animations: Vec<Keyframes>,
     animation_names: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -551,6 +841,7 @@ fn lower_scene(
             height,
             background,
             fonts,
+            parameters,
             animations,
             children,
         }),
@@ -1724,10 +2015,13 @@ fn edit_distance(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_scene;
+    use std::collections::BTreeMap;
+
+    use super::{parse_scene, parse_scene_with_bindings};
     use crate::{
         AlignItems, AnimationDuration, Color, Display, Length, NodeKind, ObjectFit, Overflow,
-        ScrollDirection, TextAlign, TextLineHeight, TextWrap, TimingFunction,
+        ParameterKind, ParameterValue, ScrollDirection, TextAlign, TextLineHeight, TextWrap,
+        TimingFunction,
     };
 
     const SOURCE: &str = r"
@@ -1854,6 +2148,72 @@ mod tests {
         assert_eq!(text.color, Color::rgba(0xf0, 0xf4, 0xf8, 0xff));
         assert_eq!(text.align, TextAlign::Center);
         assert_eq!(text.wrap, TextWrap::NoWrap);
+    }
+
+    #[test]
+    fn types_parameters_and_applies_host_bindings() {
+        let source = r#"
+            @param --title { type: text; default: "Default title"; }
+            @param --accent { type: color; default: #f00; }
+            @param --size { type: length; default: 24px; }
+            @param --visible { type: boolean; default: true; }
+            @param --align { type: choice; default: center; choices: "start, center, end"; }
+            @scene x {
+                width: 320px; height: 180px;
+                @font Inter { src: "Inter.ttf"; }
+                @text title {
+                    width: auto; height: auto; content: var(--title);
+                    font-family: Inter; font-size: var(--size); color: var(--accent);
+                    text-align: var(--align);
+                }
+            }
+        "#;
+        let bindings = BTreeMap::from([
+            ("title".into(), "Bound title".into()),
+            ("accent".into(), "#42d6c7".into()),
+            ("size".into(), "31px".into()),
+            ("align".into(), "end".into()),
+        ]);
+        let scene = parse_scene_with_bindings(source, &bindings).expect("typed bindings");
+        assert_eq!(scene.parameters.len(), 5);
+        let title = scene
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "title")
+            .unwrap();
+        assert_eq!(title.kind, ParameterKind::Text);
+        assert_eq!(title.value, ParameterValue::Text("Bound title".into()));
+        let NodeKind::Text(text) = &scene.children[0].kind else {
+            panic!("expected text");
+        };
+        assert_eq!(text.content, "Bound title");
+        assert_eq!(text.font_size, 31.0);
+        assert_eq!(text.color, Color::rgba(0x42, 0xd6, 0xc7, 0xff));
+        assert_eq!(text.align, TextAlign::End);
+    }
+
+    #[test]
+    fn rejects_unknown_and_mistyped_parameter_bindings() {
+        let source = "@param --accent { type: color; default: #f00; } \
+            @scene x { width: 1px; height: 1px; background: var(--accent); }";
+        let errors = parse_scene_with_bindings(
+            source,
+            &BTreeMap::from([
+                ("accent".into(), "blue".into()),
+                ("missing".into(), "1".into()),
+            ]),
+        )
+        .expect_err("invalid bindings");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("hexadecimal"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("no matching"))
+        );
     }
 
     #[test]

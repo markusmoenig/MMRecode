@@ -324,6 +324,7 @@ struct MmfxDocument {
     name: String,
     source: String,
     resource_base: Option<PathBuf>,
+    parameter_bindings: BTreeMap<String, String>,
     cursor: usize,
     scroll: usize,
     column_scroll: usize,
@@ -339,6 +340,7 @@ impl MmfxDocument {
         name: String,
         source: String,
         resource_base: Option<PathBuf>,
+        parameter_bindings: BTreeMap<String, String>,
         generation: u64,
     ) -> Self {
         Self {
@@ -354,6 +356,7 @@ impl MmfxDocument {
             last_good_revision: None,
             source,
             resource_base,
+            parameter_bindings,
         }
     }
 
@@ -382,6 +385,7 @@ struct MmfxCompileRequest {
     revision: u64,
     source: String,
     base_directory: PathBuf,
+    parameter_bindings: BTreeMap<String, String>,
 }
 
 struct MmfxCompileResult {
@@ -407,7 +411,11 @@ impl MmfxCompileWorker {
                     while let Ok(newer) = request_rx.try_recv() {
                         request = newer;
                     }
-                    let result = compile_mmfx_preview(&request.source, &request.base_directory);
+                    let result = compile_mmfx_preview_with_bindings(
+                        &request.source,
+                        &request.base_directory,
+                        &request.parameter_bindings,
+                    );
                     if result_tx
                         .send(MmfxCompileResult {
                             generation: request.generation,
@@ -438,26 +446,46 @@ impl Drop for MmfxCompileWorker {
     }
 }
 
+#[cfg(test)]
 fn compile_mmfx_preview(source: &str, base_directory: &Path) -> Result<DynamicImage, String> {
-    let scene = mmrecode_mmfx::parse_scene(source).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                let (line, column) = diagnostic.span.line_column(source);
-                diagnostic.help.map_or_else(
-                    || format!("{line}:{column}: {}", diagnostic.message),
-                    |help| format!("{line}:{column}: {} — {help}", diagnostic.message),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    compile_mmfx_preview_with_bindings(source, base_directory, &BTreeMap::new())
+}
+
+fn compile_mmfx_preview_with_bindings(
+    source: &str,
+    base_directory: &Path,
+    parameter_bindings: &BTreeMap<String, String>,
+) -> Result<DynamicImage, String> {
+    let scene = mmrecode_mmfx::parse_scene_with_bindings(source, parameter_bindings)
+        .map_err(|diagnostics| format_mmfx_diagnostics(source, diagnostics))?;
     let resources = crate::load_mmfx_resources(&scene, base_directory)?;
     let surface = mmrecode_mmfx::render_with_resources(&scene, &resources)
         .map_err(|error| error.to_string())?;
     let image = image::RgbaImage::from_raw(surface.width(), surface.height(), surface.to_rgba8())
         .ok_or_else(|| "MMFX renderer returned an invalid image buffer".to_owned())?;
     Ok(DynamicImage::ImageRgba8(image))
+}
+
+fn format_mmfx_diagnostics(source: &str, diagnostics: Vec<mmrecode_mmfx::Diagnostic>) -> String {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let (line, column) = diagnostic.span.line_column(source);
+            diagnostic.help.map_or_else(
+                || format!("{line}:{column}: {}", diagnostic.message),
+                |help| format!("{line}:{column}: {} — {help}", diagnostic.message),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn current_mmfx_scene(session: &EditorSession) -> Result<mmrecode_mmfx::Scene, String> {
+    let (_, source) = session
+        .current_mmfx_source()
+        .map_err(|error| error.to_string())?;
+    mmrecode_mmfx::parse_scene_with_bindings(&source.source, &source.parameter_bindings)
+        .map_err(|diagnostics| format_mmfx_diagnostics(&source.source, diagnostics))
 }
 
 struct TimelineImageSlot {
@@ -759,6 +787,7 @@ fn update_mmfx_preview(
             revision: document.revision,
             source: document.source.clone(),
             base_directory,
+            parameter_bindings: document.parameter_bindings.clone(),
         };
         let sent = editor
             .mmfx_worker
@@ -1278,9 +1307,16 @@ fn handle_mmfx_editor_key(
         .as_ref()
         .is_some_and(|document| document.revision != revision)
     {
+        let parameter_bindings = session
+            .current_mmfx_source()
+            .ok()
+            .map_or_else(BTreeMap::new, |(_, source)| {
+                source.parameter_bindings.clone()
+            });
         let source = editor.mmfx.as_ref().map(|document| MmfxSource {
             source: document.source.clone(),
             resource_base: document.resource_base.clone(),
+            parameter_bindings,
         });
         if let Some(source) = source
             && let Err(error) = session.replace_current_mmfx_source(source)
@@ -1674,7 +1710,10 @@ fn execute_editor_input(
         EditCommand::FxLoad { .. }
         | EditCommand::FxSave { .. }
         | EditCommand::FxEdit
-        | EditCommand::FxClose => InspectorFocus::Mmfx,
+        | EditCommand::FxClose
+        | EditCommand::SceneParameters
+        | EditCommand::SceneSet { .. }
+        | EditCommand::SceneReset { .. } => InspectorFocus::Mmfx,
         _ => InspectorFocus::Context,
     };
     let output = match session.apply(command) {
@@ -1892,6 +1931,7 @@ fn execute_editor_input(
                         .replace_current_mmfx_source(MmfxSource {
                             source,
                             resource_base,
+                            parameter_bindings: BTreeMap::new(),
                         })
                         .map_err(|error| error.to_string())?;
                     Ok(path)
@@ -1931,6 +1971,95 @@ fn execute_editor_input(
             } else {
                 editor.message = "No MMFX source was open.".into();
             }
+            return Ok(false);
+        }
+        CommandOutput::SceneParametersRequested => {
+            match current_mmfx_scene(session) {
+                Ok(scene) => {
+                    editor.message = if scene.parameters.is_empty() {
+                        "This scene declares no public parameters.".into()
+                    } else {
+                        format!(
+                            "{} scene parameter(s); focus the inspector to view values.",
+                            scene.parameters.len()
+                        )
+                    };
+                }
+                Err(error) => editor.message = format!("error: {error}"),
+            }
+            return Ok(false);
+        }
+        CommandOutput::SceneSetRequested { name, value } => {
+            let name = name.strip_prefix("--").unwrap_or(&name).to_owned();
+            let result = session
+                .current_mmfx_source()
+                .map_err(|error| error.to_string())
+                .and_then(|(_, source)| {
+                    let mut bindings = source.parameter_bindings.clone();
+                    bindings.insert(name.clone(), value.clone());
+                    mmrecode_mmfx::parse_scene_with_bindings(&source.source, &bindings).map_err(
+                        |diagnostics| format_mmfx_diagnostics(&source.source, diagnostics),
+                    )?;
+                    Ok(bindings)
+                })
+                .and_then(|bindings| {
+                    session
+                        .replace_current_mmfx_parameter_bindings(bindings)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(_) => editor.message = format!("ok: scene set {name} {value}"),
+                Err(error) => editor.message = format!("error: {error}"),
+            }
+            sync_open_mmfx_context(session, editor, now);
+            return Ok(false);
+        }
+        CommandOutput::SceneResetRequested { name } => {
+            let normalized = name
+                .as_deref()
+                .map(|name| name.strip_prefix("--").unwrap_or(name).to_owned());
+            let result = session
+                .current_mmfx_source()
+                .map_err(|error| error.to_string())
+                .and_then(|(_, source)| {
+                    let mut bindings = source.parameter_bindings.clone();
+                    if let Some(name) = &normalized
+                        && bindings.remove(name).is_none()
+                    {
+                        let scene = mmrecode_mmfx::parse_scene_with_bindings(
+                            &source.source,
+                            &source.parameter_bindings,
+                        )
+                        .map_err(|diagnostics| {
+                            format_mmfx_diagnostics(&source.source, diagnostics)
+                        })?;
+                        if !scene
+                            .parameters
+                            .iter()
+                            .any(|parameter| &parameter.name == name)
+                        {
+                            return Err(format!("scene has no parameter '--{name}'"));
+                        }
+                    } else if normalized.is_none() {
+                        bindings.clear();
+                    }
+                    Ok(bindings)
+                })
+                .and_then(|bindings| {
+                    session
+                        .replace_current_mmfx_parameter_bindings(bindings)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(_) => {
+                    editor.message = normalized.map_or_else(
+                        || "ok: restored all scene parameter defaults".into(),
+                        |name| format!("ok: restored scene parameter '{name}'"),
+                    );
+                }
+                Err(error) => editor.message = format!("error: {error}"),
+            }
+            sync_open_mmfx_context(session, editor, now);
             return Ok(false);
         }
         output => output,
@@ -1990,10 +2119,15 @@ fn sync_open_mmfx_context(session: &EditorSession, editor: &mut EditorUi, now: I
         return;
     }
     if let Some(document) = editor.mmfx.as_mut()
-        && (document.source != payload.source || document.resource_base != payload.resource_base)
+        && (document.source != payload.source
+            || document.resource_base != payload.resource_base
+            || document.parameter_bindings != payload.parameter_bindings)
     {
         document.source.clone_from(&payload.source);
         document.resource_base.clone_from(&payload.resource_base);
+        document
+            .parameter_bindings
+            .clone_from(&payload.parameter_bindings);
         document.cursor = document.cursor.min(document.source.len());
         document.changed(now);
     }
@@ -2013,6 +2147,7 @@ fn open_current_mmfx_editor(session: &EditorSession, editor: &mut EditorUi) -> R
         media.name.clone(),
         payload.source.clone(),
         payload.resource_base.clone(),
+        payload.parameter_bindings.clone(),
         editor.mmfx_generation,
     ));
     if let Some(image) = &mut editor.mmfx_image {
@@ -4698,6 +4833,15 @@ fn highlight_mmfx_line(text: &str, active_line: bool, in_comment: &mut bool) -> 
                     | "scene"
                     | "from"
                     | "to"
+                    | "var"
+                    | "text"
+                    | "color"
+                    | "length"
+                    | "number"
+                    | "boolean"
+                    | "choice"
+                    | "true"
+                    | "false"
             ) {
                 Color::LightMagenta
             } else {
@@ -4810,7 +4954,7 @@ fn editor_context_title(session: &EditorSession, editor: &EditorUi) -> String {
         InspectorFocus::AudioInfo => "Info — Audio".into(),
         InspectorFocus::SourceInfo => "Info — Source".into(),
         InspectorFocus::ExportReport => "Export — Plan".into(),
-        InspectorFocus::Mmfx => "MMFX Source".into(),
+        InspectorFocus::Mmfx => "MMFX Scene".into(),
         InspectorFocus::Context => session
             .project()
             .resolve_path(session.path())
@@ -4850,19 +4994,28 @@ fn editor_context_text(
             .unwrap_or_else(|| quick_help_text(session));
     }
     if matches!(editor.inspector_focus, InspectorFocus::Mmfx) {
-        return editor.mmfx.as_ref().map_or_else(
-            || "No MMFX source pane is open.\n\nCreate one with `add scene <name> <duration>`, focus it with `cd <name>`, then use `edit`.".into(),
-            |document| {
-                format!(
-                    "MMFX SCENE SOURCE\n\nObject     {}\nOwnership  embedded in project\nResources  {}\nProject    {}\nPreview    {}\n\n`save` persists the project and source.\n`scene save as <file>` extracts a copy.\nUse `man scene` for the complete workflow.",
-                    document.name,
-                    document.resource_base.as_ref().map_or_else(
-                        || "project directory".into(),
-                        |path| path.display().to_string()
-                    ),
-                    if session.is_dirty() { "modified" } else { "saved" },
-                    document.compile_status,
-                )
+        let Ok((media_id, source)) = session.current_mmfx_source() else {
+            return "No MMFX scene is focused.\n\nCreate one with `add scene <name> <duration>`, then focus it with `cd <name>`.".into();
+        };
+        let name = session
+            .project()
+            .media(media_id)
+            .map_or("unnamed", |media| media.name.as_str());
+        let resources = source.resource_base.as_ref().map_or_else(
+            || "project directory".into(),
+            |path| path.display().to_string(),
+        );
+        let source_state = editor
+            .mmfx
+            .as_ref()
+            .map_or("closed", |document| document.compile_status.as_str());
+        let parameters = format_mmfx_parameters(session);
+        return format!(
+            "MMFX SCENE\n\nObject     {name}\nOwnership  embedded in project\nResources  {resources}\nProject    {}\nSource     {source_state}\n\n{parameters}\n\n`edit` opens the embedded source.\n`save` persists the project, source, and bindings.\n`scene save as <file>` extracts source defaults.\nUse `man scene` for the complete workflow.",
+            if session.is_dirty() {
+                "modified"
+            } else {
+                "saved"
             },
         );
     }
@@ -5018,11 +5171,42 @@ fn editor_context_text(
     if project_focus || media.kind.as_str() == "project" {
         text.push_str("\n\nAvailable here\nimport <file>   add scene <name> <duration>   save   export plan\nproject info|match|preset|set   ls   cd <alias>");
     } else if media.kind.is_mmfx_scene() {
-        text.push_str("\n\nAvailable here\nedit   scene load <scene.mmfx>   scene save as <file>\nscene close   save   cd ..   help   man edit");
+        text.push_str("\n\nAvailable here\nedit   scene params   scene set <name> <value>   scene reset [name]\nscene load <scene.mmfx>   scene save as <file>   scene close\nsave   cd ..   help   man edit");
     } else {
         text.push_str("\n\nAvailable here\nin <time>   out <time>   scale <mode>   project match\nls   cd ..   info video   info source   help");
     }
     text
+}
+
+fn format_mmfx_parameters(session: &EditorSession) -> String {
+    match current_mmfx_scene(session) {
+        Ok(scene) if scene.parameters.is_empty() => "PARAMETERS\n  none declared".into(),
+        Ok(scene) => {
+            let mut text = "PARAMETERS".to_owned();
+            for parameter in scene.parameters {
+                let state = if parameter.value == parameter.default {
+                    "default"
+                } else {
+                    "override"
+                };
+                let choices = if parameter.choices.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", parameter.choices.join(" | "))
+                };
+                let _ = write!(
+                    text,
+                    "\n  {} ({}) = {}  {state}{choices}",
+                    parameter.name,
+                    parameter.kind.as_str(),
+                    parameter.value.display(),
+                );
+            }
+            text.push_str("\n\nscene set <name> <value>\nscene reset [name]");
+            text
+        }
+        Err(error) => format!("PARAMETERS\n  unavailable: {error}"),
+    }
 }
 
 fn trim_inspector_text(
@@ -5065,7 +5249,7 @@ fn quick_help_text(session: &EditorSession) -> String {
         "CURRENT LEVEL\n  import adds media at the project root"
     };
     format!(
-        "PROJECT\n  new <name> [using <preset>]\n  open <project>   save [as <project>]\n  project info | match | presets | preset | set\n\nHIERARCHY & MEDIA\n  import <file> [as <name>]\n  pwd   ls   cd <path>\n  in <time>   out <time>   scale <mode>\n\nMMFX SCENES\n  add scene <name> <duration> [at <start>]\n  edit   scene load <scene.mmfx>\n  scene save as <file>   scene close\n  monitor project|local|toggle\n\nOUTPUT & HISTORY\n  export plan   export <file>\n  undo   redo   help   man <cmd>   quit\n\n{local}\n\nKEYS\n  Tab / Shift-Tab                 Move focus\n  Ctrl-Space                      Complete / play\n  Ctrl-S                          Save project\n  Ctrl-Z / Ctrl-Y                 Undo / redo\n  Inspector ↑/↓/PgUp/PgDn        Scroll\n  Timeline +/-   Shift-←/→   0    Zoom / pan / fit\n\nTime: S:FF or M:SS:FF"
+        "PROJECT\n  new <name> [using <preset>]\n  open <project>   save [as <project>]\n  project info | match | presets | preset | set\n\nHIERARCHY & MEDIA\n  import <file> [as <name>]\n  pwd   ls   cd <path>\n  in <time>   out <time>   scale <mode>\n\nMMFX SCENES\n  add scene <name> <duration> [at <start>]\n  edit   scene load <scene.mmfx>\n  scene params   scene set <name> <value>\n  scene reset [name]   scene save as <file>   scene close\n  monitor project|local|toggle\n\nOUTPUT & HISTORY\n  export plan   export <file>\n  undo   redo   help   man <cmd>   quit\n\n{local}\n\nKEYS\n  Tab / Shift-Tab                 Move focus\n  Ctrl-Space                      Complete / play\n  Ctrl-S                          Save project\n  Ctrl-Z / Ctrl-Y                 Undo / redo\n  Inspector ↑/↓/PgUp/PgDn        Scroll\n  Timeline +/-   Shift-←/→   0    Zoom / pan / fit\n\nTime: S:FF or M:SS:FF"
     )
 }
 
@@ -5152,6 +5336,18 @@ fn quick_help_rich_text(session: &EditorSession) -> Text<'static> {
             command("scene save as"),
             args(" <file>   "),
             command("scene close"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("scene params"),
+            Span::raw("   "),
+            command("scene set"),
+            args(" <name> <value>"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            command("scene reset"),
+            args(" [name]"),
         ]),
         Line::from(vec![
             Span::raw("  "),
@@ -6587,8 +6783,11 @@ mod tests {
             .unwrap();
         let starter = &session.current_mmfx_source().unwrap().1.source;
         assert!(starter.contains("@font Inter"));
+        assert!(starter.contains("@param --title"));
+        assert!(starter.contains("var(--accent)"));
         assert!(starter.contains("@text title"));
-        assert!(starter.contains("content: \"LivePreview\""));
+        assert!(starter.contains("default: \"LivePreview\""));
+        assert!(starter.contains("content: var(--title)"));
         let starter_image = compile_mmfx_preview(starter, Path::new("."))
             .expect("compile the internal starter scene");
         assert_eq!(
@@ -6661,6 +6860,134 @@ mod tests {
         .expect("open documented rolling-credits output")
         .to_rgba8();
         assert_eq!(documented.into_raw(), rendered.to_rgba8());
+
+        let parameterized = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/mmfx/parameterized-title.mmfx");
+        let source =
+            std::fs::read_to_string(&parameterized).expect("read parameterized title example");
+        let bindings = BTreeMap::from([
+            ("title".into(), "Launch Day".into()),
+            (
+                "subtitle".into(),
+                "One source, many timeline instances.".into(),
+            ),
+            ("accent".into(), "#ffb454".into()),
+            ("card-width".into(), "810px".into()),
+            ("alignment".into(), "center".into()),
+        ]);
+        let rendered =
+            compile_mmfx_preview_with_bindings(&source, parameterized.parent().unwrap(), &bindings)
+                .expect("render parameterized title example")
+                .to_rgba8();
+        let documented = image::open(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/static/img/mmfx/parameterized-title-bound.png"),
+        )
+        .expect("open documented parameterized title output")
+        .to_rgba8();
+        assert_eq!(documented.into_raw(), rendered.into_raw());
+    }
+
+    #[test]
+    fn scene_parameter_commands_validate_persist_and_reset_bindings() {
+        let (resize_tx, _resize_rx) = mpsc::channel();
+        let picker = Picker::halfblocks();
+        let host = EditorHost {
+            resize_tx: &resize_tx,
+            picker: &picker,
+            base_directory: Path::new("."),
+            terminal_size: Size::new(80, 24),
+        };
+        let mut session =
+            EditorSession::new(MediaProject::new("Film", Rational::new(1, 30).unwrap()).unwrap());
+        session
+            .apply(EditCommand::Add {
+                kind: MediaKind::new("scene").unwrap(),
+                alias: "Title".into(),
+                duration: mmrecode_edit::FrameValue::Frames {
+                    frames: 30,
+                    relative: false,
+                },
+                start: mmrecode_edit::FrameValue::Frames {
+                    frames: 0,
+                    relative: false,
+                },
+            })
+            .unwrap();
+        session
+            .apply(EditCommand::Cd {
+                path: "Title".into(),
+            })
+            .unwrap();
+        let mut editor = EditorUi {
+            input: "scene set title \"Launch Day\"".into(),
+            ..EditorUi::default()
+        };
+        let mut history = CommandHistory::default();
+        let mut app = None;
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            Instant::now(),
+            &host,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .parameter_bindings
+                .get("title")
+                .map(String::as_str),
+            Some("Launch Day")
+        );
+        assert!(format_mmfx_parameters(&session).contains("Launch Day  override"));
+        assert!(editor.mmfx.is_none());
+        let inspector = editor_context_text(None, &session, &editor);
+        assert!(inspector.contains("Source     closed"));
+        assert!(inspector.contains("title (text) = Launch Day  override"));
+
+        editor.input = "scene set accent blue".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            Instant::now(),
+            &host,
+        )
+        .unwrap();
+        assert!(editor.message.contains("hexadecimal"));
+        assert!(
+            !session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .parameter_bindings
+                .contains_key("accent")
+        );
+
+        editor.input = "scene reset title".into();
+        execute_editor_input(
+            &mut app,
+            &mut session,
+            &mut history,
+            &mut editor,
+            Instant::now(),
+            &host,
+        )
+        .unwrap();
+        assert!(
+            session
+                .current_mmfx_source()
+                .unwrap()
+                .1
+                .parameter_bindings
+                .is_empty()
+        );
     }
 
     #[test]

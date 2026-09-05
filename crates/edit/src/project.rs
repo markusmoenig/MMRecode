@@ -100,6 +100,8 @@ pub struct MmfxSource {
     pub source: String,
     /// Optional directory used to resolve module-relative resources imported from an external file.
     pub resource_base: Option<PathBuf>,
+    /// Canonical host values overriding public `@param` defaults for this scene object.
+    pub parameter_bindings: BTreeMap<String, String>,
 }
 
 /// Reusable media definition that may establish its own local child timeline.

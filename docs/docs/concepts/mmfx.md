@@ -58,6 +58,7 @@ The `mmrecode-mmfx` crate currently provides:
 - strict, source-spanned parsing and validation;
 - nested overlay, row, and column layout with absolute children, padding, gap, alignment, and justification;
 - pixel, percentage, and intrinsic `auto` sizes with min/max constraints;
+- typed public parameters with strict `var(--name)` references and persisted editor bindings;
 - colors, opacity, clipping, and rounded corners;
 - image `contain`, `cover`, and `fill` fitting;
 - exact local-frame keyframes, easing, translation, scaling, rotation, and cover-style scrolling;
@@ -70,8 +71,8 @@ The terminal editor creates declarative content with `add scene`, edits its embe
 
 ## What comes next
 
-Media slots, fallback fonts, richer animation controls, reusable parameters/styles, Kernel IR, transitions, optimized CPU/GPU backends, and the plugin boundary are not implemented yet.
+Media slots, fallback fonts, richer animation controls, named reusable styles, Kernel IR, transitions, optimized CPU/GPU backends, and the plugin boundary are not implemented yet.
 
-See the executable [Scene 0.3 reference](../mmfx/scene-language.md) and [inline, rendered examples](../mmfx/examples.md).
+See the executable [Scene 0.4 reference](../mmfx/scene-language.md) and [inline, rendered examples](../mmfx/examples.md).
 
-See the complete design record in [`mmfx-concept.md`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/mmfx-concept.md).
+See the complete design record in [`mmfx-concept.md`](https://github.com/markusmoenig/MMRecode/blob/main/mmfx-concept.md).

@@ -13,10 +13,95 @@ pub struct Scene {
     pub background: Color,
     /// Explicit font resources required by text objects.
     pub fonts: Vec<FontResource>,
+    /// Typed public inputs declared by this reusable scene.
+    pub parameters: Vec<SceneParameter>,
     /// Named animation definitions referenced by scene nodes.
     pub animations: Vec<Keyframes>,
     /// Top-level nodes, in paint order.
     pub children: Vec<Node>,
+}
+
+/// One typed public input exposed by a reusable scene.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneParameter {
+    /// Name used by `var(--name)` and host bindings, without the leading dashes.
+    pub name: String,
+    /// Declared value category.
+    pub kind: ParameterKind,
+    /// Author-provided default value.
+    pub default: ParameterValue,
+    /// Effective value after applying the current host binding.
+    pub value: ParameterValue,
+    /// Allowed values for a choice parameter; empty for all other kinds.
+    pub choices: Vec<String>,
+}
+
+/// Value category accepted by an MMFX scene parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterKind {
+    /// Quoted Unicode text.
+    Text,
+    /// Hexadecimal sRGBA color.
+    Color,
+    /// Pixel, percentage, or automatic length.
+    Length,
+    /// Finite scalar number.
+    Number,
+    /// `true` or `false`.
+    Boolean,
+    /// One identifier from the parameter's declared choices.
+    Choice,
+}
+
+impl ParameterKind {
+    /// Stable source spelling used by diagnostics and editor inspectors.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Color => "color",
+            Self::Length => "length",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Choice => "choice",
+        }
+    }
+}
+
+/// A validated MMFX parameter value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParameterValue {
+    /// Unicode text.
+    Text(String),
+    /// Straight-alpha sRGB color.
+    Color(Color),
+    /// Typed layout length.
+    Length(Length),
+    /// Finite scalar.
+    Number(f32),
+    /// Boolean switch.
+    Boolean(bool),
+    /// Selected choice identifier.
+    Choice(String),
+}
+
+impl ParameterValue {
+    /// Canonical human-readable value suitable for an inspector or command result.
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self {
+            Self::Text(value) | Self::Choice(value) => value.clone(),
+            Self::Color(value) => format!(
+                "#{:02x}{:02x}{:02x}{:02x}",
+                value.red, value.green, value.blue, value.alpha
+            ),
+            Self::Length(Length::Auto) => "auto".into(),
+            Self::Length(Length::Pixels(value)) => format!("{value}px"),
+            Self::Length(Length::Percent(value)) => format!("{value}%"),
+            Self::Number(value) => value.to_string(),
+            Self::Boolean(value) => value.to_string(),
+        }
+    }
 }
 
 impl Scene {

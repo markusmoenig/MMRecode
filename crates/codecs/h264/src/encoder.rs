@@ -9,11 +9,44 @@ use mmrecode_core::{
 use crate::{CODEC_NAME, cavlc::encode_residual_block};
 
 const PROFILE_BASELINE: u8 = 66;
-const PROFILE_COMPATIBILITY: u8 = 0xc0;
-const LEVEL_5_2: u8 = 52;
+const PROFILE_MAIN: u8 = 77;
+const BASELINE_COMPATIBILITY: u8 = 0xc0;
 const NAL_LENGTH_SIZE: u8 = 4;
 const MAX_MACROBLOCKS_PER_FRAME: usize = 36_864;
 const RATE_CONTROL_BUFFER_FRAMES: u64 = 8;
+
+// ITU-T H.264 Annex A, Table A-1. Bitrate and CPB entries use the Baseline/Main
+// profile factor of 1_000 bits per table unit.
+const AVC_LEVELS: [AvcLevel; 20] = [
+    AvcLevel::new("1", 10, false, 1_485, 99, 396, 64, 175),
+    AvcLevel::new("1b", 11, true, 1_485, 99, 396, 128, 350),
+    AvcLevel::new("1.1", 11, false, 3_000, 396, 900, 192, 500),
+    AvcLevel::new("1.2", 12, false, 6_000, 396, 2_376, 384, 1_000),
+    AvcLevel::new("1.3", 13, false, 11_880, 396, 2_376, 768, 2_000),
+    AvcLevel::new("2", 20, false, 11_880, 396, 2_376, 2_000, 2_000),
+    AvcLevel::new("2.1", 21, false, 19_800, 792, 4_752, 4_000, 4_000),
+    AvcLevel::new("2.2", 22, false, 20_250, 1_620, 8_100, 4_000, 4_000),
+    AvcLevel::new("3", 30, false, 40_500, 1_620, 8_100, 10_000, 10_000),
+    AvcLevel::new("3.1", 31, false, 108_000, 3_600, 18_000, 14_000, 14_000),
+    AvcLevel::new("3.2", 32, false, 216_000, 5_120, 20_480, 20_000, 20_000),
+    AvcLevel::new("4", 40, false, 245_760, 8_192, 32_768, 20_000, 25_000),
+    AvcLevel::new("4.1", 41, false, 245_760, 8_192, 32_768, 50_000, 62_500),
+    AvcLevel::new("4.2", 42, false, 522_240, 8_704, 34_816, 50_000, 62_500),
+    AvcLevel::new("5", 50, false, 589_824, 22_080, 110_400, 135_000, 135_000),
+    AvcLevel::new("5.1", 51, false, 983_040, 36_864, 184_320, 240_000, 240_000),
+    AvcLevel::new(
+        "5.2", 52, false, 2_073_600, 36_864, 184_320, 240_000, 240_000,
+    ),
+    AvcLevel::new(
+        "6", 60, false, 4_177_920, 139_264, 696_320, 240_000, 240_000,
+    ),
+    AvcLevel::new(
+        "6.1", 61, false, 8_355_840, 139_264, 696_320, 480_000, 480_000,
+    ),
+    AvcLevel::new(
+        "6.2", 62, false, 16_711_680, 139_264, 696_320, 800_000, 800_000,
+    ),
+];
 
 #[derive(Clone, Debug)]
 struct Configuration {
@@ -31,6 +64,65 @@ struct Configuration {
     b_direct_mode: BDirectMode,
     aq_strength: u8,
     pic_order_cnt_type0: bool,
+    level: LevelConfiguration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SequenceConfiguration {
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    max_references: usize,
+    pic_order_cnt_type0: bool,
+    hrd: Option<EncoderHrd>,
+    profile: EncoderProfile,
+    level: AvcLevel,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LevelConfiguration {
+    level: AvcLevel,
+    macroblocks_per_frame: usize,
+    default_frame_duration_ticks: u64,
+    time_base: mmrecode_core::Rational,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AvcLevel {
+    name: &'static str,
+    level_idc: u8,
+    constraint_set3: bool,
+    max_macroblocks_per_second: u64,
+    max_frame_size: usize,
+    max_dpb_macroblocks: usize,
+    max_bitrate_kbps: u64,
+    max_cpb_kbits: u64,
+}
+
+impl AvcLevel {
+    #[allow(clippy::too_many_arguments)]
+    const fn new(
+        name: &'static str,
+        level_idc: u8,
+        constraint_set3: bool,
+        max_macroblocks_per_second: u64,
+        max_frame_size: usize,
+        max_dpb_macroblocks: usize,
+        max_bitrate_kbps: u64,
+        max_cpb_kbits: u64,
+    ) -> Self {
+        Self {
+            name,
+            level_idc,
+            constraint_set3,
+            max_macroblocks_per_second,
+            max_frame_size,
+            max_dpb_macroblocks,
+            max_bitrate_kbps,
+            max_cpb_kbits,
+        }
+    }
 }
 
 struct EncodedFrame {
@@ -219,6 +311,175 @@ enum EncoderMode {
     Intra16,
     Intra4,
     Inter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EncoderProfile {
+    Baseline,
+    Main,
+}
+
+impl EncoderProfile {
+    const fn profile_idc(self) -> u8 {
+        match self {
+            Self::Baseline => PROFILE_BASELINE,
+            Self::Main => PROFILE_MAIN,
+        }
+    }
+
+    const fn compatibility(self) -> u8 {
+        match self {
+            Self::Baseline => BASELINE_COMPATIBILITY,
+            Self::Main => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProfilePreference {
+    #[default]
+    Auto,
+    Baseline,
+    Main,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LevelPreference {
+    #[default]
+    Auto,
+    Exact(AvcLevel),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LevelRequirements {
+    width_in_macroblocks: usize,
+    height_in_macroblocks: usize,
+    macroblocks_per_frame: usize,
+    decoded_picture_buffer_macroblocks: usize,
+    frame_duration_ticks: u64,
+    time_base: mmrecode_core::Rational,
+    bitrate: Option<u64>,
+    cpb_size: Option<u64>,
+}
+
+impl LevelRequirements {
+    fn failures(self, level: AvcLevel) -> Vec<String> {
+        let mut failures = Vec::new();
+        if self.macroblocks_per_frame > level.max_frame_size {
+            failures.push(format!(
+                "{} macroblocks/frame exceeds {}",
+                self.macroblocks_per_frame, level.max_frame_size
+            ));
+        }
+        let squared_dimension_limit = level.max_frame_size.saturating_mul(8);
+        if self
+            .width_in_macroblocks
+            .saturating_mul(self.width_in_macroblocks)
+            > squared_dimension_limit
+            || self
+                .height_in_macroblocks
+                .saturating_mul(self.height_in_macroblocks)
+                > squared_dimension_limit
+        {
+            failures.push(format!(
+                "{}x{} macroblock dimensions exceed the level's dimension limit",
+                self.width_in_macroblocks, self.height_in_macroblocks
+            ));
+        }
+        if !level_allows_frame_interval(
+            level,
+            self.macroblocks_per_frame,
+            self.frame_duration_ticks,
+            self.time_base,
+        ) {
+            failures.push(format!(
+                "the declared frame cadence exceeds {} macroblocks/second",
+                level.max_macroblocks_per_second
+            ));
+        }
+        if self.decoded_picture_buffer_macroblocks > level.max_dpb_macroblocks {
+            failures.push(format!(
+                "{} decoded-picture-buffer macroblocks exceeds {}",
+                self.decoded_picture_buffer_macroblocks, level.max_dpb_macroblocks
+            ));
+        }
+        if self
+            .bitrate
+            .is_some_and(|bitrate| bitrate > level.max_bitrate_kbps.saturating_mul(1_000))
+        {
+            failures.push(format!(
+                "bitrate exceeds {} bit/s",
+                level.max_bitrate_kbps.saturating_mul(1_000)
+            ));
+        }
+        if self
+            .cpb_size
+            .is_some_and(|size| size > level.max_cpb_kbits.saturating_mul(1_000))
+        {
+            failures.push(format!(
+                "CPB size exceeds {} bits",
+                level.max_cpb_kbits.saturating_mul(1_000)
+            ));
+        }
+        failures
+    }
+}
+
+fn parse_level_preference(value: &str) -> Option<LevelPreference> {
+    if value == "auto" {
+        return Some(LevelPreference::Auto);
+    }
+    AVC_LEVELS
+        .iter()
+        .copied()
+        .find(|level| level.name == value)
+        .map(LevelPreference::Exact)
+}
+
+fn negotiate_level(
+    preference: LevelPreference,
+    requirements: LevelRequirements,
+) -> Result<AvcLevel> {
+    if let LevelPreference::Exact(level) = preference {
+        let failures = requirements.failures(level);
+        if failures.is_empty() {
+            return Ok(level);
+        }
+        return Err(Error::Unsupported(format!(
+            "H.264 level {} cannot represent this sequence: {}",
+            level.name,
+            failures.join(", ")
+        )));
+    }
+    AVC_LEVELS
+        .iter()
+        .copied()
+        .find(|level| requirements.failures(*level).is_empty())
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "H.264 sequence exceeds the supported Level 6.2 limits; reduce dimensions, frame rate, references, bitrate, or VBV size"
+                    .into(),
+            )
+        })
+}
+
+fn level_allows_frame_interval(
+    level: AvcLevel,
+    macroblocks_per_frame: usize,
+    duration_ticks: u64,
+    time_base: mmrecode_core::Rational,
+) -> bool {
+    if duration_ticks == 0 || time_base.numerator() <= 0 || time_base.denominator() <= 0 {
+        return false;
+    }
+    let required = (macroblocks_per_frame as u128)
+        .saturating_mul(u128::try_from(time_base.denominator()).expect("positive denominator"));
+    let capacity = u128::from(level.max_macroblocks_per_second)
+        .saturating_mul(u128::from(duration_ticks))
+        .saturating_mul(
+            u128::try_from(time_base.numerator()).expect("positive time-base numerator"),
+        );
+    required <= capacity
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -558,8 +819,8 @@ fn scaled_hrd_value(value: u64, base_shift: u8, name: &str) -> Result<(u8, u32, 
 
 /// Stateful deterministic H.264/AVC encoder foundation.
 ///
-/// This encoder emits one Baseline-profile, CAVLC IDR access unit for every input frame. Its
-/// default `I_PCM` mode is lossless but intentionally large. Setting the codec-specific `mode`
+/// This encoder emits Baseline- or Main-profile CAVLC access units. Its default `I_PCM` mode is
+/// lossless but intentionally large. Setting the codec-specific `mode`
 /// option to `intra16` enables reconstructed-neighbor macroblock prediction, while `intra4`
 /// selects among all nine 4x4 luma prediction modes. Both compressed modes write quantized luma
 /// and chroma residuals with CAVLC. `inter` adds periodic Intra4 IDRs, the complete P partition tree
@@ -568,7 +829,8 @@ fn scaled_hrd_value(value: u64, base_shift: u8, name: &str) -> Result<(u8, u32, 
 /// generic `bitrate` setting is present, it becomes the initial QP for a deterministic frame-level
 /// virtual-buffer controller. `aq_strength=1..12` redistributes that picture QP between quiet and
 /// textured macroblocks while preserving normative QP-delta state. `vbv_buffer_ms` activates
-/// single-CPB NAL HRD signalling and checked removal scheduling.
+/// single-CPB NAL HRD signalling and checked removal scheduling. `profile=auto` selects Baseline
+/// without B pictures and Main when B pictures are enabled.
 #[derive(Debug, Default)]
 pub struct H264Encoder {
     configuration: Option<Configuration>,
@@ -840,6 +1102,9 @@ impl Encoder for H264Encoder {
         let mut b_direct_mode = BDirectMode::Spatial;
         let mut aq_strength = 0;
         let mut vbv_buffer_milliseconds = None;
+        let mut profile_preference = ProfilePreference::Auto;
+        let mut level_preference = LevelPreference::Auto;
+        let mut frame_duration_ticks = 1_u64;
         for (name, value) in &settings.options {
             match name.as_str() {
                 "mode" => {
@@ -950,6 +1215,36 @@ impl Encoder for H264Encoder {
                             })?,
                     );
                 }
+                "profile" => {
+                    profile_preference = match value.as_str() {
+                        "auto" => ProfilePreference::Auto,
+                        "baseline" => ProfilePreference::Baseline,
+                        "main" => ProfilePreference::Main,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 profile {value}; expected auto, baseline, or main"
+                            )));
+                        }
+                    };
+                }
+                "level" => {
+                    level_preference = parse_level_preference(value).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "invalid H.264 level {value}; expected auto, 1, 1b, 1.1..1.3, 2..2.2, 3..3.2, 4..4.2, 5..5.2, or 6..6.2"
+                        ))
+                    })?;
+                }
+                "frame_duration_ticks" => {
+                    frame_duration_ticks = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|duration| *duration != 0)
+                        .ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "invalid H.264 frame_duration_ticks {value}; expected a positive integer"
+                            ))
+                        })?;
+                }
                 _ => {
                     return Err(Error::Unsupported(format!(
                         "unsupported H.264 encoder option {name}={value}"
@@ -971,6 +1266,12 @@ impl Encoder for H264Encoder {
         let coded_width = macroblocks_wide * 16;
         let coded_height = macroblocks_high * 16;
 
+        if settings.time_base.numerator() <= 0 || settings.time_base.denominator() <= 0 {
+            return Err(Error::Unsupported(
+                "H.264 level negotiation requires a positive time_base".into(),
+            ));
+        }
+
         if mode != EncoderMode::Inter && (max_references != 1 || b_frames != 0) {
             return Err(Error::Unsupported(
                 "H.264 max_refs and b_frames require mode=inter".into(),
@@ -989,6 +1290,17 @@ impl Encoder for H264Encoder {
         if vbv_buffer_milliseconds.is_some() && settings.bitrate.is_none() {
             return Err(Error::Unsupported(
                 "H.264 vbv_buffer_ms requires a target bitrate".into(),
+            ));
+        }
+        let profile = match profile_preference {
+            ProfilePreference::Auto if b_frames == 0 => EncoderProfile::Baseline,
+            ProfilePreference::Baseline => EncoderProfile::Baseline,
+            ProfilePreference::Auto | ProfilePreference::Main => EncoderProfile::Main,
+        };
+        if profile == EncoderProfile::Baseline && b_frames != 0 {
+            return Err(Error::Unsupported(
+                "H.264 Baseline Profile does not support B pictures; use profile=main or auto"
+                    .into(),
             ));
         }
         let hrd = vbv_buffer_milliseconds
@@ -1014,15 +1326,35 @@ impl Encoder for H264Encoder {
             })
             .transpose()?;
         let decoded_picture_buffer_size = max_references.max(if b_frames == 0 { 1 } else { 2 });
-        let sps = encode_sps(
-            settings.width,
-            settings.height,
+        let buffered_pictures = decoded_picture_buffer_size + usize::from(b_frames != 0);
+        let level = negotiate_level(
+            level_preference,
+            LevelRequirements {
+                width_in_macroblocks: macroblocks_wide,
+                height_in_macroblocks: macroblocks_high,
+                macroblocks_per_frame: macroblock_count,
+                decoded_picture_buffer_macroblocks: macroblock_count
+                    .checked_mul(buffered_pictures)
+                    .ok_or_else(|| {
+                        Error::Unsupported("H.264 decoded-picture-buffer size overflows".into())
+                    })?,
+                frame_duration_ticks,
+                time_base: settings.time_base,
+                bitrate: hrd.map(EncoderHrd::signalled_bit_rate).or(settings.bitrate),
+                cpb_size: hrd.map(|parameters| parameters.signalled_cpb_size),
+            },
+        )?;
+        let sps = encode_sps(&SequenceConfiguration {
+            width: settings.width,
+            height: settings.height,
             coded_width,
             coded_height,
-            decoded_picture_buffer_size,
-            b_frames != 0,
-            hrd.as_ref(),
-        )?;
+            max_references: decoded_picture_buffer_size,
+            pic_order_cnt_type0: b_frames != 0,
+            hrd,
+            profile,
+            level,
+        })?;
         let pps = encode_pps()?;
         let descriptor = CodecDescriptor {
             codec_id: CodecId::new(CODEC_NAME),
@@ -1045,6 +1377,12 @@ impl Encoder for H264Encoder {
             b_direct_mode,
             aq_strength,
             pic_order_cnt_type0: b_frames != 0,
+            level: LevelConfiguration {
+                level,
+                macroblocks_per_frame: macroblock_count,
+                default_frame_duration_ticks: frame_duration_ticks,
+                time_base: settings.time_base,
+            },
         });
         self.rate_control = rate_control;
         self.hrd_state = hrd.map(HrdState::new);
@@ -1069,6 +1407,7 @@ impl Encoder for H264Encoder {
             ));
         }
         validate_frame(&frame, configuration.width, configuration.height)?;
+        validate_frame_level(&frame, configuration.level)?;
         self.decode_timestamps.push_back(frame.timing.pts);
         let inter_mode = configuration.mode == EncoderMode::Inter;
         let key = !inter_mode
@@ -1160,6 +1499,34 @@ fn validate_frame(frame: &VideoFrame, width: usize, height: usize) -> Result<()>
     Ok(())
 }
 
+fn validate_frame_level(frame: &VideoFrame, configuration: LevelConfiguration) -> Result<()> {
+    let (duration_ticks, time_base) = frame
+        .timing
+        .duration
+        .filter(|duration| duration.value > 0)
+        .and_then(|duration| {
+            u64::try_from(duration.value)
+                .ok()
+                .map(|ticks| (ticks, duration.time_base))
+        })
+        .unwrap_or((
+            configuration.default_frame_duration_ticks,
+            configuration.time_base,
+        ));
+    if level_allows_frame_interval(
+        configuration.level,
+        configuration.macroblocks_per_frame,
+        duration_ticks,
+        time_base,
+    ) {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "H.264 frame duration exceeds Level {}'s {} macroblocks/second limit",
+        configuration.level.name, configuration.level.max_macroblocks_per_second
+    )))
+}
+
 fn validate_plane(plane: &Plane, width: usize, height: usize, index: usize) -> Result<()> {
     if (plane.width, plane.height) != (width, height) || plane.stride < width {
         return Err(Error::InvalidData(format!(
@@ -1179,43 +1546,50 @@ fn validate_plane(plane: &Plane, width: usize, height: usize, index: usize) -> R
     Ok(())
 }
 
-fn encode_sps(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    max_references: usize,
-    pic_order_cnt_type0: bool,
-    hrd: Option<&EncoderHrd>,
-) -> Result<Vec<u8>> {
+fn encode_sps(configuration: &SequenceConfiguration) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
-    writer.write_bits(u64::from(PROFILE_BASELINE), 8)?;
-    writer.write_bits(u64::from(PROFILE_COMPATIBILITY), 8)?;
-    writer.write_bits(u64::from(LEVEL_5_2), 8)?;
+    writer.write_bits(u64::from(configuration.profile.profile_idc()), 8)?;
+    let level_compatibility = if configuration.level.constraint_set3 {
+        0x10
+    } else {
+        0
+    };
+    writer.write_bits(
+        u64::from(configuration.profile.compatibility() | level_compatibility),
+        8,
+    )?;
+    writer.write_bits(u64::from(configuration.level.level_idc), 8)?;
     write_ue(&mut writer, 0)?; // seq_parameter_set_id
     write_ue(&mut writer, 0)?; // log2_max_frame_num_minus4
-    if pic_order_cnt_type0 {
+    if configuration.pic_order_cnt_type0 {
         write_ue(&mut writer, 0)?; // pic_order_cnt_type
         write_ue(&mut writer, 0)?; // log2_max_pic_order_cnt_lsb_minus4
     } else {
         write_ue(&mut writer, 2)?; // pic_order_cnt_type
     }
-    write_ue(&mut writer, max_references as u64)?; // max_num_ref_frames
+    write_ue(&mut writer, configuration.max_references as u64)?; // max_num_ref_frames
     writer.write_bit(false)?; // gaps_in_frame_num_value_allowed_flag
-    write_ue(&mut writer, (coded_width / 16 - 1) as u64)?;
-    write_ue(&mut writer, (coded_height / 16 - 1) as u64)?;
+    write_ue(&mut writer, (configuration.coded_width / 16 - 1) as u64)?;
+    write_ue(&mut writer, (configuration.coded_height / 16 - 1) as u64)?;
     writer.write_bit(true)?; // frame_mbs_only_flag
     writer.write_bit(true)?; // direct_8x8_inference_flag
-    let cropped = width != coded_width || height != coded_height;
+    let cropped = configuration.width != configuration.coded_width
+        || configuration.height != configuration.coded_height;
     writer.write_bit(cropped)?;
     if cropped {
         write_ue(&mut writer, 0)?; // frame_crop_left_offset
-        write_ue(&mut writer, ((coded_width - width) / 2) as u64)?;
+        write_ue(
+            &mut writer,
+            ((configuration.coded_width - configuration.width) / 2) as u64,
+        )?;
         write_ue(&mut writer, 0)?; // frame_crop_top_offset
-        write_ue(&mut writer, ((coded_height - height) / 2) as u64)?;
+        write_ue(
+            &mut writer,
+            ((configuration.coded_height - configuration.height) / 2) as u64,
+        )?;
     }
-    writer.write_bit(hrd.is_some())?; // vui_parameters_present_flag
-    if let Some(hrd) = hrd {
+    writer.write_bit(configuration.hrd.is_some())?; // vui_parameters_present_flag
+    if let Some(hrd) = configuration.hrd {
         writer.write_bit(false)?; // aspect_ratio_info_present_flag
         writer.write_bit(false)?; // overscan_info_present_flag
         writer.write_bit(false)?; // video_signal_type_present_flag
@@ -5140,15 +5514,18 @@ fn visible_frame(
 }
 
 fn encode_avcc(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
+    let sps_identifiers = sps
+        .get(1..4)
+        .ok_or_else(|| Error::InvalidData("H.264 SPS is too short for avcC identifiers".into()))?;
     let sps_length = u16::try_from(sps.len())
         .map_err(|_| Error::InvalidData("H.264 SPS exceeds avcC length field".into()))?;
     let pps_length = u16::try_from(pps.len())
         .map_err(|_| Error::InvalidData("H.264 PPS exceeds avcC length field".into()))?;
     let mut output = vec![
         1,
-        PROFILE_BASELINE,
-        PROFILE_COMPATIBILITY,
-        LEVEL_5_2,
+        sps_identifiers[0],
+        sps_identifiers[1],
+        sps_identifiers[2],
         0xfc | (NAL_LENGTH_SIZE - 1),
         0xe1,
     ];
@@ -5290,7 +5667,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        AvcDecoderConfigurationRecord, H264Decoder, NalUnitType, parse_sps,
+        AvcDecoderConfigurationRecord, H264Decoder, NalUnitType, Sps, parse_sps,
         remove_emulation_prevention,
     };
 
@@ -5367,6 +5744,9 @@ mod tests {
             ("aq_strength", "13"),
             ("vbv_buffer_ms", "0"),
             ("vbv_buffer_ms", "60001"),
+            ("profile", "extended"),
+            ("level", "7"),
+            ("frame_duration_ticks", "0"),
         ] {
             let mut invalid_option = settings(16, 16);
             invalid_option.options.insert(name.into(), value.into());
@@ -5393,6 +5773,13 @@ mod tests {
             .options
             .insert("vbv_buffer_ms".into(), "1000".into());
         assert!(encoder.configure(&vbv_without_bitrate).is_err());
+        let mut baseline_b = settings(16, 16);
+        baseline_b.options.insert("mode".into(), "inter".into());
+        baseline_b.options.insert("b_frames".into(), "1".into());
+        baseline_b
+            .options
+            .insert("profile".into(), "baseline".into());
+        assert!(encoder.configure(&baseline_b).is_err());
 
         let mut lossless_bitrate = settings(16, 16);
         lossless_bitrate.bitrate = Some(100_000);
@@ -5410,6 +5797,131 @@ mod tests {
         let mut frame = patterned_frame(16, 16);
         frame.planes[0].data.truncate(8);
         assert!(encoder.send_frame(frame).is_err());
+    }
+
+    #[test]
+    fn negotiates_baseline_and_main_profiles_and_keeps_avcc_consistent() {
+        let baseline_descriptor = H264Encoder::default().configure(&settings(16, 16)).unwrap();
+        let baseline_avcc =
+            AvcDecoderConfigurationRecord::parse(&baseline_descriptor.configuration).unwrap();
+        let baseline_sps = parse_sps(&baseline_avcc.sequence_parameter_sets[0]).unwrap();
+        assert_eq!(baseline_sps.profile_idc, PROFILE_BASELINE);
+        assert_eq!(baseline_sps.constraint_flags, BASELINE_COMPATIBILITY);
+        assert_eq!(baseline_avcc.profile_indication, baseline_sps.profile_idc);
+        assert_eq!(
+            baseline_avcc.profile_compatibility,
+            baseline_sps.constraint_flags
+        );
+
+        let mut automatic_main = settings(16, 16);
+        automatic_main.options.insert("mode".into(), "inter".into());
+        automatic_main.options.insert("b_frames".into(), "1".into());
+        let main_descriptor = H264Encoder::default().configure(&automatic_main).unwrap();
+        let main_avcc =
+            AvcDecoderConfigurationRecord::parse(&main_descriptor.configuration).unwrap();
+        let main_sps = parse_sps(&main_avcc.sequence_parameter_sets[0]).unwrap();
+        assert_eq!(main_sps.profile_idc, PROFILE_MAIN);
+        assert_eq!(main_sps.constraint_flags, 0);
+        assert_eq!(main_avcc.profile_indication, main_sps.profile_idc);
+        assert_eq!(main_avcc.profile_compatibility, 0);
+
+        let mut explicit_main = settings(16, 16);
+        explicit_main
+            .options
+            .insert("profile".into(), "main".into());
+        let descriptor = H264Encoder::default().configure(&explicit_main).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        assert_eq!(
+            parse_sps(&avcc.sequence_parameter_sets[0])
+                .unwrap()
+                .profile_idc,
+            PROFILE_MAIN
+        );
+    }
+
+    #[test]
+    fn negotiates_and_enforces_annex_a_levels() {
+        fn parameter_sets(settings: &VideoEncoderSettings) -> (Sps, AvcDecoderConfigurationRecord) {
+            let descriptor = H264Encoder::default().configure(settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            let sps = parse_sps(&avcc.sequence_parameter_sets[0]).unwrap();
+            (sps, avcc)
+        }
+
+        let (level_one, avcc) = parameter_sets(&settings(16, 16));
+        assert_eq!(level_one.level_idc, 10);
+        assert_eq!(avcc.level_indication, level_one.level_idc);
+
+        let mut level_one_b = settings(16, 16);
+        level_one_b.options.insert("mode".into(), "intra4".into());
+        level_one_b.bitrate = Some(100_000);
+        let (level_one_b, avcc) = parameter_sets(&level_one_b);
+        assert_eq!(level_one_b.level_idc, 11);
+        assert_ne!(level_one_b.constraint_flags & 0x10, 0);
+        assert_eq!(avcc.profile_compatibility, level_one_b.constraint_flags);
+
+        let mut cif_thirty = settings(176, 144);
+        cif_thirty.time_base = Rational::new(1, 30).unwrap();
+        assert_eq!(parameter_sets(&cif_thirty).0.level_idc, 11);
+        assert_eq!(parameter_sets(&cif_thirty).0.constraint_flags & 0x10, 0);
+
+        let mut full_hd = settings(1_920, 1_080);
+        full_hd.time_base = Rational::new(1, 30).unwrap();
+        assert_eq!(parameter_sets(&full_hd).0.level_idc, 40);
+        full_hd.time_base = Rational::new(1, 60).unwrap();
+        assert_eq!(parameter_sets(&full_hd).0.level_idc, 42);
+
+        let mut clock_based = settings(1_920, 1_080);
+        clock_based.time_base = Rational::new(1, 90_000).unwrap();
+        clock_based
+            .options
+            .insert("frame_duration_ticks".into(), "3000".into());
+        assert_eq!(parameter_sets(&clock_based).0.level_idc, 40);
+
+        let mut reference_heavy = settings(1_920, 1_080);
+        reference_heavy.time_base = Rational::new(1, 30).unwrap();
+        reference_heavy
+            .options
+            .insert("mode".into(), "inter".into());
+        reference_heavy
+            .options
+            .insert("max_refs".into(), "4".into());
+        reference_heavy
+            .options
+            .insert("b_frames".into(), "1".into());
+        assert_eq!(parameter_sets(&reference_heavy).0.level_idc, 50);
+
+        let mut large_cpb = settings(1_920, 1_080);
+        large_cpb.time_base = Rational::new(1, 30).unwrap();
+        large_cpb.options.insert("mode".into(), "intra4".into());
+        large_cpb
+            .options
+            .insert("vbv_buffer_ms".into(), "2000".into());
+        large_cpb.bitrate = Some(20_000_000);
+        assert_eq!(parameter_sets(&large_cpb).0.level_idc, 41);
+
+        let mut constrained = settings(1_920, 1_080);
+        constrained.time_base = Rational::new(1, 30).unwrap();
+        constrained.options.insert("level".into(), "3.2".into());
+        let error = H264Encoder::default().configure(&constrained).unwrap_err();
+        assert!(error.to_string().contains("level 3.2"));
+
+        let mut explicit = settings(16, 16);
+        explicit.options.insert("level".into(), "4.1".into());
+        assert_eq!(parameter_sets(&explicit).0.level_idc, 41);
+
+        let mut timed = settings(176, 144);
+        timed.time_base = Rational::new(1, 15).unwrap();
+        let mut encoder = H264Encoder::default();
+        encoder.configure(&timed).unwrap();
+        let too_fast = patterned_frame(176, 144);
+        assert!(encoder.send_frame(too_fast).is_err());
+        let mut conforming = patterned_frame(176, 144);
+        conforming.timing.duration = Some(Timestamp {
+            value: 1,
+            time_base: Rational::new(1, 15).unwrap(),
+        });
+        encoder.send_frame(conforming).unwrap();
     }
 
     #[test]

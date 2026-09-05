@@ -42,7 +42,7 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           editUrl:
-            'https://github.com/markusmoenig/MMRecode/tree/feature/jpeg-inspect/docs/',
+            'https://github.com/markusmoenig/MMRecode/tree/main/docs/',
         },
         blog: false,
         theme: {

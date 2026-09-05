@@ -12,7 +12,7 @@ const MONITOR_TARGETS: &[&str] = &["local", "project", "toggle"];
 const PROJECT_COMMANDS: &[&str] = &["info", "match", "preset", "presets", "set"];
 const RATE_CONFORM_POLICIES: &[&str] = &["frames", "time"];
 const SCALE_MODES: &[&str] = &["fill", "fit", "native", "stretch"];
-const SCENE_COMMANDS: &[&str] = &["close", "edit", "load", "save"];
+const SCENE_COMMANDS: &[&str] = &["close", "edit", "load", "params", "reset", "save", "set"];
 
 /// A prompt replacement and the candidates that produced it.
 #[derive(Debug, Eq, PartialEq)]
@@ -38,27 +38,8 @@ pub(crate) fn complete(input: &str, session: &EditorSession, base_directory: &Pa
     if let Some(partial) = input.strip_prefix("monitor ") {
         return complete_words(partial, "monitor ", MONITOR_TARGETS);
     }
-    if let Some(partial) = input.strip_prefix("scene load ") {
-        return complete_path(partial, "scene load ", None, base_directory);
-    }
-    if let Some(partial) = input.strip_prefix("scene save as ") {
-        return complete_path(partial, "scene save as ", None, base_directory);
-    }
-    if let Some(partial) = input.strip_prefix("scene ")
-        && !partial.contains(char::is_whitespace)
-    {
-        return complete_words(partial, "scene ", SCENE_COMMANDS);
-    }
-    if let Some(partial) = input.strip_prefix("fx load ") {
-        return complete_path(partial, "fx load ", None, base_directory);
-    }
-    if let Some(partial) = input.strip_prefix("fx save as ") {
-        return complete_path(partial, "fx save as ", None, base_directory);
-    }
-    if let Some(partial) = input.strip_prefix("fx ")
-        && !partial.contains(char::is_whitespace)
-    {
-        return complete_words(partial, "fx ", SCENE_COMMANDS);
+    if let Some(completion) = complete_scene(input, session, base_directory) {
+        return completion;
     }
     if let Some(partial) = input.strip_prefix("project preset ") {
         return complete_words(partial, "project preset ", ProjectSettings::preset_names());
@@ -123,6 +104,85 @@ pub(crate) fn complete(input: &str, session: &EditorSession, base_directory: &Pa
         replacement: input.to_owned(),
         candidates: Vec::new(),
     }
+}
+
+fn complete_scene(
+    input: &str,
+    session: &EditorSession,
+    base_directory: &Path,
+) -> Option<Completion> {
+    for command in ["scene", "fx"] {
+        let prefix = format!("{command} ");
+        let Some(partial) = input.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(path) = partial.strip_prefix("load ") {
+            return Some(complete_path(
+                path,
+                &format!("{prefix}load "),
+                None,
+                base_directory,
+            ));
+        }
+        if let Some(path) = partial.strip_prefix("save as ") {
+            return Some(complete_path(
+                path,
+                &format!("{prefix}save as "),
+                None,
+                base_directory,
+            ));
+        }
+        if let Some(parameter) = partial.strip_prefix("set ")
+            && !parameter.contains(char::is_whitespace)
+        {
+            return Some(complete_scene_parameter(
+                parameter,
+                &format!("{prefix}set "),
+                session,
+            ));
+        }
+        if let Some(parameter) = partial.strip_prefix("reset ")
+            && !parameter.contains(char::is_whitespace)
+        {
+            return Some(complete_scene_parameter(
+                parameter,
+                &format!("{prefix}reset "),
+                session,
+            ));
+        }
+        if !partial.contains(char::is_whitespace) {
+            return Some(complete_words(partial, &prefix, SCENE_COMMANDS));
+        }
+    }
+    None
+}
+
+fn complete_scene_parameter(
+    partial: &str,
+    command_prefix: &str,
+    session: &EditorSession,
+) -> Completion {
+    let names = session
+        .current_mmfx_source()
+        .ok()
+        .and_then(|(_, source)| {
+            mmrecode_mmfx::parse_scene_with_bindings(&source.source, &source.parameter_bindings)
+                .ok()
+        })
+        .map(|scene| {
+            scene
+                .parameters
+                .into_iter()
+                .map(|parameter| parameter.name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let command_prefix = format!(
+        "{command_prefix}{}",
+        if partial.starts_with("--") { "--" } else { "" }
+    );
+    complete_words(partial.trim_start_matches("--"), &command_prefix, &names)
 }
 
 fn complete_words(partial: &str, command_prefix: &str, words: &[&str]) -> Completion {
@@ -371,5 +431,24 @@ mod tests {
         assert_eq!(file.replacement, "open \"Media Folder/clip one.ts\"");
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completes_declared_scene_parameter_names() {
+        let mut session = session();
+        let add = mmrecode_edit::parse_command("add scene Title 1:00")
+            .unwrap()
+            .unwrap();
+        session.apply(add).unwrap();
+        let cd = mmrecode_edit::parse_command("cd Title").unwrap().unwrap();
+        session.apply(cd).unwrap();
+
+        let set = complete("scene set ti", &session, Path::new("."));
+        assert_eq!(set.replacement, "scene set title ");
+        assert_eq!(set.candidates, vec!["title"]);
+
+        let reset = complete("scene reset --ac", &session, Path::new("."));
+        assert_eq!(reset.replacement, "scene reset --accent ");
+        assert_eq!(reset.candidates, vec!["accent"]);
     }
 }

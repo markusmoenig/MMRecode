@@ -9,9 +9,115 @@ Every example below includes real source, a reproducible command, and output fro
 reference renderer. The code fences use CSS highlighting because MMFX Scene is deliberately a
 strict CSS-shaped language.
 
+## Reusable parameterized title
+
+[`parameterized-title.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/parameterized-title.mmfx)
+is one source that can create many timeline instances without editing its structure.
+
+```css title="examples/mmfx/parameterized-title.mmfx"
+@param --title {
+    type: text;
+    default: "MMRecode";
+}
+
+@param --subtitle {
+    type: text;
+    default: "Edit intent, not transcoded accidents.";
+}
+
+@param --accent {
+    type: color;
+    default: #42d6c7;
+}
+
+@param --card-width {
+    type: length;
+    default: 720px;
+}
+
+@param --alignment {
+    type: choice;
+    default: start;
+    choices: "start, center, end";
+}
+
+@scene parameterized-title {
+    width: 960px;
+    height: 540px;
+    background: #090d14;
+
+    @font Inter { src: "builtin:inter"; }
+
+    @group card {
+        position: absolute;
+        display: column;
+        left: 70px;
+        bottom: 64px;
+        width: var(--card-width);
+        height: auto;
+        min-width: 360px;
+        max-width: 820px;
+        padding: 34px;
+        gap: 12px;
+        background: #152131f2;
+        border-radius: 24px;
+
+        @rect accent {
+            width: 150px;
+            height: 5px;
+            background: var(--accent);
+            border-radius: 3px;
+        }
+
+        @text title {
+            width: 100%;
+            height: auto;
+            content: var(--title);
+            font-family: Inter;
+            font-size: 46px;
+            font-weight: 700;
+            line-height: 1.1;
+            color: #f5f8fb;
+            text-align: var(--alignment);
+            white-space: nowrap;
+        }
+
+        @text subtitle {
+            width: 100%;
+            height: auto;
+            content: var(--subtitle);
+            font-family: Inter;
+            font-size: 22px;
+            font-weight: 450;
+            line-height: 1.3;
+            color: #aebed1;
+            text-align: var(--alignment);
+        }
+    }
+}
+```
+
+Render the defaults or override several typed inputs from the command line:
+
+```console
+cargo run -p mmrecode -- render-mmfx examples/mmfx/parameterized-title.mmfx title-default.png
+cargo run -p mmrecode -- render-mmfx examples/mmfx/parameterized-title.mmfx title-bound.png \
+  --set "title=Launch Day" \
+  --set "subtitle=One source, many timeline instances." \
+  --set accent=#ffb454 --set card-width=810px --set alignment=center
+```
+
+| Declared defaults | Bound values |
+| --- | --- |
+| ![Parameterized title defaults](/img/mmfx/parameterized-title-default.png) | ![Parameterized title overrides](/img/mmfx/parameterized-title-bound.png) |
+
+The corresponding editor workflow is `scene params`, `scene set title "Launch Day"`, and
+`scene reset title`. The binding is stored with the project and the source retains its reusable
+default.
+
 ## Rolling credits with intrinsic layout
 
-This complete [`rolling-credits.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/rolling-credits.mmfx)
+This complete [`rolling-credits.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/rolling-credits.mmfx)
 scene does not declare a pixel height for the moving column. Each text object is shaped and
 measured, the column adds its gaps and padding, and `cover` scrolling uses that resolved height.
 
@@ -141,7 +247,7 @@ cargo run -p mmrecode -- render-mmfx examples/mmfx/rolling-credits.mmfx credits-
 
 ## Animated image-and-text card
 
-The checked-in [`motion-layout.mmfx`](https://github.com/markusmoenig/MMRecode/blob/feature/jpeg-inspect/examples/mmfx/motion-layout.mmfx)
+The checked-in [`motion-layout.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/motion-layout.mmfx)
 uses an image resource, nested row/column layout, an entrance animation, and a horizontal ticker.
 This is its actual card and animation source; the full file also declares its 960×540 scene,
 portable Inter font, and ticker window.

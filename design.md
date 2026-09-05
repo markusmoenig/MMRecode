@@ -412,7 +412,13 @@ macroblocks whose syntax permits a change. An opt-in single-entry NAL HRD/VBV pa
 declared bitrate and CPB size into SPS VUI syntax, emits buffering-period and per-picture timing
 SEI, derives removal clocks from exact frame durations, accounts for reordered output delay, and
 pauses VBR arrivals at capacity while rejecting oversized or underfunded removals. Broader
-profile/tool support remains follow-on work.
+profile/tool support remains follow-on work. Profile selection is no longer hard-coded: automatic
+mode declares Baseline for I/P-only streams and Main for B-picture streams, rejects forced Baseline
+configurations that contain B slices, and copies the SPS profile bytes into `avcC`. Annex A level
+negotiation now selects or validates Levels 1 through 6.2 from coded frame size, rational frame
+cadence, DPB occupancy, target bitrate, and optional CPB size. It handles Level 1b signalling,
+mirrors the SPS level in `avcC`, and rejects submitted frame durations that exceed the negotiated
+macroblock rate. High Profile encoder tools remain follow-on work.
 Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
 window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
 reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;

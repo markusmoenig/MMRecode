@@ -69,6 +69,8 @@ struct MmfxRecord {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_base: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    parameter_bindings: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -186,6 +188,7 @@ impl ProjectDocument {
                     Some(MmfxRecord {
                         source: mmfx.source.clone(),
                         resource_base: mmfx.resource_base.as_deref().map(path_text).transpose()?,
+                        parameter_bindings: mmfx.parameter_bindings.clone(),
                     })
                 } else {
                     None
@@ -342,6 +345,7 @@ impl MmfxRecord {
         Ok(MmfxSource {
             source: self.source,
             resource_base,
+            parameter_bindings: self.parameter_bindings,
         })
     }
 }
@@ -600,6 +604,10 @@ mod tests {
                 MmfxSource {
                     source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
                     resource_base: Some(directory.join("fx")),
+                    parameter_bindings: BTreeMap::from([
+                        ("title".into(), "Launch Day".into()),
+                        ("accent".into(), "#42d6c7".into()),
+                    ]),
                 },
             )
             .unwrap();
@@ -625,6 +633,10 @@ mod tests {
             &MmfxSource {
                 source: "@scene LowerThird { width: 1920px; height: 1080px; }".into(),
                 resource_base: Some(directory.join("fx")),
+                parameter_bindings: BTreeMap::from([
+                    ("title".into(), "Launch Day".into()),
+                    ("accent".into(), "#42d6c7".into()),
+                ]),
             }
         );
 

@@ -425,7 +425,9 @@ size, frame duration, and a bounded virtual buffer. Optional activity-based macr
 redistributes each picture target between quiet and textured regions with normative QP-delta state.
 Opt-in single-CPB NAL HRD/VBV signalling and scheduling writes VUI plus buffering/picture-timing
 SEI and rejects access units that violate the declared buffer. Broader coding tools remain
-follow-on work.
+follow-on work. Encoder profile selection now advertises Baseline for I/P-only streams and Main for
+B-picture streams instead of placing unsupported B syntax under a Baseline SPS. Annex A level
+selection covers Levels 1 through 6.2 using structural, cadence, DPB, bitrate, and CPB limits.
 Pixel reconstruction attempts the native CAVLC and CABAC decoder first and
 currently uses an optional bounded FFmpeg process fallback for other reconstruction tools. Native
 in-loop deblocking and default-list multiple-reference CAVLC P slices are also implemented, including skip,
@@ -634,8 +636,13 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Add opt-in single-entry NAL HRD/VBV scheduling with scaled SPS rate/CPB syntax, 24-bit
   buffering-period and picture-timing SEI delays, duration-aware removal clocks, reordered B output
   delays, shared rate-controller capacity, and explicit CPB violation errors.
-- [ ] Add broader profile/tool support only after the adaptive and buffer-constrained controller is
-  mature.
+- [x] Add `profile=auto|baseline|main`, automatically promote B-picture streams to Main Profile,
+  reject forced Baseline+B output, and keep SPS plus `avcC` profile declarations identical.
+- [x] Add Annex A level negotiation across Levels 1 through 6.2, including Level 1b signalling,
+  exact frame-size/rate and dimension checks, DPB/bitrate/CPB constraints, explicit-level
+  diagnostics, actual-frame-duration enforcement, and matching SPS/`avcC` declarations.
+- [ ] Add broader High Profile encoder tools after the adaptive and buffer-constrained controller
+  and Baseline/Main profile-level negotiation are mature.
 - [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
   Treat a production-quality encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.

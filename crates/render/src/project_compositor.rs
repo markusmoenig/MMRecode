@@ -613,6 +613,7 @@ fn source_signature(source: &MmfxSource, canvas: (u32, u32), scale_mode: u8) -> 
     let mut hasher = DefaultHasher::new();
     source.source.hash(&mut hasher);
     source.resource_base.hash(&mut hasher);
+    source.parameter_bindings.hash(&mut hasher);
     canvas.hash(&mut hasher);
     scale_mode.hash(&mut hasher);
     hasher.finish()
@@ -655,19 +656,21 @@ fn compile_asset<F>(
 where
     F: FnMut(MediaId, &MmfxSource, &Scene) -> std::result::Result<RenderResources, String>,
 {
-    let scene = mmrecode_mmfx::parse_scene(&source.source).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                let (line, column) = diagnostic.span.line_column(&source.source);
-                diagnostic.help.map_or_else(
-                    || format!("{line}:{column}: {}", diagnostic.message),
-                    |help| format!("{line}:{column}: {} — {help}", diagnostic.message),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let scene =
+        mmrecode_mmfx::parse_scene_with_bindings(&source.source, &source.parameter_bindings)
+            .map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| {
+                        let (line, column) = diagnostic.span.line_column(&source.source);
+                        diagnostic.help.map_or_else(
+                            || format!("{line}:{column}: {}", diagnostic.message),
+                            |help| format!("{line}:{column}: {} — {help}", diagnostic.message),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
     let resources = load_resources(media_id, source, &scene)?;
     let animated = scene.is_animated();
     let mut prepared =
@@ -1073,6 +1076,7 @@ mod tests {
                 MmfxSource {
                     source: source.into(),
                     resource_base: None,
+                    parameter_bindings: BTreeMap::new(),
                 },
             )
             .unwrap();
@@ -1173,6 +1177,7 @@ mod tests {
                 MmfxSource {
                     source: red_scene().into(),
                     resource_base: None,
+                    parameter_bindings: BTreeMap::new(),
                 },
             )
             .unwrap();
@@ -1223,6 +1228,41 @@ mod tests {
         });
         assert!(!second.changed);
         assert_eq!(second.reused_assets, 1);
+    }
+
+    #[test]
+    fn parameter_binding_change_recompiles_only_the_affected_asset() {
+        let source = "@param --accent { type: color; default: #ff0000; } \
+            @scene overlay { width: 4px; height: 4px; background: var(--accent); }";
+        let mut project = project_with_fx(source);
+        let media_id = project
+            .media_nodes()
+            .find(|media| media.kind.is_mmfx_scene())
+            .unwrap()
+            .id;
+        let mut compositor = ProjectCompositor::new();
+        let first = compositor.synchronize(&project, project.root_id(), |_, _, _| {
+            Ok(RenderResources::new())
+        });
+        assert_eq!(first.compiled_assets, 1);
+        let mut red = RgbaImage::new(4, 4);
+        compositor.composite_rgba8(1, &mut red).unwrap();
+        assert_eq!(red.get_pixel(0, 0).0, [255, 0, 0, 255]);
+
+        let mut payload = project.media(media_id).unwrap().mmfx.clone().unwrap();
+        payload
+            .parameter_bindings
+            .insert("accent".into(), "#00ff00".into());
+        project.set_mmfx_source(media_id, payload).unwrap();
+
+        let changed = compositor.synchronize(&project, project.root_id(), |_, _, _| {
+            Ok(RenderResources::new())
+        });
+        assert!(changed.changed);
+        assert_eq!(changed.compiled_assets, 1);
+        let mut green = RgbaImage::new(4, 4);
+        compositor.composite_rgba8(1, &mut green).unwrap();
+        assert_eq!(green.get_pixel(0, 0).0, [0, 255, 0, 255]);
     }
 
     #[test]
@@ -1386,6 +1426,7 @@ mod tests {
                 MmfxSource {
                     source: "not mmfx".into(),
                     resource_base: None,
+                    parameter_bindings: BTreeMap::new(),
                 },
             )
             .unwrap();
