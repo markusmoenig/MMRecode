@@ -105,6 +105,35 @@ impl ParameterValue {
 }
 
 impl Scene {
+    /// Returns the longest exact animation or scroll duration declared by this scene.
+    ///
+    /// A host can use this as the natural duration for a generated timeline placement. Durations
+    /// expressed as `scene` deliberately do not contribute because they depend on the placement
+    /// length and therefore cannot define it.
+    #[must_use]
+    pub fn intrinsic_duration_frames(&self) -> Option<u32> {
+        fn visit(nodes: &[Node], longest: &mut Option<u32>) {
+            for node in nodes {
+                for duration in [
+                    node.style.animation.as_ref().map(|value| value.duration),
+                    node.style.scroll.map(|value| value.duration),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let AnimationDuration::Frames(frames) = duration {
+                        *longest = Some(longest.map_or(frames, |current| current.max(frames)));
+                    }
+                }
+                visit(&node.children, longest);
+            }
+        }
+
+        let mut longest = None;
+        visit(&self.children, &mut longest);
+        longest
+    }
+
     /// Returns every image source referenced by the scene, in paint order.
     #[must_use]
     pub fn image_sources(&self) -> Vec<&str> {
@@ -565,4 +594,21 @@ pub enum ScrollDirection {
     InlineStart,
     /// Move toward the right edge.
     InlineEnd,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_scene;
+
+    #[test]
+    fn fixed_animations_define_intrinsic_duration_but_scene_relative_ones_do_not() {
+        let source = "@keyframes fade { from { opacity: 0; } to { opacity: 1; } } \
+            @scene timed { width: 10px; height: 10px; \
+            @group fixed { width: 1px; height: 1px; \
+                mm-scroll-direction: block-start; mm-scroll-duration: 90f; } \
+            @group relative { width: 1px; height: 1px; animation: fade scene linear; } }";
+        let scene = parse_scene(source).expect("valid timed scene");
+
+        assert_eq!(scene.intrinsic_duration_frames(), Some(90));
+    }
 }

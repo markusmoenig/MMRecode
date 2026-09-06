@@ -1,11 +1,15 @@
 //! MPEG audio elementary-stream framing and timing.
 //!
-//! The initial slice parses MPEG-1 Audio Layer II frames for transport pass-through. It does not
-//! decode or encode audio samples.
+//! The crate parses MPEG-1 Audio Layer II frames for transport pass-through and reconstructs a
+//! complete elementary stream to codec-independent signed-16 PCM through Rodio's Rust Symphonia
+//! Layer II backend. Encoding remains outside the current slice.
 
-use std::ops::Range;
+use std::{io::Cursor, ops::Range};
 
-use mmrecode_core::{Error, Result};
+use mmrecode_core::{
+    AudioFrame, AudioSampleFormat, Error, FrameTiming, Rational, Result, Timestamp,
+};
+use rodio::Source as _;
 
 const LAYER2_BIT_RATES_KBIT: [u16; 16] = [
     0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
@@ -113,6 +117,76 @@ pub fn parse_layer2_stream(data: &[u8]) -> Result<Vec<Layer2Frame>> {
     Ok(frames)
 }
 
+/// Decodes one complete MPEG-1 Layer II elementary stream to interleaved signed-16 PCM.
+///
+/// The strict framing pass runs first so format changes, truncation, and unsupported MPEG audio
+/// variants are rejected before reconstruction. The returned frame starts at sample zero and
+/// covers the complete decoded stream.
+///
+/// # Errors
+///
+/// Returns an error for invalid Layer II framing, decoder failure, unsupported channel layouts,
+/// empty output, or sample-count overflow.
+#[allow(clippy::cast_possible_truncation)]
+pub fn decode_layer2_stream(data: &[u8]) -> Result<AudioFrame> {
+    let frames = parse_layer2_stream(data)?;
+    let header = frames
+        .first()
+        .ok_or_else(|| Error::InvalidData("empty MPEG audio elementary stream".into()))?
+        .header;
+    let decoder = rodio::Decoder::builder()
+        .with_data(Cursor::new(data.to_vec()))
+        .with_hint("mp2")
+        .build()
+        .map_err(|error| Error::InvalidData(format!("MPEG Layer II decode failed: {error}")))?;
+    let sample_rate = decoder.sample_rate().get();
+    let channels = decoder.channels().get();
+    if sample_rate != header.sample_rate || channels != u16::from(header.channels) {
+        return Err(Error::InvalidData(
+            "MPEG Layer II decoder format differs from the parsed frame headers".into(),
+        ));
+    }
+    if !matches!(channels, 1 | 2) {
+        return Err(Error::Unsupported(
+            "MPEG Layer II PCM reconstruction supports mono or stereo".into(),
+        ));
+    }
+    let samples = decoder
+        .map(|sample| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        return Err(Error::InvalidData(
+            "MPEG Layer II decoder returned no PCM samples".into(),
+        ));
+    }
+    let samples_per_channel = samples.len() / usize::from(channels);
+    if samples_per_channel * usize::from(channels) != samples.len() {
+        return Err(Error::InvalidData(
+            "MPEG Layer II decoder returned a partial interleaved sample".into(),
+        ));
+    }
+    let time_base = Rational::new(1, i64::from(sample_rate))?;
+    let duration = i64::try_from(samples_per_channel)
+        .map_err(|_| Error::InvalidData("MPEG Layer II PCM duration exceeds i64".into()))?;
+    Ok(AudioFrame {
+        format: AudioSampleFormat::I16Interleaved,
+        sample_rate,
+        channels,
+        samples_per_channel,
+        samples,
+        timing: FrameTiming {
+            pts: Some(Timestamp {
+                value: 0,
+                time_base,
+            }),
+            duration: Some(Timestamp {
+                value: duration,
+                time_base,
+            }),
+        },
+    })
+}
+
 fn parse_layer2_header(data: &[u8], offset: usize) -> Result<Layer2Header> {
     let bits = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     if bits >> 21 != 0x7ff {
@@ -197,6 +271,22 @@ mod tests {
         assert_eq!(frames[0].header.channels, 2);
         assert!(frames.iter().all(|frame| frame.header.frame_length == 576));
         assert_eq!(frames.last().unwrap().source_range.end, MP2.len());
+    }
+
+    #[test]
+    fn decodes_permanent_layer2_vector_to_nonzero_pcm() {
+        let audio = decode_layer2_stream(MP2).unwrap();
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.channels, 2);
+        assert_eq!(audio.samples_per_channel, 20 * 1_152);
+        assert_eq!(audio.samples.len(), 20 * 1_152 * 2);
+        assert!(
+            audio
+                .samples
+                .iter()
+                .any(|sample| sample.unsigned_abs() > 100)
+        );
+        audio.validate().unwrap();
     }
 
     #[test]

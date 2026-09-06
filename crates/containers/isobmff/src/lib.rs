@@ -3,11 +3,11 @@
 //! The first slice reads complete seekable files, discovers tracks, preserves opaque sample-entry
 //! configuration, expands timing/chunk/sample tables, and emits packets without interpreting codec
 //! syntax. Fragmented movies remain outside this milestone; a deliberately small single-video-
-//! track muxer supports packet-preserving H.264 remuxing.
+//! track muxer supports packet-preserving H.264/AAC Fast Start output.
 
 mod mux;
 
-pub use mux::mux_video_track;
+pub use mux::{TrackMuxEdit, TrackMuxInput, mux_tracks, mux_video_track};
 
 use std::{cmp::Ordering, ops::Range};
 
@@ -180,6 +180,14 @@ impl IsoBmffFile {
         self.tracks
             .iter()
             .find(|track| track.descriptor.codec.codec_id.as_str() == "video/h264")
+    }
+
+    /// Returns the first AAC audio track.
+    #[must_use]
+    pub fn aac_track(&self) -> Option<&Track> {
+        self.tracks
+            .iter()
+            .find(|track| track.descriptor.codec.codec_id.as_str() == "audio/aac")
     }
 
     /// Returns the source bytes for one indexed sample.

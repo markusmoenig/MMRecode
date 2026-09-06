@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 mmrecode-core.workspace = true
+rodio = { version = "=0.22.2", default-features = false, features = ["symphonia-mp2"] }
 
 [lints]
 workspace = true

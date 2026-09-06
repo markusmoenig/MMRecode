@@ -16,7 +16,19 @@ Install the current release from crates.io:
 cargo install mmrecode
 ```
 
-After installation, the `mmrecode` command is available from your Cargo binary directory.
+After installation, the `mmrecode` command is available from your Cargo binary directory. The
+default build enables wgpu composition and automatically falls back to the CPU compositor when no
+compatible adapter is available.
+
+For a deliberately CPU-only compatibility build:
+
+```bash
+cargo install mmrecode --no-default-features
+```
+
+The default GPU path uses a three-slot asynchronous wgpu readback ring for video-plus-MMFX monitor
+frames. Scene evaluation, decoded-frame conversion, and final terminal transfer are still CPU
+operations.
 
 ```bash
 mmrecode --help
@@ -69,13 +81,24 @@ Untitled > save as MyFilm
 
 Use `help` for the concise vocabulary and `man <command>` for detailed command help.
 
+Press `Tab` until the timeline is focused, then use `Space` to play or pause the complete
+project. One project clock crosses sequential MPEG-2/H.264 clips, black gaps, and MMFX scenes.
+Opened clip decoders are reused and the next cut is pre-rolled so playback does not synchronously
+reopen media at each edit. The clock and keyboard remain responsive when rendering is late: preview
+work drops obsolete images instead of slowing time. The monitor title reports measured view/decode
+frame rates and conversion/send latency. Terminal images use a bounded proxy—up to 960×540 with
+Kitty and 800×450 with fallback protocols—while export always uses the project’s full resolution.
+Kitty sessions use the compatible temporary-file transfer path by default. Experimental POSIX
+shared-memory transfer can be enabled with `MMRECODE_KITTY_SHM=1` for protocol testing, but should
+not be used as the normal editor path until capability negotiation is implemented.
+
 ## Preview supported media
 
 ```bash
 mmrecode preview input.ts
 ```
 
-Terminal preview selects Kitty graphics, Sixel, iTerm2 images, or a portable 24-bit half-block renderer according to terminal capability.
+Terminal preview selects Kitty graphics, Sixel, iTerm2 images, or a portable 24-bit half-block renderer according to terminal capability. The monitor reports the selected delivery protocol.
 
 ## Render an MMFX scene
 

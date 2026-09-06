@@ -14,6 +14,7 @@ mpeg2 = ["dep:mmrecode-mpeg2"]
 mpegts = ["mpeg2", "dep:mmrecode-mpegaudio", "dep:mmrecode-mpegts"]
 h264 = ["dep:mmrecode-h264", "dep:mmrecode-isobmff"]
 mmfx = ["dep:mmrecode-mmfx"]
+wgpu = ["dep:wgpu"]
 
 [dependencies]
 image.workspace = true
@@ -25,6 +26,7 @@ mmrecode-mpegaudio = { workspace = true, optional = true }
 mmrecode-mpeg2 = { workspace = true, optional = true }
 mmrecode-mpegts = { workspace = true, optional = true }
 mmrecode-mmfx = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
 mmrecode-dv.workspace = true
@@ -32,6 +34,7 @@ mmrecode-mjpeg.workspace = true
 mmrecode-mpegaudio.workspace = true
 mmrecode-mpeg2.workspace = true
 mmrecode-mpegts.workspace = true
+pollster.workspace = true
 
 [lints]
 workspace = true

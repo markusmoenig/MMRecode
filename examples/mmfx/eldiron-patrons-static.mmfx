@@ -1,0 +1,258 @@
+/* Eldiron static patron card. Active Patreon snapshot: 2026-09-06. */
+@scene eldiron-patrons-static {
+    width: 960px;
+    height: 540px;
+    background: #071016f2;
+
+    @font Inter {
+        src: "builtin:inter";
+    }
+
+    @rect frame-outer {
+        position: absolute;
+        left: 22px;
+        top: 22px;
+        width: 916px;
+        height: 496px;
+        background: #b48745;
+    }
+
+    @rect frame-inner {
+        position: absolute;
+        left: 26px;
+        top: 26px;
+        width: 908px;
+        height: 488px;
+        background: #0b1720;
+    }
+
+    @text label {
+        position: absolute;
+        left: 48px;
+        top: 40px;
+        width: auto;
+        height: auto;
+        content: "ELDIRON  //  PATRON GUILD";
+        font-family: Inter;
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1;
+        color: #d8ad59;
+        white-space: nowrap;
+    }
+
+    @text edition {
+        position: absolute;
+        right: 48px;
+        top: 40px;
+        width: auto;
+        height: auto;
+        content: "HALL OF HEROES";
+        font-family: Inter;
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1;
+        text-align: end;
+        color: #769b78;
+        white-space: nowrap;
+    }
+
+    @rect header-rule {
+        position: absolute;
+        left: 48px;
+        top: 67px;
+        width: 864px;
+        height: 2px;
+        background: #5e6e4d;
+    }
+
+    @text title {
+        position: absolute;
+        left: 80px;
+        top: 91px;
+        width: 800px;
+        height: auto;
+        content: "THANK YOU, ADVENTURERS";
+        font-family: Inter;
+        font-size: 36px;
+        font-weight: 700;
+        line-height: 1.1;
+        text-align: center;
+        color: #ead9ae;
+        white-space: nowrap;
+    }
+
+    @text subtitle {
+        position: absolute;
+        left: 80px;
+        top: 137px;
+        width: 800px;
+        height: auto;
+        content: "YOUR SUPPORT HELPS BUILD THE WORLD OF ELDIRON";
+        font-family: Inter;
+        font-size: 15px;
+        font-weight: 600;
+        line-height: 1;
+        text-align: center;
+        color: #78939a;
+        white-space: nowrap;
+    }
+
+    @group tiers {
+        position: absolute;
+        display: row;
+        left: 48px;
+        top: 185px;
+        width: 864px;
+        height: 242px;
+        gap: 12px;
+
+        @group dragon-slayers {
+            display: column;
+            width: 280px;
+            height: 242px;
+            padding: 20px;
+            gap: 18px;
+            align-items: center;
+            background: #111e27;
+
+            @rect accent {
+                width: 100%;
+                height: 4px;
+                background: #d36b55;
+            }
+
+            @text tier {
+                width: 100%;
+                height: auto;
+                content: "DRAGON SLAYERS";
+                font-family: Inter;
+                font-size: 16px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #d36b55;
+                white-space: nowrap;
+            }
+
+            @text names {
+                width: 100%;
+                height: auto;
+                content: "Scott Hamill\nMike Plaza";
+                font-family: Inter;
+                font-size: 23px;
+                font-weight: 650;
+                line-height: 1.6;
+                text-align: center;
+                color: #ead9ae;
+            }
+        }
+
+        @group adventurers {
+            display: column;
+            width: 280px;
+            height: 242px;
+            padding: 20px;
+            gap: 18px;
+            align-items: center;
+            background: #111e27;
+
+            @rect accent {
+                width: 100%;
+                height: 4px;
+                background: #d8ad59;
+            }
+
+            @text tier {
+                width: 100%;
+                height: auto;
+                content: "ADVENTURERS";
+                font-family: Inter;
+                font-size: 16px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #d8ad59;
+                white-space: nowrap;
+            }
+
+            @text names {
+                width: 100%;
+                height: auto;
+                content: "Fnurrpants\nCharleston Marks\nElias\nThomas Osborne";
+                font-family: Inter;
+                font-size: 20px;
+                font-weight: 650;
+                line-height: 1.45;
+                text-align: center;
+                color: #ead9ae;
+            }
+        }
+
+        @group farmers {
+            display: column;
+            width: 280px;
+            height: 242px;
+            padding: 20px;
+            gap: 18px;
+            align-items: center;
+            background: #111e27;
+
+            @rect accent {
+                width: 100%;
+                height: 4px;
+                background: #769b78;
+            }
+
+            @text tier {
+                width: 100%;
+                height: auto;
+                content: "FARMERS";
+                font-family: Inter;
+                font-size: 16px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #769b78;
+                white-space: nowrap;
+            }
+
+            @text names {
+                width: 100%;
+                height: auto;
+                content: "Jonathan Pickett\nTom Carlson\nR Isted";
+                font-family: Inter;
+                font-size: 21px;
+                font-weight: 650;
+                line-height: 1.55;
+                text-align: center;
+                color: #ead9ae;
+            }
+        }
+    }
+
+    @rect footer-rule {
+        position: absolute;
+        left: 48px;
+        bottom: 78px;
+        width: 864px;
+        height: 2px;
+        background: #5e6e4d;
+    }
+
+    @text footer {
+        position: absolute;
+        left: 48px;
+        bottom: 44px;
+        width: 864px;
+        height: auto;
+        content: "THE REALM GROWS WITH YOU  //  ELDIRON.COM";
+        font-family: Inter;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1;
+        text-align: center;
+        color: #d8ad59;
+        white-space: nowrap;
+    }
+}

@@ -46,7 +46,10 @@ Unknown declarations are errors. A misspelling should produce a source-spanned d
 
 ## CPU execution defines correctness
 
-Scene evaluation, layout, text shaping, and the scalar reference renderer run on the CPU. Tiled/SIMD CPU execution and WGSL/wgpu preview are future accelerators consuming the same typed intermediate representation; they do not define separate effect semantics.
+Scene evaluation, layout, text shaping, and the scalar reference renderer run on the CPU. The first
+optional wgpu project compositor already consumes the outer backend-neutral graph for RGBA
+overlays. Tiled/SIMD scene execution and broader WGSL/wgpu preview are accelerators consuming the
+same typed intermediate representations; they do not define separate effect semantics.
 
 General composition uses linear-light, premultiplied alpha. Codec YUV is converted at the render boundary and converted back only for delivery.
 
@@ -65,7 +68,11 @@ The `mmrecode-mmfx` crate currently provides:
 - Parley text shaping and layout;
 - Swash/Zeno glyph coverage and antialiasing;
 - explicit font resources with no silent system-font fallback; and
-- a linear-premultiplied scalar CPU renderer.
+- a linear-premultiplied scalar CPU renderer;
+- backend-neutral scene and project composition graphs; and
+- stable frame-resource identities with a bounded, backend-owned device cache policy; and
+- a cached wgpu backend for positioned RGBA project composition, enabled by default in the terminal
+  application with a non-blocking monitor readback ring and CPU fallback.
 
 The terminal editor creates declarative content with `add scene`, edits embedded source, or links an
 external `.mmfx` module with a persisted last-valid cache. Linked files are polled and debounced;
@@ -80,7 +87,9 @@ evaluation is used for nested timeline preview and MPEG-2/TS project export.
 
 ## What comes next
 
-Media slots, fallback fonts, richer animation controls, named reusable styles, Kernel IR, transitions, optimized CPU/GPU backends, and the plugin boundary are not implemented yet.
+Media slots, fallback fonts, richer animation controls, named reusable styles, Kernel IR,
+transitions, GPU scene rendering, GPU scaling/color conversion, direct native-surface delivery,
+optimized CPU execution, and the plugin boundary are not implemented yet.
 
 See the executable [Scene 0.4 reference](../mmfx/scene-language.md) and [inline, rendered examples](../mmfx/examples.md).
 

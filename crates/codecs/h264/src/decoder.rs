@@ -4585,46 +4585,46 @@ const CABAC_P_CHROMA_AC_ABS_INIT: [[(i8, i8); 10]; 3] = [
     ],
 ];
 
-struct CabacPContexts {
-    skip: [ContextState; 3],
-    macroblock_type: [ContextState; 7],
-    sub_macroblock_type: [ContextState; 3],
-    reference_index: [ContextState; 6],
-    motion_x: [ContextState; 7],
-    motion_y: [ContextState; 7],
-    coded_block_pattern_luma: [ContextState; 4],
-    coded_block_pattern_chroma: [ContextState; 8],
-    macroblock_qp_delta: [ContextState; 4],
-    luma_coded_block: [ContextState; 4],
-    chroma_dc_coded_block: [ContextState; 4],
-    chroma_ac_coded_block: [ContextState; 4],
-    luma_significant: [ContextState; 15],
-    luma_last: [ContextState; 15],
-    luma_abs_level: [ContextState; 10],
-    chroma_dc_significant: [ContextState; 4],
-    chroma_dc_last: [ContextState; 4],
-    chroma_dc_abs_level: [ContextState; 10],
-    chroma_ac_significant: [ContextState; 14],
-    chroma_ac_last: [ContextState; 14],
-    chroma_ac_abs_level: [ContextState; 10],
-    chroma_prediction_mode: [ContextState; 4],
-    intra4_prediction_mode: [ContextState; 2],
-    luma_dc_coded_block: [ContextState; 4],
-    luma_ac_coded_block: [ContextState; 4],
-    luma_dc_significant: [ContextState; 15],
-    luma_dc_last: [ContextState; 15],
-    luma_dc_abs_level: [ContextState; 10],
-    luma_ac_significant: [ContextState; 14],
-    luma_ac_last: [ContextState; 14],
-    luma_ac_abs_level: [ContextState; 10],
-    transform_size_8x8: [ContextState; 3],
-    luma_8x8_significant: [ContextState; 15],
-    luma_8x8_last: [ContextState; 9],
-    luma_8x8_abs_level: [ContextState; 10],
+pub(crate) struct CabacPContexts {
+    pub(crate) skip: [ContextState; 3],
+    pub(crate) macroblock_type: [ContextState; 7],
+    pub(crate) sub_macroblock_type: [ContextState; 3],
+    pub(crate) reference_index: [ContextState; 6],
+    pub(crate) motion_x: [ContextState; 7],
+    pub(crate) motion_y: [ContextState; 7],
+    pub(crate) coded_block_pattern_luma: [ContextState; 4],
+    pub(crate) coded_block_pattern_chroma: [ContextState; 8],
+    pub(crate) macroblock_qp_delta: [ContextState; 4],
+    pub(crate) luma_coded_block: [ContextState; 4],
+    pub(crate) chroma_dc_coded_block: [ContextState; 4],
+    pub(crate) chroma_ac_coded_block: [ContextState; 4],
+    pub(crate) luma_significant: [ContextState; 15],
+    pub(crate) luma_last: [ContextState; 15],
+    pub(crate) luma_abs_level: [ContextState; 10],
+    pub(crate) chroma_dc_significant: [ContextState; 4],
+    pub(crate) chroma_dc_last: [ContextState; 4],
+    pub(crate) chroma_dc_abs_level: [ContextState; 10],
+    pub(crate) chroma_ac_significant: [ContextState; 14],
+    pub(crate) chroma_ac_last: [ContextState; 14],
+    pub(crate) chroma_ac_abs_level: [ContextState; 10],
+    pub(crate) chroma_prediction_mode: [ContextState; 4],
+    pub(crate) intra4_prediction_mode: [ContextState; 2],
+    pub(crate) luma_dc_coded_block: [ContextState; 4],
+    pub(crate) luma_ac_coded_block: [ContextState; 4],
+    pub(crate) luma_dc_significant: [ContextState; 15],
+    pub(crate) luma_dc_last: [ContextState; 15],
+    pub(crate) luma_dc_abs_level: [ContextState; 10],
+    pub(crate) luma_ac_significant: [ContextState; 14],
+    pub(crate) luma_ac_last: [ContextState; 14],
+    pub(crate) luma_ac_abs_level: [ContextState; 10],
+    pub(crate) transform_size_8x8: [ContextState; 3],
+    pub(crate) luma_8x8_significant: [ContextState; 15],
+    pub(crate) luma_8x8_last: [ContextState; 9],
+    pub(crate) luma_8x8_abs_level: [ContextState; 10],
 }
 
 impl CabacPContexts {
-    fn new(slice_qp_y: i32, cabac_init_idc: u32) -> Result<Self> {
+    pub(crate) fn new(slice_qp_y: i32, cabac_init_idc: u32) -> Result<Self> {
         let index = usize::try_from(cabac_init_idc).expect("CABAC initialization idc fits usize");
         if index >= CABAC_P_SKIP_INIT.len() {
             return Err(Error::InvalidData("invalid H.264 cabac_init_idc".into()));
@@ -4693,15 +4693,15 @@ impl CabacPContexts {
     }
 }
 
-struct CabacBContexts {
-    skip: [ContextState; 3],
-    macroblock_type: [ContextState; 9],
-    sub_macroblock_type: [ContextState; 4],
-    inter: CabacPContexts,
+pub(crate) struct CabacBContexts {
+    pub(crate) skip: [ContextState; 3],
+    pub(crate) macroblock_type: [ContextState; 9],
+    pub(crate) sub_macroblock_type: [ContextState; 4],
+    pub(crate) inter: CabacPContexts,
 }
 
 impl CabacBContexts {
-    fn new(slice_qp_y: i32, cabac_init_idc: u32) -> Result<Self> {
+    pub(crate) fn new(slice_qp_y: i32, cabac_init_idc: u32) -> Result<Self> {
         let index = usize::try_from(cabac_init_idc).expect("CABAC initialization idc fits usize");
         if index >= CABAC_B_SKIP_INIT.len() {
             return Err(Error::InvalidData("invalid H.264 cabac_init_idc".into()));
@@ -4964,7 +4964,7 @@ fn decode_cabac_b_macroblocks(
     )))
 }
 
-fn decode_cabac_b_macroblock_type(
+pub(crate) fn decode_cabac_b_macroblock_type(
     decoder: &mut CabacDecoder<'_, '_>,
     contexts: &mut [ContextState; 9],
     context_increment: usize,
@@ -5009,7 +5009,7 @@ fn decode_cabac_b_intra_macroblock_type(
     Ok(macroblock_type)
 }
 
-fn decode_cabac_b_sub_macroblock_type(
+pub(crate) fn decode_cabac_b_sub_macroblock_type(
     decoder: &mut CabacDecoder<'_, '_>,
     contexts: &mut [ContextState; 4],
 ) -> Result<u32> {
@@ -6931,10 +6931,10 @@ pub(crate) struct CabacIContexts {
     pub(crate) macroblock_type: [ContextState; 11],
     pub(crate) macroblock_qp_delta: [ContextState; 4],
     pub(crate) chroma_prediction_mode: [ContextState; 4],
-    intra4_prediction_mode: [ContextState; 2],
-    transform_size_8x8: [ContextState; 3],
-    coded_block_pattern_luma: [ContextState; 4],
-    coded_block_pattern_chroma: [ContextState; 8],
+    pub(crate) intra4_prediction_mode: [ContextState; 2],
+    pub(crate) transform_size_8x8: [ContextState; 3],
+    pub(crate) coded_block_pattern_luma: [ContextState; 4],
+    pub(crate) coded_block_pattern_chroma: [ContextState; 8],
     pub(crate) luma_dc_coded_block: [ContextState; 4],
     pub(crate) chroma_dc_coded_block: [ContextState; 4],
     pub(crate) luma_ac_coded_block: [ContextState; 4],
@@ -6951,13 +6951,13 @@ pub(crate) struct CabacIContexts {
     pub(crate) chroma_ac_significant: [ContextState; 14],
     pub(crate) chroma_ac_last: [ContextState; 14],
     pub(crate) chroma_ac_abs_level: [ContextState; 10],
-    luma_4x4_coded_block: [ContextState; 4],
-    luma_4x4_significant: [ContextState; 15],
-    luma_4x4_last: [ContextState; 15],
-    luma_4x4_abs_level: [ContextState; 10],
-    luma_8x8_significant: [ContextState; 15],
-    luma_8x8_last: [ContextState; 9],
-    luma_8x8_abs_level: [ContextState; 10],
+    pub(crate) luma_4x4_coded_block: [ContextState; 4],
+    pub(crate) luma_4x4_significant: [ContextState; 15],
+    pub(crate) luma_4x4_last: [ContextState; 15],
+    pub(crate) luma_4x4_abs_level: [ContextState; 10],
+    pub(crate) luma_8x8_significant: [ContextState; 15],
+    pub(crate) luma_8x8_last: [ContextState; 9],
+    pub(crate) luma_8x8_abs_level: [ContextState; 10],
 }
 
 impl CabacIContexts {

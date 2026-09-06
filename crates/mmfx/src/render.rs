@@ -3,9 +3,11 @@
 use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
-    AlignItems, AnimationDuration, Color, Display, ImageContent, JustifyContent, Keyframe, Length,
-    Node, NodeKind, ObjectFit, Overflow, Position, Scene, ScrollDirection, Style, TextAlign,
-    TextContent, TextLineHeight, TextWrap, TimingFunction, Transform,
+    AlignItems, AlphaMask, AnimationDuration, Color, Display, DisplayCommand, DisplayList,
+    DrawCommand, ImageContent, JustifyContent, Keyframe, LayerTransform, Length, Node, NodeKind,
+    ObjectFit, Overflow, PixelRect, Position, RenderBackend, RenderGraph, RenderPass, Scene,
+    SceneRect, ScrollDirection, Style, SurfaceId, TextAlign, TextContent, TextLineHeight, TextWrap,
+    TimingFunction, Transform,
 };
 use parley::fontique::{Blob, Collection, CollectionOptions, SourceCache};
 use parley::{
@@ -40,6 +42,22 @@ pub struct RenderError {
     message: String,
 }
 
+impl RenderError {
+    /// Construct a rendering failure from a backend or host diagnostic.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Human-readable diagnostic text.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
@@ -60,6 +78,17 @@ struct ImageResource {
     width: u32,
     height: u32,
     rgba: Arc<Vec<u8>>,
+}
+
+/// Borrowed decoded image pixels exposed to render backends.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageResourceView<'a> {
+    /// Image width.
+    pub width: u32,
+    /// Image height.
+    pub height: u32,
+    /// Tightly packed straight-alpha sRGBA8 pixels.
+    pub rgba: &'a [u8],
 }
 
 impl RenderResources {
@@ -114,6 +143,16 @@ impl RenderResources {
             },
         );
         Ok(())
+    }
+
+    /// Access one decoded image by its scene resource name.
+    #[must_use]
+    pub fn image(&self, source: &str) -> Option<ImageResourceView<'_>> {
+        self.images.get(source).map(|image| ImageResourceView {
+            width: image.width,
+            height: image.height,
+            rgba: &image.rgba,
+        })
     }
 }
 
@@ -244,6 +283,26 @@ impl Surface {
     }
 }
 
+/// Deterministic scalar CPU implementation of the MMFX render-graph contract.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScalarCpuBackend;
+
+impl RenderBackend for ScalarCpuBackend {
+    type Output = Surface;
+
+    fn name(&self) -> &'static str {
+        "scalar-cpu"
+    }
+
+    fn execute(
+        &mut self,
+        graph: &RenderGraph,
+        resources: &RenderResources,
+    ) -> Result<Self::Output, RenderError> {
+        execute_scalar_graph(graph, resources)
+    }
+}
+
 /// Render a validated scene using the scalar CPU reference backend.
 ///
 /// Blending occurs in linear light with premultiplied alpha. The returned
@@ -319,26 +378,57 @@ impl PreparedScene {
         &self.scene
     }
 
-    /// Evaluate and render one local frame without reparsing or re-registering resources.
+    /// Evaluate one local frame into backend-neutral semantic paint operations.
+    ///
+    /// Text shaping remains part of scene evaluation. Glyph coverage is retained as immutable
+    /// masks which CPU backends can consume directly and GPU backends can upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when text or image resources cannot be evaluated.
+    pub fn display_list(&mut self, time: SceneTime) -> Result<DisplayList, RenderError> {
+        evaluate_scene(&self.scene, &self.resources, &mut self.state, time)
+    }
+
+    /// Evaluate one local frame and lower it into explicit surfaces and render passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scene evaluation fails.
+    pub fn render_graph(&mut self, time: SceneTime) -> Result<RenderGraph, RenderError> {
+        Ok(self.display_list(time)?.lower())
+    }
+
+    /// Evaluate and render one local frame through an explicit backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from scene evaluation or backend execution.
+    pub fn render_frame_with<B: RenderBackend>(
+        &mut self,
+        time: SceneTime,
+        backend: &mut B,
+    ) -> Result<B::Output, RenderError> {
+        let graph = self.render_graph(time)?;
+        backend.execute(&graph, &self.resources)
+    }
+
+    /// Evaluate and render one local frame with the scalar CPU reference backend.
     ///
     /// # Errors
     ///
     /// Returns an error for an impractically large output or invalid prepared resources.
     pub fn render_frame(&mut self, time: SceneTime) -> Result<Surface, RenderError> {
-        let scene = &self.scene;
-        let mut surface = Surface::transparent(scene.width, scene.height)?;
-        render_scene(scene, &self.resources, &mut self.state, time, &mut surface)?;
-        Ok(surface)
+        self.render_frame_with(time, &mut ScalarCpuBackend)
     }
 }
 
-fn render_scene(
+fn evaluate_scene(
     scene: &Scene,
     resources: &RenderResources,
     state: &mut RenderState,
     time: SceneTime,
-    surface: &mut Surface,
-) -> Result<(), RenderError> {
+) -> Result<DisplayList, RenderError> {
     let viewport = Bounds {
         x: 0.0,
         y: 0.0,
@@ -351,11 +441,17 @@ fn render_scene(
         right: i32::try_from(scene.width).unwrap_or(i32::MAX),
         bottom: i32::try_from(scene.height).unwrap_or(i32::MAX),
     };
-    fill_rounded(surface, viewport, 0.0, scene.background, clip, &[]);
+    let mut commands = vec![DisplayCommand::Draw(DrawCommand::FillRoundedRect {
+        bounds: viewport,
+        radius: 0.0,
+        color: scene.background,
+        clip,
+        coverage_clips: Vec::new(),
+    })];
     let mut coverage_clips = Vec::new();
     for child in &scene.children {
-        draw_node(
-            surface,
+        record_node(
+            &mut commands,
             child,
             viewport,
             None,
@@ -367,7 +463,7 @@ fn render_scene(
             time,
         )?;
     }
-    Ok(())
+    Ok(DisplayList::new(scene.width, scene.height, commands))
 }
 
 struct RenderState {
@@ -432,6 +528,10 @@ struct EvaluatedNode {
     style: Style,
     text_color: Option<Color>,
 }
+
+type Bounds = SceneRect;
+type Clip = PixelRect;
+type CoverageMask = AlphaMask;
 
 fn evaluate_node(node: &Node, scene: &Scene, time: SceneTime) -> EvaluatedNode {
     let mut style = node.style.clone();
@@ -598,8 +698,8 @@ fn lerp(start: f64, end: f64, amount: f64) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_node(
-    target: &mut Surface,
+fn record_node(
+    target: &mut Vec<DisplayCommand>,
     node: &Node,
     parent: Bounds,
     assigned: Option<Bounds>,
@@ -623,26 +723,25 @@ fn draw_node(
     } else {
         inherited_clip
     };
-    let mut layer = Surface::transparent(target.width, target.height)?;
+    let mut layer = Vec::new();
     let radius = node
         .style
         .border_radius
         .resolve_f64(bounds.width.min(bounds.height))
         .max(0.0);
-    fill_rounded(
-        &mut layer,
+    layer.push(DisplayCommand::Draw(DrawCommand::FillRoundedRect {
         bounds,
         radius,
-        evaluated.style.background,
-        inherited_clip,
-        coverage_clips,
-    );
+        color: evaluated.style.background,
+        clip: inherited_clip,
+        coverage_clips: coverage_clips.clone(),
+    }));
     let adds_clip = evaluated.style.overflow == Overflow::Hidden;
     if adds_clip {
         coverage_clips.push(rasterize_rounded_rect(bounds, radius));
     }
     match &node.kind {
-        NodeKind::Text(text) => draw_text(
+        NodeKind::Text(text) => record_text(
             &mut layer,
             text,
             evaluated.text_color.unwrap_or(text.color),
@@ -651,7 +750,7 @@ fn draw_node(
             coverage_clips,
             state,
         )?,
-        NodeKind::Image(image) => draw_image(
+        NodeKind::Image(image) => record_image(
             &mut layer,
             image,
             bounds,
@@ -661,7 +760,7 @@ fn draw_node(
         )?,
         NodeKind::Group | NodeKind::Rect => {}
     }
-    draw_children(
+    record_children(
         &mut layer,
         &node.children,
         bounds,
@@ -676,19 +775,23 @@ fn draw_node(
     if adds_clip {
         coverage_clips.pop();
     }
-    if (evaluated.style.transform.scale_x - 1.0).abs() > f32::EPSILON
-        || (evaluated.style.transform.scale_y - 1.0).abs() > f32::EPSILON
-        || evaluated.style.transform.rotate_degrees.abs() > f32::EPSILON
-    {
-        layer = transform_surface(&layer, bounds, evaluated.style.transform)?;
-    }
-    target.blend_surface(&layer, evaluated.style.opacity, inherited_clip);
+    target.push(DisplayCommand::Layer {
+        bounds,
+        opacity: evaluated.style.opacity,
+        transform: LayerTransform {
+            scale_x: evaluated.style.transform.scale_x,
+            scale_y: evaluated.style.transform.scale_y,
+            rotate_degrees: evaluated.style.transform.rotate_degrees,
+        },
+        clip: inherited_clip,
+        commands: layer,
+    });
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn draw_children(
-    layer: &mut Surface,
+fn record_children(
+    layer: &mut Vec<DisplayCommand>,
     children: &[Node],
     parent: Bounds,
     clip: Clip,
@@ -708,7 +811,7 @@ fn draw_children(
     };
     if parent_style.display == Display::Overlay {
         for child in children {
-            draw_node(
+            record_node(
                 layer,
                 child,
                 content,
@@ -802,7 +905,7 @@ fn draw_children(
                 height: main_size,
             }
         };
-        draw_node(
+        record_node(
             layer,
             child,
             content,
@@ -818,7 +921,7 @@ fn draw_children(
     }
     for child in children {
         if evaluate_node(child, scene, time).style.position == Position::Absolute {
-            draw_node(
+            record_node(
                 layer,
                 child,
                 content,
@@ -1106,6 +1209,175 @@ fn fill_rounded(
     paint_coverage_mask(surface, &shape, color, clip, inherited_coverage_masks);
 }
 
+#[allow(clippy::too_many_lines)]
+fn execute_scalar_graph(
+    graph: &RenderGraph,
+    resources: &RenderResources,
+) -> Result<Surface, RenderError> {
+    let count = usize::try_from(graph.surface_count()).map_err(|_| RenderError {
+        message: "MMFX render graph has too many logical surfaces".into(),
+    })?;
+    if count == 0 || graph.output() != SurfaceId(0) {
+        return Err(RenderError {
+            message: "MMFX render graph has no scalar output surface".into(),
+        });
+    }
+    let mut surfaces = (0..count).map(|_| None).collect::<Vec<Option<Surface>>>();
+    surfaces[0] = Some(Surface::transparent(graph.width(), graph.height())?);
+    let mut remaining_reads = vec![0_usize; count];
+    for pass in graph.passes() {
+        if let RenderPass::Transform { source, .. } | RenderPass::Composite { source, .. } = pass {
+            let source = scalar_surface_index(&surfaces, *source)?;
+            remaining_reads[source] = remaining_reads[source].saturating_add(1);
+        }
+    }
+
+    for pass in graph.passes() {
+        match pass {
+            RenderPass::Draw { target, commands } => {
+                let target = scalar_surface_mut(&mut surfaces, *target, graph)?;
+                for command in commands {
+                    match command {
+                        DrawCommand::FillRoundedRect {
+                            bounds,
+                            radius,
+                            color,
+                            clip,
+                            coverage_clips,
+                        } => fill_rounded(target, *bounds, *radius, *color, *clip, coverage_clips),
+                        DrawCommand::DrawImage {
+                            source,
+                            destination,
+                            clip,
+                            coverage_clips,
+                        } => execute_draw_image(
+                            target,
+                            source,
+                            *destination,
+                            *clip,
+                            coverage_clips,
+                            resources,
+                        )?,
+                        DrawCommand::PaintMask {
+                            mask,
+                            color,
+                            clip,
+                            coverage_clips,
+                        } => paint_coverage_mask(target, mask, *color, *clip, coverage_clips),
+                    }
+                }
+            }
+            RenderPass::Transform {
+                source,
+                target,
+                bounds,
+                transform,
+            } => {
+                let source_index = scalar_surface_index(&surfaces, *source)?;
+                if surfaces[source_index].is_none() {
+                    surfaces[source_index] =
+                        Some(Surface::transparent(graph.width(), graph.height())?);
+                }
+                let transformed = transform_surface(
+                    surfaces[source_index]
+                        .as_ref()
+                        .expect("surface initialized"),
+                    *bounds,
+                    *transform,
+                )?;
+                let target_index = scalar_surface_index(&surfaces, *target)?;
+                surfaces[target_index] = Some(transformed);
+                release_scalar_source(&mut surfaces, &mut remaining_reads, source_index);
+            }
+            RenderPass::Composite {
+                source,
+                target,
+                opacity,
+                clip,
+            } => {
+                let source_index = scalar_surface_index(&surfaces, *source)?;
+                let target_index = scalar_surface_index(&surfaces, *target)?;
+                if source_index == target_index {
+                    return Err(RenderError {
+                        message: "MMFX render graph cannot composite a surface over itself".into(),
+                    });
+                }
+                if surfaces[source_index].is_none() {
+                    surfaces[source_index] =
+                        Some(Surface::transparent(graph.width(), graph.height())?);
+                }
+                if surfaces[target_index].is_none() {
+                    surfaces[target_index] =
+                        Some(Surface::transparent(graph.width(), graph.height())?);
+                }
+                let (source, target) =
+                    scalar_surface_pair(&mut surfaces, source_index, target_index);
+                target.blend_surface(source, *opacity, *clip);
+                release_scalar_source(&mut surfaces, &mut remaining_reads, source_index);
+            }
+        }
+    }
+
+    surfaces[0].take().ok_or_else(|| RenderError {
+        message: "MMFX scalar backend did not produce its output surface".into(),
+    })
+}
+
+fn release_scalar_source(
+    surfaces: &mut [Option<Surface>],
+    remaining_reads: &mut [usize],
+    source: usize,
+) {
+    remaining_reads[source] = remaining_reads[source].saturating_sub(1);
+    if source != 0 && remaining_reads[source] == 0 {
+        surfaces[source] = None;
+    }
+}
+
+fn scalar_surface_index(surfaces: &[Option<Surface>], id: SurfaceId) -> Result<usize, RenderError> {
+    let index = usize::try_from(id.0).map_err(|_| RenderError {
+        message: "MMFX render graph surface identifier exceeds this platform".into(),
+    })?;
+    if index >= surfaces.len() {
+        return Err(RenderError {
+            message: format!("MMFX render graph references unknown surface {}", id.0),
+        });
+    }
+    Ok(index)
+}
+
+fn scalar_surface_mut<'a>(
+    surfaces: &'a mut [Option<Surface>],
+    id: SurfaceId,
+    graph: &RenderGraph,
+) -> Result<&'a mut Surface, RenderError> {
+    let index = scalar_surface_index(surfaces, id)?;
+    if surfaces[index].is_none() {
+        surfaces[index] = Some(Surface::transparent(graph.width(), graph.height())?);
+    }
+    Ok(surfaces[index].as_mut().expect("surface initialized"))
+}
+
+fn scalar_surface_pair(
+    surfaces: &mut [Option<Surface>],
+    source: usize,
+    target: usize,
+) -> (&Surface, &mut Surface) {
+    if source < target {
+        let (left, right) = surfaces.split_at_mut(target);
+        (
+            left[source].as_ref().expect("source initialized"),
+            right[0].as_mut().expect("target initialized"),
+        )
+    } else {
+        let (left, right) = surfaces.split_at_mut(source);
+        (
+            right[0].as_ref().expect("source initialized"),
+            left[target].as_mut().expect("target initialized"),
+        )
+    }
+}
+
 fn paint_coverage_mask(
     surface: &mut Surface,
     shape: &CoverageMask,
@@ -1133,20 +1405,57 @@ fn paint_coverage_mask(
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn draw_image(
+fn execute_draw_image(
     surface: &mut Surface,
+    source: &str,
+    destination: Bounds,
+    clip: Clip,
+    coverage_masks: &[CoverageMask],
+    resources: &RenderResources,
+) -> Result<(), RenderError> {
+    let resource = resources.image(source).ok_or_else(|| RenderError {
+        message: format!("image '{source}' has no prepared pixels"),
+    })?;
+    let surface_width = i32::try_from(surface.width).unwrap_or(i32::MAX);
+    let surface_height = i32::try_from(surface.height).unwrap_or(i32::MAX);
+    for y in clip.top.max(0)..clip.bottom.min(surface_height) {
+        for x in clip.left.max(0)..clip.right.min(surface_width) {
+            let u = (f64::from(x) + 0.5 - destination.x) / destination.width;
+            let v = (f64::from(y) + 0.5 - destination.y) / destination.height;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            let source_x = (u * f64::from(resource.width)).floor() as u32;
+            let source_y = (v * f64::from(resource.height)).floor() as u32;
+            let offset = (source_y as usize * resource.width as usize + source_x as usize) * 4;
+            let rgba = &resource.rgba[offset..offset + 4];
+            let mut opacity = u16::MAX;
+            for coverage in coverage_masks {
+                opacity = multiply_channel(opacity, u16::from(coverage.coverage_at(x, y)) * 257);
+            }
+            if opacity == 0 {
+                continue;
+            }
+            let source = LinearPixel::from_rgba(rgba);
+            let index = surface.index(x, y);
+            surface.pixels[index] = source.over(surface.pixels[index], opacity);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn record_image(
+    commands: &mut Vec<DisplayCommand>,
     image: &ImageContent,
     bounds: Bounds,
     clip: Clip,
     coverage_masks: &[CoverageMask],
     resources: &RenderResources,
 ) -> Result<(), RenderError> {
-    let resource = resources
-        .images
-        .get(&image.source)
-        .ok_or_else(|| RenderError {
-            message: format!("image '{}' has no prepared pixels", image.source),
-        })?;
+    let resource = resources.image(&image.source).ok_or_else(|| RenderError {
+        message: format!("image '{}' has no prepared pixels", image.source),
+    })?;
     if bounds.width <= 0.0 || bounds.height <= 0.0 {
         return Ok(());
     }
@@ -1172,38 +1481,19 @@ fn draw_image(
     let paint_clip = clip
         .intersect(Clip::from_bounds(destination))
         .intersect(Clip::from_bounds(bounds));
-    let surface_width = i32::try_from(surface.width).unwrap_or(i32::MAX);
-    let surface_height = i32::try_from(surface.height).unwrap_or(i32::MAX);
-    for y in paint_clip.top.max(0)..paint_clip.bottom.min(surface_height) {
-        for x in paint_clip.left.max(0)..paint_clip.right.min(surface_width) {
-            let u = (f64::from(x) + 0.5 - destination.x) / destination.width;
-            let v = (f64::from(y) + 0.5 - destination.y) / destination.height;
-            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-                continue;
-            }
-            let source_x = (u * f64::from(resource.width)).floor() as u32;
-            let source_y = (v * f64::from(resource.height)).floor() as u32;
-            let offset = (source_y as usize * resource.width as usize + source_x as usize) * 4;
-            let rgba = &resource.rgba[offset..offset + 4];
-            let mut opacity = u16::MAX;
-            for coverage in coverage_masks {
-                opacity = multiply_channel(opacity, u16::from(coverage.coverage_at(x, y)) * 257);
-            }
-            if opacity == 0 {
-                continue;
-            }
-            let source = LinearPixel::from_rgba(rgba);
-            let index = surface.index(x, y);
-            surface.pixels[index] = source.over(surface.pixels[index], opacity);
-        }
-    }
+    commands.push(DisplayCommand::Draw(DrawCommand::DrawImage {
+        source: image.source.clone(),
+        destination,
+        clip: paint_clip,
+        coverage_clips: coverage_masks.to_vec(),
+    }));
     Ok(())
 }
 
 fn transform_surface(
     source: &Surface,
     bounds: Bounds,
-    transform: Transform,
+    transform: LayerTransform,
 ) -> Result<Surface, RenderError> {
     let mut output = Surface::transparent(source.width, source.height)?;
     if transform.scale_x <= f32::EPSILON || transform.scale_y <= f32::EPSILON {
@@ -1287,8 +1577,8 @@ fn sample_surface(surface: &Surface, x: f64, y: f64) -> LinearPixel {
     LinearPixel::lerp(top, bottom, fy)
 }
 
-fn draw_text(
-    surface: &mut Surface,
+fn record_text(
+    commands: &mut Vec<DisplayCommand>,
     text: &TextContent,
     color: Color,
     bounds: Bounds,
@@ -1301,8 +1591,8 @@ fn draw_text(
     for line in layout.lines() {
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                draw_glyph_run(
-                    surface,
+                record_glyph_run(
+                    commands,
                     &glyph_run,
                     bounds,
                     clip,
@@ -1351,8 +1641,8 @@ fn build_text_layout(
     layout
 }
 
-fn draw_glyph_run(
-    surface: &mut Surface,
+fn record_glyph_run(
+    commands: &mut Vec<DisplayCommand>,
     glyph_run: &parley::GlyphRun<'_, Color>,
     bounds: Bounds,
     clip: Clip,
@@ -1397,16 +1687,18 @@ fn draw_glyph_run(
             width: image.placement.width,
             height: image.placement.height,
         };
-        paint_coverage_mask(
-            surface,
-            &CoverageMask {
-                pixels: image.data,
-                placement,
+        commands.push(DisplayCommand::Draw(DrawCommand::PaintMask {
+            mask: CoverageMask {
+                left: placement.left,
+                top: placement.top,
+                width: placement.width,
+                height: placement.height,
+                pixels: image.data.into(),
             },
-            glyph_run.style().brush,
+            color: glyph_run.style().brush,
             clip,
-            coverage_masks,
-        );
+            coverage_clips: coverage_masks.to_vec(),
+        }));
     }
     Ok(())
 }
@@ -1425,7 +1717,13 @@ fn rasterize_rounded_rect(bounds: Bounds, radius: f64) -> CoverageMask {
     );
     path.add_round_rect([x, y], width, height, radius, radius);
     let (pixels, placement) = Mask::new(&path).render();
-    CoverageMask { pixels, placement }
+    CoverageMask {
+        left: placement.left,
+        top: placement.top,
+        width: placement.width,
+        height: placement.height,
+        pixels: pixels.into(),
+    }
 }
 
 fn multiply_coverage(left: u8, right: u8) -> u8 {
@@ -1438,57 +1736,6 @@ fn f64_to_f32(value: f64) -> f32 {
     value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Bounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-#[derive(Clone, Debug)]
-struct CoverageMask {
-    pixels: Vec<u8>,
-    placement: Placement,
-}
-
-impl CoverageMask {
-    fn coverage_at(&self, x: i32, y: i32) -> u8 {
-        let local_x = i64::from(x) - i64::from(self.placement.left);
-        let local_y = i64::from(y) - i64::from(self.placement.top);
-        if local_x < 0
-            || local_y < 0
-            || local_x >= i64::from(self.placement.width)
-            || local_y >= i64::from(self.placement.height)
-        {
-            return 0;
-        }
-        let index = usize::try_from(local_y).expect("non-negative mask y")
-            * usize::try_from(self.placement.width).expect("mask width")
-            + usize::try_from(local_x).expect("non-negative mask x");
-        self.pixels.get(index).copied().unwrap_or(0)
-    }
-
-    fn clip(&self) -> Clip {
-        let right = i64::from(self.placement.left) + i64::from(self.placement.width);
-        let bottom = i64::from(self.placement.top) + i64::from(self.placement.height);
-        Clip {
-            left: self.placement.left,
-            top: self.placement.top,
-            right: i32::try_from(right).unwrap_or(i32::MAX),
-            bottom: i32::try_from(bottom).unwrap_or(i32::MAX),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Clip {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
 impl Clip {
     fn from_bounds(bounds: Bounds) -> Self {
         Self {
@@ -1496,15 +1743,6 @@ impl Clip {
             top: floor_to_i32(bounds.y),
             right: ceil_to_i32(bounds.x + bounds.width),
             bottom: ceil_to_i32(bounds.y + bounds.height),
-        }
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        Self {
-            left: self.left.max(other.left),
-            top: self.top.max(other.top),
-            right: self.right.min(other.right),
-            bottom: self.bottom.min(other.bottom),
         }
     }
 }
@@ -1645,7 +1883,8 @@ fn linear_u16_to_srgb(value: u16) -> u8 {
 mod tests {
     use super::{Bounds, RenderState, measure_node};
     use crate::{
-        RenderResources, SceneTime, parse_scene, prepare_scene, render, render_with_resources,
+        DisplayCommand, RenderBackend, RenderGraph, RenderPass, RenderResources, SceneTime,
+        parse_scene, prepare_scene, render, render_with_resources,
     };
 
     fn inter_resources() -> RenderResources {
@@ -1655,6 +1894,58 @@ mod tests {
             include_bytes!("../../../assets/fonts/Inter.ttf").to_vec(),
         );
         resources
+    }
+
+    #[derive(Default)]
+    struct GraphProbe;
+
+    impl RenderBackend for GraphProbe {
+        type Output = (u32, u32, usize);
+
+        fn name(&self) -> &'static str {
+            "graph-probe"
+        }
+
+        fn execute(
+            &mut self,
+            graph: &RenderGraph,
+            _resources: &RenderResources,
+        ) -> Result<Self::Output, super::RenderError> {
+            Ok((graph.width(), graph.height(), graph.passes().len()))
+        }
+    }
+
+    #[test]
+    fn prepared_scene_exposes_display_list_graph_and_backend_boundary() {
+        let scene = parse_scene(
+            "@scene x { width: 8px; height: 4px; background: #000; \
+             @rect card { left: 1px; width: 4px; height: 2px; background: #fff; } }",
+        )
+        .expect("valid scene");
+        let mut prepared = prepare_scene(&scene, &RenderResources::new()).expect("prepared scene");
+        let list = prepared
+            .display_list(SceneTime::default())
+            .expect("display list");
+        assert_eq!((list.width(), list.height()), (8, 4));
+        assert!(matches!(list.commands()[0], DisplayCommand::Draw(_)));
+        assert!(matches!(list.commands()[1], DisplayCommand::Layer { .. }));
+
+        let graph = list.lower();
+        assert_eq!((graph.width(), graph.height()), (8, 4));
+        assert!(graph.surface_count() >= 2);
+        assert!(
+            graph
+                .passes()
+                .iter()
+                .any(|pass| matches!(pass, RenderPass::Composite { .. }))
+        );
+
+        let output = prepared
+            .render_frame_with(SceneTime::default(), &mut GraphProbe)
+            .expect("custom backend");
+        assert_eq!(output.0, 8);
+        assert_eq!(output.1, 4);
+        assert!(output.2 >= 3);
     }
 
     #[test]

@@ -11,10 +11,11 @@ roadmap does not turn every possible feature into an immediate commitment.
 
 ## Suggested next milestones
 
-**Current codec path:** Validate representative iPhone/YouTube AAC-LC files, then add bounded audio
-buffering/seek preroll. Uncommon 960-sample, multichannel, and HE-AAC variants remain explicit
-fallback cases rather than native implementation targets. Strengthen H.264 arbitrary-cut dependency
-planning before starting a native edit-boundary encoder.
+**Current delivery path:** The YouTube 1080p/2160p presets decode and timeline-map MPEG-TS Layer II
+or MP4/MOV AAC, mix/resample to 48 kHz stereo, and write interleaved H.264/AAC Fast Start MP4;
+sources without audio contribute silence. Next improve
+AAC quality with band-adaptive psychoacoustics and short blocks. Uncommon 960-sample, multichannel,
+and HE-AAC variants remain explicit fallback cases.
 
 1. Add media fingerprints, relinking, and collect/portable-copy behavior to the new versioned
    project document, then extend recursive timeline export beyond MPEG-2/MMFX into audio and later
@@ -176,7 +177,11 @@ fallback under the iPhone/YouTube-focused scope.
   preroll for long media.
 - [ ] Add browser audio-device output while preserving cooperative baseline WebAssembly decode.
 - [ ] Add implicit/explicit SBR and Parametric Stereo only if the retained target corpus requires it.
-- [ ] Add AAC encoding and ISO-BMFF audio muxing after decode and edit-boundary behavior stabilize.
+- [x] Establish `AudioEncoder`; add native sine long-window MDCT, uniform quantization,
+  escape-codebook Huffman emission, packet-budget rate selection, nonzero mono/stereo round trips,
+  explicit 1024-sample priming/tail handling, and timestamp-interleaved `mp4a`/`esds` muxing.
+- [ ] Add short-window transient decisions, band-specific scalefactors and nonzero codebook
+  selection, and a masking-based psychoacoustic model for production AAC quality.
 
 ## MPEG-2 Transport Stream
 
@@ -248,12 +253,29 @@ policy to complete Layer II frames. Broader sample-domain audio editing remains 
   bounded Main@Main/Main@High encoding, MPEG-TS delivery, and explainable `export plan` output.
 - [x] Render every root MPEG-2 placement independently of the current navigation context,
   including sequential cuts, trims, project positions, black gaps, and opaque composition order.
+- [x] Add `youtube-1080p` and `youtube-2160p` upload delivery: native High Profile
+  H.264/CABAC, two B-frames, two references, half-second closed GOPs, resolution/frame-rate VBR
+  tiers, limited-range BT.709 VUI/`nclx`, and an interleaved Fast Start MP4 with exact-duration
+  native AAC-LC 48 kHz stereo at a 384 kbps target. Infer the preset from `.mp4` plus project
+  resolution.
+- [x] Add codec-independent decoded-PCM placement, overlap mixing, linear resampling, mono/stereo
+  mapping, gain, one-time output saturation, and exact output-sample duration.
+- [x] Decode MPEG-TS Layer II and MP4/MOV AAC carried beside H.264, map source trims and A/V
+  origins into timeline placements, mix/resample overlaps, and preserve synchronized project audio
+  in YouTube delivery; sources without audio contribute silence.
+- [x] Put container/codec-specific audio ingestion behind one playback-source boundary that yields
+  timed PCM; keep timeline placement, mixing, and delivery encoding independent of source format.
 - [ ] Compile nested media/effect content recursively into the flattened render intent, including
   alpha-aware composition rather than the current opaque-video ordering.
 - [x] Prove capability-selected Kitty, Sixel, iTerm2, and 24-bit half-block terminal preview with
   real asynchronous MPEG-2 ES/TS and H.264 MP4/MOV playback, stepping, seeking, looping, and bounded buffering.
 - [x] Add a double-buffered direct Kitty playback path for flicker-free local terminal
   video in Kitty-compatible terminals such as Ghostty.
+- [x] Move editor transport to the project clock: play sequential MPEG-2/H.264 placements, black
+  gaps, and scene-only timelines; reuse opened decoder caches, pre-roll the next cut, drop late
+  display frames, and evaluate recursively placed MMFX at project time.
+- [ ] Composite simultaneous overlapping video sources during preview and mix/resample
+  placement-aware audio; current overlap preview selects the topmost opaque video placement.
 - [x] Make `mmrecode` / `mmrecode edit` a full-screen editor shell even with no source loaded, then
   populate its monitor in place when `import` resolves media.
 - [x] Add a compact monitor/context/timeline layout with a time ruler, visible trim range,
@@ -343,6 +365,27 @@ versioned semantic values rather than internal Rust objects.
   coordinate, edge, precision, and time semantics.
 - [x] Implement the first scalar CPU reference backend with deterministic parser, layout,
   compositing, clipping, and pixel tests.
+- [x] Split per-frame scene evaluation from execution with a public backend-neutral display list,
+  explicit logical-surface render graph, immutable uploadable masks/resources, and a scalar backend
+  implementation that preserves the reference pixel tests and releases transient graph surfaces.
+- [x] Extend render graphs across decoded-video targets, MMFX placements, cached color conversion,
+  and preview/encoder delivery; define backend-independent CPU/device frame handles and structured,
+  deterministic resource residency keys, then route RGBA preview and YUV export composition through
+  the graph-backed CPU path.
+- [x] Define a public project `FrameResourceProvider` and `CompositionBackend`; route existing RGBA
+  preview and direct YUV export through the standalone CPU executor without exposing cache internals.
+- [x] Move decoded YUV fit/fill/stretch/native conformance behind an explicit graph scale pass with
+  selectable Lanczos3/triangle sampling and graph-backed CPU execution.
+- [x] Add a generic bounded device-resource cache with stable-key reuse, deterministic LRU eviction,
+  current-graph lifetime protection, descriptor/backend validation, idle release, and statistics.
+- [x] Implement an optional wgpu project-graph backend using the device cache for positioned RGBA
+  source-over composition into a caller-owned RGBA/BGRA target, with real GPU render/readback and
+  cache-reuse coverage.
+- [x] Enable video-plus-MMFX wgpu monitoring by default in the terminal application through a
+  non-blocking three-slot output/readback ring, with stale-completion dropping, automatic CPU
+  fallback, and an explicit `--no-default-features` compatibility build.
+- [ ] Connect direct native-surface presentation, implement GPU `Scale` and `ColorConvert`, and
+  remove readback where the display API can consume a backend-owned texture.
 - [ ] Add tiled multithreaded and SIMD CPU execution with correct halos for large-radius effects and
   differential testing against the reference backend.
 - [ ] Add controlled text shaping, font fallback, vector rasterization, high-quality antialiasing,
@@ -394,15 +437,18 @@ cache; other media and audio remain eager.
 
 ## Additional containers
 
-**Status:** MPEG-TS, Y4M, and a first ISO-BMFF/QuickTime sample-table demuxer plus single-video-track
-MP4 writer exist. Each remaining item below should be its own crate and bounded vertical slice.
+**Status:** MPEG-TS, Y4M, and a first ISO-BMFF/QuickTime sample-table demuxer plus interleaved
+H.264/AAC Fast Start MP4 writer exist. Each remaining item below should be a bounded vertical slice.
 
 - [ ] **AVI:** prioritize OpenDML indexing, MJPEG, DV, PCM, and metadata preservation.
 - [x] **QuickTime/MOV and ISO BMFF/MP4:** read non-fragmented sample tables, DTS/PTS and composition
   offsets, sync samples, chunk offsets, `avcC`, `pasp`, `colr`, track rotation, basic AAC sample-entry
   metadata, generic packets, and keyframe-aligned seeking for H.264 editor import/playback.
-- [ ] Add fragmented MP4, edit lists, multiple sample descriptions, richer metadata preservation,
-  incremental I/O, and audio/multitrack muxing as separate ISO-BMFF slices.
+- [x] Add Fast Start H.264/AAC writing with per-track clocks, `mp4a`/`esds`, sample-time
+  interleaving, exact timing tables, and round-trip demux tests.
+- [ ] Add fragmented MP4, arbitrary multi-segment/non-unit-rate edit lists, multiple sample
+  descriptions, richer metadata preservation, incremental I/O, and general codec/track layouts as
+  separate ISO-BMFF slices.
 - [ ] **MPEG Program Stream/VOB:** add PES, SCR, navigation/private-stream handling, and MPEG-2/MP2
   mappings as required by archive/DVD workflows.
 - [ ] **MXF:** begin with one operational pattern and concrete DV/MPEG-2 archive samples rather than
@@ -412,9 +458,9 @@ MP4 writer exist. Each remaining item below should be its own crate and bounded 
 ## H.264 and future video codecs
 
 **Status:** The H.264 syntax/indexing, MP4/MOV editor import/playback, video-only clean-GOP remux,
-and first deterministic encoder foundation are implemented. The encoder currently emits
-Baseline-profile, all-IDR lossless `I_PCM` pictures plus transform-coded Intra16 and Intra4
-pictures with CAVLC residuals and configurable picture/macroblock QP. Its bounded inter mode retains
+deterministic encoder, and first YouTube upload delivery with a silent AAC bed are implemented. The encoder
+emits Baseline/Main/High Profile CAVLC or CABAC streams, including lossless `I_PCM` and compressed
+Intra16/Intra4/Intra8 pictures. Its bounded inter mode retains
 up to four references,
 emits every P partition down to 4x4 with quarter-pixel motion and P-skip, and optionally reorders up
 to three non-reference B pictures between anchors. B16x16, B16x8, B8x16, and all thirteen B8x8
@@ -659,7 +705,25 @@ parsing, dependency indexing, and seek-window selection. HEVC, AV1, and VVC have
 - [x] Extend CABAC emission to compressed Intra16 IDRs, including macroblock/chroma modes,
   modulo-52 QP deltas, contextual luma/chroma coded-block flags, significance/last maps, reverse
   coefficient levels and signs, AQ, scaling matrices, and native plus FFmpeg verification.
-- [ ] Extend CABAC emission to compressed Intra4/Intra8 and P/B macroblocks.
+- [x] Extend CABAC emission to compressed Intra4 IDRs, including all nine predicted luma modes,
+  contextual luma/chroma coded-block patterns and flags, AQ, scaling matrices, exact QP-zero
+  transform bypass, and native plus FFmpeg verification.
+- [x] Extend CABAC emission to High Profile Intra8 IDRs with contextual transform-size signalling,
+  all nine filtered prediction modes, dedicated 8x8 significance/last-position maps, AQ, scaling
+  matrices, and native plus FFmpeg verification.
+- [x] Extend CABAC emission to P pictures with P-skip, the complete partition tree down to 4x4,
+  multiple references, contextual motion differences, coded-block patterns, QP deltas, chroma,
+  adaptive 4x4/8x8 residuals, AQ, scaling matrices, and QP-zero transform bypass.
+- [x] Extend CABAC emission to B pictures with spatial/temporal direct and skip, every explicit
+  list-0/list-1/bi partition combination, all thirteen B8x8 sub-macroblock types, contextual motion
+  differences, reordered output, and shared AQ/scaling/4x4/8x8/transform-bypass residual paths.
+- [x] Add a delivery-oriented `analysis=fast` path: hierarchical integer motion search with
+  bounded SAD, subsampled/bilinear analysis metrics, compact current-macroblock motion histories,
+  P16x16/direct-B first-pass analysis with adaptive split/explicit fallbacks for high-error blocks,
+  and one residual-transform path. Keep exhaustive partition/reference analysis available as
+  `analysis=full`, and provide a reproducible release benchmark. The 300-frame 1080p Patrons
+  regression project exports in about 54 seconds while keeping the first post-IDR scrolling-text
+  frames free of the previous-position ghosts caused by unconditional P16x16/direct prediction.
 - [ ] Extend H.264 planning to arbitrary edit boundaries after complete reference semantics exist.
   Treat a production-quality encoder as a later, separate decision.
 - [ ] **HEVC:** consider only after the H.264 interfaces expose what the shared model must represent.
@@ -717,10 +781,17 @@ still minimal.
 ## Performance and hardware acceleration
 
 **Status:** Current code favors clear deterministic reference implementations. The first profiled
-H.264 scalar optimizations are bit-exact and isolated from correctness; broader codecs and
-workloads still need measured baselines.
+H.264 scalar optimizations are bit-exact and isolated from correctness. Editor preview now keeps
+the project clock independent, caches the timeline raster, defers thumbnail refresh during
+transport, moves YUV-to-RGB preview conversion to a latest-request-wins worker, caps terminal proxy
+resolution, and reports live view/decode/convert/send timing. POSIX shared-memory Kitty delivery is
+implemented behind an experimental opt-in; capability negotiation is required before enabling it
+automatically. Broader reproducible corpus baselines are still required.
 
-- [ ] Profile representative workloads before choosing optimization targets.
+- [x] Add live editor-preview stage timing and remove timeline and color-conversion work from the
+  project-clock/input path.
+- [ ] Record reproducible representative 1080p playback baselines and enforce the 30 fps, <50 ms
+  input-latency, and 100–150 ms indexed-scrub acceptance gates.
 - [ ] Add benchmark coverage for parsing, transforms, motion compensation, color conversion,
   demux/mux, and end-to-end decode/render.
 - [ ] Add runtime-dispatched SIMD behind bit-exact scalar fallbacks.

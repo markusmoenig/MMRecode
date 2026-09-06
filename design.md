@@ -91,6 +91,7 @@ crates/
 ├── render/                  mmrecode-render; dependency-aware render planning/execution
 ├── edit/                    mmrecode-edit; authoring graph, commands, and project documents
 ├── quality/                 mmrecode-quality
+├── terminal-shm/            mmrecode-terminal-shm; audited local graphics transport
 ├── testkit/                 mmrecode-testkit
 ├── capi/                    mmrecode-capi; experimental C boundary
 └── cli/                     mmrecode; main terminal application
@@ -152,6 +153,13 @@ views. Such optimization must not leak backend-specific behavior into codec algo
 `AudioFrame` uses owned interleaved sample storage for the same clarity-first reason as
 `VideoFrame`. DV is the first consumer because its audio is embedded and physically shuffled among
 DIF blocks. Containers must allow audio and data streams without depending on the DV crate.
+
+Imported audio crosses a single source boundary in `mmrecode-playback`: container probes select an
+adapter, the adapter demuxes and decodes its codec, and the result is a timed `AudioFrame` whose PTS
+is relative to the source video origin. Timeline placements, trimming, mixing, resampling, and
+delivery encoding operate only on this PCM contract. Adding another input codec therefore extends
+the source adapter layer rather than the timeline renderer. A future compatible-packet copy path is
+a separate delivery optimization and must not alter this canonical decoded-audio path.
 
 ### Packets
 
@@ -430,9 +438,17 @@ also available: it signals SPS fallback lists and applies distinct intra/inter 4
 consistently to forward quantization and normative local reconstruction. The first CABAC encoder
 slice adds a byte-oriented arithmetic core plus complete lossless `I_PCM` IDRs in Main or High
 Profile, including PPS signalling, context adaptation, carry propagation, termination, and
-arithmetic restart after raw samples. It now also emits compressed Intra16 CABAC macroblocks with
-prediction-mode, QP-delta, coded-block, significance-map, coefficient-level, AQ, and scaling-matrix
-coverage. Intra4/Intra8 and inter CABAC macroblocks remain follow-on work.
+arithmetic restart after raw samples. It now also emits compressed Intra16, Intra4, and Intra8 CABAC
+macroblocks with prediction-mode, QP-delta, coded-block-pattern, contextual coded-block,
+significance-map, coefficient-level, AQ, scaling-matrix, and QP-zero transform-bypass coverage.
+Intra8 includes contextual transform-size signalling and its dedicated 8x8 coefficient-position
+context maps. CABAC P emission now covers P-skip and the complete P16x16/P16x8/P8x16/P8x8
+partition tree down to 4x4, multiple short-term reference indices, context-adaptive motion-vector
+differences, coded-block patterns, QP state, chroma, and adaptive 4x4/8x8 luma residuals. CABAC B
+emission completes the inter entropy path with spatial and temporal direct/skip coding, every
+explicit list-0/list-1/bi partition combination, all thirteen B8x8 sub-macroblock types, contextual
+motion differences, and the same AQ, scaling-matrix, transform-bypass, and adaptive-transform
+residual paths.
 Playback also retains recovery-point SEI and the active `MaxFrameNum` per indexed picture. Native
 window selection resolves `recovery_frame_cnt` through modulo frame-number arithmetic to the target
 reference picture in output order. Self-contained non-IDR I pictures start with an empty DPB;
@@ -554,12 +570,14 @@ codec configuration and exposes container-level `pasp`, `colr`, audio sample-ent
 track-matrix rotation metadata. Seeking selects the closest preceding video sync sample. The crate
 does not depend on H.264 and never parses parameter sets or slice syntax.
 
-The crate also has a minimal single-video-track MP4 writer for clean packet-copy workflows. It
-rebuilds decode/composition-time, size, chunk, and sync tables while preserving opaque `avcC`,
-rotation, pixel aspect, colour metadata, and sample bytes. The render adapter—not the writer—proves
-that a requested H.264 range is independently decodable. The current slice deliberately excludes
-fragmented movies, edit lists, multiple active sample descriptions, incremental I/O, DRM,
-audio/multitrack muxing, and files above 4 GiB.
+The crate also has a Fast Start MP4 writer for H.264 video and AAC audio. It rebuilds
+decode/composition-time, size, per-sample chunk, and sync tables, physically interleaves samples by
+decode time, emits `mp4a`/`esds`, and preserves opaque `avcC`, rotation, pixel aspect, colour
+metadata, and sample bytes. The render adapter—not the writer—proves that a requested H.264 range
+is independently decodable. A single rate-1 media edit supports leading codec-priming removal. The
+current slice deliberately excludes fragmented movies, arbitrary multi-segment/non-unit-rate
+edits, multiple active sample descriptions, incremental I/O, DRM, general codec/track layouts, and
+files above 4 GiB.
 
 ### Implemented MPEG-2 Transport Stream slice
 
@@ -739,13 +757,16 @@ only an explicit seek creates a superseding generation.
 
 The first terminal frontend consumes that same playback source through both
 `mmrecode preview <media-file>` and the full-screen loop entered by `mmrecode edit`. Terminal UI
-and graphics protocol dependencies belong only to the CLI crate. Capability probing selects Kitty,
+and graphics protocol dependencies belong only to the application layer. Capability probing selects Kitty,
 Sixel, iTerm2, or 24-bit Unicode half-block output;
 codec, container, playback, edit, and render crates remain terminal-agnostic. MPEG-2 reconstruction
-and fallback terminal-specific resize/encoding use separate workers. Direct Kitty output transfers
-local RGB frames through temporary files and alternates two image slots: it uploads and places the
-next frame before deleting the previous placement. This uses the widely implemented baseline Kitty
-graphics operations rather than optional terminal animation.
+and fallback terminal-specific resize/encoding use separate workers. Direct Kitty output alternates
+two image slots: it uploads and places the next frame before deleting the previous placement. A
+local-only POSIX shared-memory implementation exists behind an experimental opt-in, but temporary
+files remain the default until capability negotiation can prove the terminal supports that medium.
+`mmrecode-terminal-shm` contains only the audited mapping needed to make the experimental path
+portable across Linux and macOS. The default display path uses widely implemented Kitty graphics
+operations rather than optional terminal animation.
 The UI thread owns input, the playback clock, a bounded display cache, and protocol state. In edit
 mode it creates the full-screen shell even with no playback source, parses commands through
 `mmrecode-edit`, and applies them to one `EditorSession`. Filesystem resolution and MPEG-2 probing
@@ -790,8 +811,21 @@ matching rate, canvas, and scan settings lowers to `EditSequence` and can use th
 path. Other progressive timelines decode required pictures and reference dependencies, map YUV
 4:2:0 planes into the project canvas with CPU Lanczos scaling, composite cached MMFX pixels, encode
 bounded closed-GOP chunks, and mux the regenerated MPEG-2 stream as MPEG-TS.
-Unsupported delivery presets report
-their missing codec/container slice instead of invoking an opaque external transcoder.
+The YouTube upload presets reuse that project-root render, require a matching progressive 1080p or
+2160p canvas, and feed frames directly to the native H.264 encoder. They select High Profile,
+CABAC, two B-frames, two references, a closed GOP approximately half the frame rate, the
+resolution/frame-rate bitrate tier, and limited-range BT.709 VUI. The single video track is written
+as a non-fragmented Fast Start MP4 with `moov` before `mdat`; no external transcoder participates.
+The container layer interleaves an AAC track by decode time, writes `mp4a`/`esds`, and preserves
+each track's exact media clock. Silent-only delivery omits edit lists; program audio uses the
+general mux API's single rate-1 edit to remove encoder priming. The native
+AAC encoder supplies long-window MDCT analysis, uniform quantization, escape-book Huffman coding,
+packet-budget rate selection, and an overlap tail. A codec-independent audio renderer mixes placed
+decoded PCM with deterministic linear resampling, gain, overlap, mono/stereo mapping, and final
+saturation. Timeline compilation decodes MPEG-TS Layer II through the Rust Symphonia backend and
+native AAC-LC carried beside H.264 in MP4/MOV, maps source trims and A/V origins into placement
+intervals, mixes overlaps, and supplies exact-duration 48 kHz stereo PCM to the encoder. Sources
+without a supported audio track contribute silence.
 
 `project match` is also an explicit host request because the terminal-independent edit crate does
 not probe codecs or containers. The host resolves the focused media origin, derives MPEG-2 canvas,
@@ -880,16 +914,18 @@ The C layer should:
 
 All allocations crossing the initial ABI have one clearly named library free function. Every
 exported operation catches Rust panics before they can unwind into C. Raw-pointer access and other
-necessary unsafe code are isolated in `mmrecode-capi`; the remaining workspace continues to forbid
-unsafe Rust.
+ABI-specific unsafe code are isolated in `mmrecode-capi`; application and media crates continue to
+forbid unsafe Rust.
 
 Swift, Kotlin, Python, and other bindings should build on the stable C ABI unless a language has a
 strong reason to use a native Rust binding.
 
 ## Safety and acceleration
 
-Workspace lints forbid unsafe Rust outside the narrowly scoped C boundary crate. This establishes a
-safe portable reference path while permitting the unavoidable pointer operations at the ABI edge.
+Workspace lints forbid unsafe Rust outside narrowly scoped boundary crates. `mmrecode-capi` owns
+the unavoidable pointer operations at the ABI edge; `mmrecode-terminal-shm` owns one audited memory
+mapping behind a safe byte-slice API. The rest of the workspace retains the safe portable reference
+path.
 
 When acceleration is introduced:
 

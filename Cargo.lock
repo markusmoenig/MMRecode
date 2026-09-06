@@ -1909,10 +1909,13 @@ dependencies = [
  "mmrecode-playback",
  "mmrecode-quality",
  "mmrecode-render",
+ "mmrecode-terminal-shm",
  "mmrecode-y4m",
+ "pollster",
  "ratatui",
  "ratatui-image",
  "rodio",
+ "wgpu",
 ]
 
 [[package]]
@@ -2014,6 +2017,7 @@ name = "mmrecode-mpegaudio"
 version = "0.0.1"
 dependencies = [
  "mmrecode-core",
+ "rodio",
 ]
 
 [[package]]
@@ -2034,6 +2038,8 @@ dependencies = [
  "mmrecode-h264",
  "mmrecode-isobmff",
  "mmrecode-mpeg2",
+ "mmrecode-mpegaudio",
+ "mmrecode-mpegts",
 ]
 
 [[package]]
@@ -2058,6 +2064,16 @@ dependencies = [
  "mmrecode-mpeg2",
  "mmrecode-mpegaudio",
  "mmrecode-mpegts",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "mmrecode-terminal-shm"
+version = "0.0.1"
+dependencies = [
+ "memmap2",
+ "rustix 1.1.4",
 ]
 
 [[package]]

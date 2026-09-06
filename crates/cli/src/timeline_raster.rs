@@ -70,7 +70,6 @@ pub(crate) struct TimelineObjectLane {
 
 pub(crate) struct TimelineRasterInput<'a> {
     pub(crate) viewport: &'a TimelineViewport,
-    pub(crate) playhead: usize,
     pub(crate) retained: Range<usize>,
     pub(crate) thumbnail_frames: &'a [usize],
     pub(crate) thumbnails: &'a BTreeMap<usize, RgbImage>,
@@ -124,8 +123,49 @@ pub(crate) fn render_timeline(
         codec_y,
         lane_height,
     );
-    draw_playhead(&mut image, input.viewport, input.playhead);
     image
+}
+
+pub(crate) fn draw_timeline_playhead(
+    image: &mut RgbImage,
+    viewport: &TimelineViewport,
+    playhead: usize,
+) {
+    if !viewport.visible_range().contains(&playhead) {
+        return;
+    }
+    let x = frame_x(viewport, playhead, image.width());
+    let shaft_width = (image.width() / 500).clamp(3, 7).min(image.width());
+    let outline_width = shaft_width.saturating_add(4).min(image.width());
+    fill_rect(
+        image,
+        x.saturating_sub(outline_width / 2),
+        0,
+        outline_width,
+        image.height(),
+        PLAYHEAD_OUTLINE,
+    );
+    fill_rect(
+        image,
+        x.saturating_sub(shaft_width / 2),
+        0,
+        shaft_width,
+        image.height(),
+        PLAYHEAD,
+    );
+    let head_width = 19.min(image.width());
+    let head_height = 10.min(image.height());
+    for row in 0..head_height {
+        let width = head_width.saturating_sub(row.saturating_mul(head_width) / head_height);
+        fill_rect(
+            image,
+            x.saturating_sub(width / 2),
+            row,
+            width.max(1),
+            1,
+            PLAYHEAD,
+        );
+    }
 }
 
 fn draw_ruler(image: &mut RgbImage, height: u32) {
@@ -334,44 +374,6 @@ fn draw_codec_lane(
     }
 }
 
-fn draw_playhead(image: &mut RgbImage, viewport: &TimelineViewport, playhead: usize) {
-    if !viewport.visible_range().contains(&playhead) {
-        return;
-    }
-    let x = frame_x(viewport, playhead, image.width());
-    let shaft_width = (image.width() / 500).clamp(3, 7).min(image.width());
-    let outline_width = shaft_width.saturating_add(4).min(image.width());
-    fill_rect(
-        image,
-        x.saturating_sub(outline_width / 2),
-        0,
-        outline_width,
-        image.height(),
-        PLAYHEAD_OUTLINE,
-    );
-    fill_rect(
-        image,
-        x.saturating_sub(shaft_width / 2),
-        0,
-        shaft_width,
-        image.height(),
-        PLAYHEAD,
-    );
-    let head_width = 19.min(image.width());
-    let head_height = 10.min(image.height());
-    for row in 0..head_height {
-        let width = head_width.saturating_sub(row.saturating_mul(head_width) / head_height);
-        fill_rect(
-            image,
-            x.saturating_sub(width / 2),
-            row,
-            width.max(1),
-            1,
-            PLAYHEAD,
-        );
-    }
-}
-
 fn range_pixels(
     viewport: &TimelineViewport,
     range: Range<usize>,
@@ -420,7 +422,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raster_contains_playhead_and_smart_render_colors() {
+    fn raster_contains_smart_render_colors() {
         let mut viewport = TimelineViewport::default();
         viewport.reset(100);
         let spans = vec![
@@ -444,7 +446,6 @@ mod tests {
         let image = render_timeline(
             &TimelineRasterInput {
                 viewport: &viewport,
-                playhead: 55,
                 retained: 10..90,
                 thumbnail_frames: &[],
                 thumbnails: &BTreeMap::new(),
@@ -468,12 +469,22 @@ mod tests {
         assert!(image.pixels().any(|pixel| *pixel == BRIDGE));
         assert!(image.pixels().any(|pixel| *pixel == FULL_RENDER));
         assert!(image.pixels().any(|pixel| *pixel == REVIEW));
-        assert!(image.pixels().any(|pixel| *pixel == PLAYHEAD));
     }
 
     #[test]
     fn thumbnail_fit_preserves_source_aspect_ratio() {
         assert_eq!(fitted_size(4, 3, 160, 90), (120, 90));
         assert_eq!(fitted_size(16, 9, 80, 80), (80, 45));
+    }
+
+    #[test]
+    fn playhead_is_a_separate_overlay_on_the_cached_raster() {
+        let mut viewport = TimelineViewport::default();
+        viewport.reset(100);
+        let mut image = RgbImage::from_pixel(200, 100, BACKGROUND);
+
+        draw_timeline_playhead(&mut image, &viewport, 55);
+
+        assert!(image.pixels().any(|pixel| *pixel == PLAYHEAD));
     }
 }

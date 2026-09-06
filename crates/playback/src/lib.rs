@@ -1,6 +1,7 @@
 //! Reusable media timeline and playback-clock primitives.
 
 mod aac;
+mod audio_source;
 mod executor;
 mod h264;
 mod mpeg2;
@@ -16,6 +17,7 @@ pub use aac::{
     AacAudioIndex, AacDecodeBackend, AacDecodePolicy, AacPlaybackEvent, AacPlaybackSource,
     IndexedAacSample,
 };
+pub use audio_source::decode_audio_source;
 #[cfg(not(target_arch = "wasm32"))]
 pub use executor::NativeDecodeExecutor;
 pub use executor::{

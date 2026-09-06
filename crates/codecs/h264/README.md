@@ -12,7 +12,8 @@ AVC. It currently provides:
 - a deterministic all-IDR `I_PCM` encoder foundation that emits lossless pictures through the
   shared stateful encoder API, including `avcC` configuration, cropping, emulation prevention,
   packet timing, and exact native round-trip reconstruction. It defaults to Baseline/CAVLC;
-  `entropy=cabac` selects Main Profile CABAC with arithmetic restart around each PCM macroblock;
+  `entropy=cabac` selects Main Profile CABAC with arithmetic restart around each PCM macroblock
+  and supports compressed Intra16/Intra4/Intra8 IDRs plus P pictures;
 - an optional `mode=intra16` compressed path with reconstructed-neighbor DC/horizontal/vertical
   mode decisions, quantized luma DC Hadamard plus 4x4 luma/chroma DC/AC coefficients, general CAVLC
   residual serialization, and a normative reconstruction matching independent FFmpeg decoding;
@@ -30,12 +31,14 @@ AVC. It currently provides:
   partition tree: adaptive P16x16, P16x8, P8x16, and P8x8 macroblocks whose subpartitions reach
   8x4, 4x8, and 4x4. Deterministic integer searches receive quarter-pixel luma refinement with
   matched eighth-sample chroma prediction. The path also writes predicted motion-vector
-  differences, full CAVLC residuals and P-skip runs, retains up to four reconstructed references,
-  and exposes `gop_size`, `search_range`, `max_refs`, and opt-in `scene_cut_threshold`;
+  differences, full CAVLC or CABAC residuals and P-skip runs, retains up to four reconstructed
+  references, and exposes `gop_size`, `search_range`, `max_refs`, and opt-in
+  `scene_cut_threshold`. CABAC covers the complete P partition tree, contextual reference and
+  motion syntax, adaptive 4x4/8x8 transforms, scaling matrices, AQ, and transform bypass;
 - an optional `b_frames=1..3` reorder path using type-0 picture order, B16x16/B16x8/B8x16
   list-0/list-1/bi motion combinations, all thirteen `B_8x8` sub-macroblock types, spatial and
-  temporal direct prediction, B-skip decisions, CAVLC residuals, presentation PTS, decode-order
-  DTS, flush-safe delayed-frame draining, and automatic Main Profile signalling;
+  temporal direct prediction, B-skip decisions, CAVLC or CABAC residuals, presentation PTS,
+  decode-order DTS, flush-safe delayed-frame draining, and automatic Main Profile signalling;
 - deterministic frame-level bitrate control for every compressed picture mode. The generic
   `bitrate` setting drives a bounded eight-frame virtual buffer and adjusts QP from the configured
   starting value using each packet's size and declared frame duration;
@@ -45,6 +48,13 @@ AVC. It currently provides:
 - opt-in single-CPB NAL HRD/VBV signalling through `vbv_buffer_ms=1..60000` when `bitrate` is set.
   The SPS carries VUI timing and scaled HRD rate/size values; buffering-period and picture-timing
   SEI carry 24-bit removal/output delays, including reordered B-picture output timing.
+- `analysis=fast` for delivery-oriented encoding. It uses hierarchical integer search, a
+  subsampled SAD and bilinear sub-pixel analysis metric, and a single 4x4 residual-transform path.
+  Low-error macroblocks stay on P16x16/newest-reference or direct-B prediction; high-error blocks
+  adaptively evaluate split P and explicit B motion so thin moving detail does not leave reference
+  ghosts. Final motion compensation, reconstruction, CABAC, and bitstream syntax remain normative.
+  `analysis=full` remains the default and retains exhaustive references, partitions, and transform
+  decisions.
 
 The crate does not parse MP4/MOV. Its native decoder foundation reconstructs
 frame-coded, 8-bit 4:2:0 IDR pictures containing `I_PCM`, CAVLC `Intra_16x16`, or
@@ -140,12 +150,19 @@ codes spatial residual differences without quantization, and disables inter 8x8 
 Profile, signals the sequence scaling-matrix fallback syntax, and applies the resolved standard
 intra/inter matrices during both forward quantization and local reconstruction. It is incompatible
 with transform bypass because scaling is skipped in bypass mode.
-`entropy=cavlc|cabac` defaults to CAVLC. CABAC currently supports `mode=ipcm|intra16`, automatically
-selects Main Profile when `profile=auto`, and is rejected with Baseline Profile or other compressed
-macroblock modes. Its byte-oriented arithmetic core covers adaptive decisions, bypass bins,
-termination, carry propagation, and PCM substream restart. Intra16 CABAC includes macroblock and
-chroma prediction modes, modulo-52 QP deltas, luma/chroma coded-block contexts, significance maps,
-last flags, reverse coefficient levels, signs, AQ, and High Profile scaling matrices.
+`entropy=cavlc|cabac` defaults to CAVLC. CABAC supports every all-intra mode and complete P/B
+inter-picture coding. It automatically selects Main Profile when `profile=auto` unless another
+tool requires High, and is rejected with Baseline Profile. Its
+byte-oriented arithmetic core covers adaptive decisions, bypass bins, termination, carry
+propagation, and PCM substream restart. Compressed CABAC includes macroblock and chroma prediction
+modes, modulo-52 QP deltas, luma/chroma coded-block contexts, significance maps, last flags,
+reverse coefficient levels, signs, AQ, and High Profile scaling matrices. Intra4 additionally
+carries all nine predicted-mode decisions and supports exact QP-zero transform bypass. Intra8
+signals contextual transform-size flags and uses the normative 8x8 significance/last-position
+context maps. P slices add contextual skip, complete partition/subpartition, multiple-reference,
+motion-vector-difference, adaptive transform, and inter residual syntax. B slices cover spatial
+and temporal direct/skip coding, all explicit list-0/list-1/bi macroblock combinations, all
+thirteen B8x8 sub-macroblock types, reordered pictures, and the shared inter residual paths.
 `level=auto|1|1b|1.1..6.2` checks the Annex A frame-size,
 macroblock-rate, decoded-picture-buffer, target-bitrate, and optional CPB limits; automatic mode
 selects the lowest conforming level and `avcC` mirrors the SPS level byte. One `time_base` tick is
@@ -154,6 +171,14 @@ than one frame should set `frame_duration_ticks` to the nominal positive frame d
 frames are checked again using their actual duration, so a faster variable-rate frame cannot
 silently violate the declared level. Without a target bitrate, level selection covers structural
 and cadence limits but cannot promise a bound for fixed-QP output size.
+`color=unspecified|bt709` controls VUI colour signalling. `bt709` writes limited-range video signal
+metadata with BT.709 primaries, transfer characteristics, and matrix coefficients; pixel values are
+not converted by this option.
+
+The editor's `youtube-1080p` and `youtube-2160p` export presets use the native encoder in High
+Profile CABAC mode with two B-frames, two references, JVT scaling matrices, a half-second closed
+GOP, fast analysis, BT.709 signalling, and YouTube's resolution/frame-rate video bitrate tiers.
+The result is an H.264/AAC Fast Start MP4 with timeline-mixed 48 kHz stereo audio.
 
 The editor's first usable H.264 preview keeps pixel decoding behind `mmrecode-playback`'s bounded
 request/event and decode-executor interfaces. Access-unit-sized jobs publish frames incrementally,

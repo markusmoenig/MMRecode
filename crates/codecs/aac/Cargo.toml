@@ -1,6 +1,6 @@
 [package]
 name = "mmrecode-aac"
-description = "AAC configuration, framing, and decoder foundations for MMRecode"
+description = "AAC configuration, framing, and native codec foundations for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

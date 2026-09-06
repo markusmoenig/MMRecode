@@ -495,6 +495,32 @@ impl EditorSession {
         })
     }
 
+    /// Replaces the focused scene source and optionally adopts its intrinsic frame duration.
+    ///
+    /// Source installation and placement fitting form one undoable project edit. This is intended
+    /// for `scene load` and `scene link`; ordinary source typing retains the author's current trim.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as replacing the source or fitting a generated placement.
+    pub fn replace_current_mmfx_source_and_fit(
+        &mut self,
+        source: MmfxSource,
+        intrinsic_duration: Option<i64>,
+    ) -> Result<CommandOutput> {
+        self.mutate(|project, path| {
+            let media_id = project.resolve_path(path)?;
+            project.set_mmfx_source(media_id, source)?;
+            if let Some(duration) = intrinsic_duration {
+                project.fit_generated_placement_duration(path, duration)?;
+            }
+            Ok(intrinsic_duration.map_or_else(
+                || "load MMFX scene source".into(),
+                |duration| format!("load MMFX scene source and fit to {duration} frames"),
+            ))
+        })
+    }
+
     /// Replaces all bindings on the focused scene as one undoable project edit.
     ///
     /// The caller must validate values against the source's typed `@param` declarations first.
@@ -1711,7 +1737,7 @@ fn display_frame_value(value: FrameValue, time_base: Rational) -> Result<String>
 }
 
 fn help_text() -> String {
-    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save project and scene snapshots\nimport <file> [as <alias>]  import media\nadd scene <alias> <duration> [at <start>]\ncd <alias>                  focus an MMFX scene\nedit                        edit an embedded scene\nscene params                inspect public inputs\nscene set <name> <value>    override one input\nscene reset [name]          restore defaults\nscene load <scene.mmfx>     embed a one-time copy\nscene link <scene.mmfx>     watch an external source\nscene reload / unlink       refresh / embed linked source\nscene save as <scene.mmfx>  extract source to a file\nscene close                 close the source pane\nmonitor project|local|toggle\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 project edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nPane focus: Tab/Shift-Tab. With the timeline focused, Left/Right scrubs, Shift-Left/Right pans the zoomed view, +/- zooms, and 0 fits the full timeline. Embedded MMFX edits, linked snapshots, and typed bindings are persisted by ordinary project `save`. Linked files are polled and debounced; valid changes refresh preview/export while missing or invalid files retain the cached scene. Use `scene unlink` before editing linked source internally. The Project Monitor shows the complete root composition; `monitor local` isolates the current hierarchy context and its descendants. Legacy `add fx` and `fx load/save/close` remain compatible aliases; `fx` is reserved for the future effect/kernel workflow. Ctrl-S saves the project, Ctrl-Z/Ctrl-Y undo/redo project edits, and Esc focuses the command prompt. Preview compilation is automatic and keeps the last valid frame when source has errors.\nInteractive prompt: Ctrl-Space completes commands, paths, settings, presets, topics, scene parameters, scale modes, monitor targets, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
+    "QUICK HELP\n\nnew <name> [using <preset>] [--discard]\nopen <project.mmrecode> [--discard]\nsave [as <project>]         save project and scene snapshots\nimport <file> [as <alias>]  import media\nadd scene <alias> <duration> [at <start>]\ncd <alias>                  focus an MMFX scene\nedit                        edit an embedded scene\nscene params                inspect public inputs\nscene set <name> <value>    override one input\nscene reset [name]          restore defaults\nscene load <scene.mmfx>     embed a one-time copy\nscene link <scene.mmfx>     watch an external source\nscene reload / unlink       refresh / embed linked source\nscene save as <scene.mmfx>  extract source to a file\nscene close                 close the source pane\nmonitor project|local|toggle\nproject info|match|presets|preset|set\nproject set rate <rate> [conform time|frames]\nscale fit|fill|stretch|native\nexport plan [using <preset>]\nexport <file> [using <preset>]\npwd / ls / cd <path>        navigate media\ninfo [project|video|audio|source]\nadd <kind> <alias> <duration> [at <start>]\nin <time> / out <time>      trim selected placement\nundo / redo                 project edit history\nhelp / man <command>        contextual help\nquit [--discard]            leave MMRecode\n\nPane focus: Tab/Shift-Tab. With the timeline focused, Space plays or pauses the complete project timeline; Left/Right scrubs, Shift-Left/Right pans the zoomed view, +/- zooms, and 0 fits the full timeline. Project playback crosses cuts and gaps on one clock, keeps opened clip decoders cached, pre-rolls an upcoming cut, and composites active MMFX scenes at exact project time. Embedded MMFX edits, linked snapshots, and typed bindings are persisted by ordinary project `save`. Linked files are polled and debounced; valid changes refresh preview/export while missing or invalid files retain the cached scene. Use `scene unlink` before editing linked source internally. The Project Monitor shows the complete root composition; `monitor local` isolates the current hierarchy context and its descendants. Legacy `add fx` and `fx load/save/close` remain compatible aliases; `fx` is reserved for the future effect/kernel workflow. Ctrl-S saves the project, Ctrl-Z/Ctrl-Y undo/redo project edits, and Esc focuses the command prompt. Preview compilation is automatic and keeps the last valid frame when source has errors.\nInteractive prompt: Ctrl-Space completes commands, paths, settings, presets, topics, scene parameters, scale modes, monitor targets, and hierarchy aliases.\nAfter in/out: left <time>, right <time>, or move <direction> <time> adjusts the focused boundary.\nTime: S:FF, M:SS:FF, or H:MM:SS:FF. Prefix + or - for relative trims."
         .into()
 }
 
@@ -1737,11 +1763,11 @@ fn man_text(command: &str) -> Result<String> {
             ProjectSettings::preset_names().join("\n")
         ),
         "export" => format!(
-            "EXPORT — render the project timeline\n\nexport plan [using <preset>]\nexport <output-file> [using <preset>]\n\nDelivery presets:\n{}\n\nExport always starts at the project root and renders the complete root timeline; the current `cd` context does not select a source for export. The output filename is only the delivery destination. The executable mpeg2-ts slice recursively flattens nested video/mpeg2 and generated FX placements, including ancestor trims, differing local time bases, project-rate conformance, per-placement `scale`, alpha composition, and black frames for gaps or FX-only output. Later overlapping video and FX placements win in stable depth-first project composition order. Reports use complete hierarchy paths. MMFX scenes, fonts, scaling, transparent bounds, and YUV values are cached before frame rendering; active pixels are blended directly into Yuv420p8 frames. A single unnested video placement covering the timeline with matching rate, canvas, and scan and no FX can use packet-preserving smart rendering as an internal optimization; all other supported timelines are fully rendered and re-encoded. Current full rendering requires progressive Yuv420p8 MPEG-2 placements, supports standard MPEG rates through 60 fps and even project canvases through 1920x1152 subject to the Main Profile/High Level limit of 62,668,800 luma samples per second, and does not yet render audio or interlaced scaling. Use `export plan` to inspect the complete timeline plan and why each path was selected. The YouTube/H.264 presets remain named future targets.",
+            "EXPORT — render the project timeline\n\nexport plan [using <preset>]\nexport <output-file> [using <preset>]\n\nDelivery presets:\n{}\n\nExport always starts at the project root and renders the complete root timeline; the current `cd` context does not select a source for export. The output filename is only the delivery destination. The executable mpeg2-ts slice recursively flattens nested video/mpeg2 and generated FX placements, including ancestor trims, differing local time bases, project-rate conformance, per-placement `scale`, alpha composition, and black frames for gaps or FX-only output. Later overlapping video and FX placements win in stable depth-first project composition order. Reports use complete hierarchy paths. MMFX scenes, fonts, scaling, transparent bounds, and YUV values are cached before frame rendering; active pixels are blended directly into Yuv420p8 frames. A single unnested video placement covering the timeline with matching rate, canvas, and scan and no FX can use packet-preserving smart rendering as an internal optimization; all other supported timelines are fully rendered and re-encoded. Current full rendering supports progressive Yuv420p8 MPEG-2 and H.264 MP4/MOV placements at standard MPEG rates through 60 fps. The YouTube presets require matching 1920x1080 or 3840x2160 projects and write native High Profile H.264/CABAC plus an interleaved AAC-LC 48 kHz stereo timeline mix configured for 384 kbps to Fast Start MP4. MPEG-TS Layer II and MP4/MOV AAC carried beside H.264 are decoded and source-trimmed, then all placements are mixed/resampled; gaps and sources without audio remain silent. Use `export plan` to inspect the complete timeline plan and why each path was selected.",
             EXPORT_PRESET_NAMES.join("\n")
         ),
         "monitor" => {
-            "MONITOR — choose preview scope\n\nmonitor project\nmonitor local\nmonitor toggle\n\n`project` is the default and shows the complete root composition at the project playhead, including the edited MMFX scene over underlying media. `local` isolates the current `cd` context and its descendants at the mapped local playhead; generated scenes use a checkerboard background so transparency remains visible. `toggle` switches between the two scopes. Changing scope is editor-session state, does not modify the project, and does not move either playhead. The monitor title always identifies the active scope."
+            "MONITOR — choose preview scope\n\nmonitor project\nmonitor local\nmonitor toggle\n\n`project` is the default and shows the complete root composition at the project playhead, including the edited MMFX scene over underlying media. `local` isolates the current `cd` context and its descendants at the mapped local playhead; generated scenes use a checkerboard background so transparency remains visible. `toggle` switches between the two scopes. Changing scope is editor-session state, does not modify the project, and does not move either playhead. The monitor title always identifies the active scope.\n\nThe standard MMRecode build automatically uses the wgpu compositor for video plus MMFX monitor frames when a compatible adapter is available. A three-slot asynchronous readback ring keeps the editor thread from waiting for the GPU and drops obsolete completions after fast scrubs. Device initialization or execution failure falls back to the CPU compositor. Build with `--no-default-features` only for an explicit CPU-only compatibility binary. Codec seeking, frame decoding, thumbnail generation, and scene evaluation remain CPU work; wgpu currently accelerates only the video-plus-MMFX composition stage.\n\nThe monitor title reports view/decode frame rates plus conversion and terminal-send latency. Kitty uses the compatible direct transfer path by default; shared-memory delivery remains an experimental opt-in until the terminal can be queried safely."
                 .into()
         }
         "edit" | "scene" | "fx" => {
@@ -1749,6 +1775,10 @@ fn man_text(command: &str) -> Result<String> {
                 .replace(
                     "The monitor continues to show the timeline playhead while source is open; focus the timeline with Tab to scrub it.",
                     "The Project Monitor continues to show the root project composition while source is open, with the draft scene over its underlying frame. The hierarchy timeline remains local to the selected object and maps its playhead to project time; focus it with Tab to scrub.",
+                )
+                .replace(
+                    "The editor polls only linked files, debounces writes, and automatically refreshes valid changes.",
+                    "Loading or linking a scene with fixed-frame animation or scrolling automatically fits the generated placement to its longest declared duration; `scene`-relative motion keeps the existing placement length. The editor polls only linked files, debounces writes, and automatically refreshes valid changes.",
                 )
         }
         "pwd" => {
@@ -2163,6 +2193,7 @@ mod tests {
             panic!("monitor manual should return text");
         };
         assert!(monitor_manual.contains("monitor toggle"));
+        assert!(monitor_manual.contains("--no-default-features"));
 
         assert_eq!(
             parse_command("scene load scenes/title.mmfx").unwrap(),

@@ -10,7 +10,7 @@ use crate::{
     CODEC_NAME,
     cabac::{CabacEncoder, initial_i_macroblock_contexts},
     cavlc::encode_residual_block,
-    decoder::CabacIContexts,
+    decoder::{CabacBContexts, CabacIContexts, CabacPContexts},
 };
 
 const PROFILE_BASELINE: u8 = 66;
@@ -64,6 +64,7 @@ struct Configuration {
     qp: i32,
     gop_size: usize,
     search_range: i32,
+    analysis: AnalysisPreset,
     scene_cut_threshold: u8,
     max_references: usize,
     b_frames: usize,
@@ -89,6 +90,7 @@ struct SequenceConfiguration {
     profile: EncoderProfile,
     transform_bypass: bool,
     scaling_matrix: ScalingMatrixPreset,
+    bt709: bool,
     level: AvcLevel,
 }
 
@@ -294,7 +296,7 @@ impl BPrediction {
 struct P8x8Candidate {
     cost: u64,
     sub_type: u8,
-    motions: Vec<[Option<MotionState>; 16]>,
+    motions: [Option<MotionState>; 16],
     luma_prediction: Vec<u8>,
     chroma_predictions: [Vec<u8>; 2],
     partitions: Vec<SelectedPartition>,
@@ -348,6 +350,13 @@ enum EncoderMode {
     Intra4,
     Intra8,
     Inter,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AnalysisPreset {
+    Fast,
+    #[default]
+    Full,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -926,8 +935,10 @@ fn scaled_hrd_value(value: u64, base_shift: u8, name: &str) -> Result<(u8, u32, 
 /// Profile inter coding adaptively selects 4x4 or 8x8 luma transforms for eligible macroblocks.
 /// `transform_bypass=true` enables exact QP-zero High Profile Intra4 or inter coding.
 /// `scaling_matrix=jvt` selects the standard High Profile intra/inter quantization matrices.
-/// `entropy=cabac` enables CABAC for `I_PCM` and Intra16 slices; other compressed CABAC
-/// macroblocks remain follow-on work and are rejected during configuration.
+/// `entropy=cabac` enables CABAC for all-intra, P, and B pictures.
+/// `analysis=fast` starts with bounded hierarchical/subsampled P16x16 and direct-B analysis, then
+/// evaluates split P or explicit B motion for high-error macroblocks. `analysis=full` is the default
+/// exhaustive partition/reference search.
 #[derive(Debug, Default)]
 pub struct H264Encoder {
     configuration: Option<Configuration>,
@@ -1193,6 +1204,7 @@ impl Encoder for H264Encoder {
         let mut qp = 26;
         let mut gop_size = 30;
         let mut search_range = 8;
+        let mut analysis = AnalysisPreset::Full;
         let mut scene_cut_threshold = 0;
         let mut max_references = 1;
         let mut b_frames = 0;
@@ -1205,6 +1217,7 @@ impl Encoder for H264Encoder {
         let mut scaling_matrix = ScalingMatrixPreset::Flat;
         let mut level_preference = LevelPreference::Auto;
         let mut frame_duration_ticks = 1_u64;
+        let mut bt709 = false;
         for (name, value) in &settings.options {
             match name.as_str() {
                 "mode" => {
@@ -1251,6 +1264,17 @@ impl Encoder for H264Encoder {
                                 "invalid H.264 search_range {value}; expected 0..=64"
                             ))
                         })?;
+                }
+                "analysis" => {
+                    analysis = match value.as_str() {
+                        "fast" => AnalysisPreset::Fast,
+                        "full" => AnalysisPreset::Full,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 analysis {value}; expected fast or full"
+                            )));
+                        }
+                    };
                 }
                 "scene_cut_threshold" => {
                     scene_cut_threshold = value.parse::<u8>().map_err(|_| {
@@ -1380,6 +1404,17 @@ impl Encoder for H264Encoder {
                             ))
                         })?;
                 }
+                "color" => {
+                    bt709 = match value.as_str() {
+                        "unspecified" => false,
+                        "bt709" => true,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "invalid H.264 color {value}; expected unspecified or bt709"
+                            )));
+                        }
+                    };
+                }
                 _ => {
                     return Err(Error::Unsupported(format!(
                         "unsupported H.264 encoder option {name}={value}"
@@ -1451,14 +1486,6 @@ impl Encoder for H264Encoder {
         if entropy_coding == EntropyCoding::Cabac && profile == EncoderProfile::Baseline {
             return Err(Error::Unsupported(
                 "H.264 CABAC requires profile=main, profile=high, or profile=auto".into(),
-            ));
-        }
-        if entropy_coding == EntropyCoding::Cabac
-            && !matches!(mode, EncoderMode::Ipcm | EncoderMode::Intra16)
-        {
-            return Err(Error::Unsupported(
-                "H.264 CABAC emission currently supports mode=ipcm or intra16; other compressed macroblocks require entropy=cavlc"
-                    .into(),
             ));
         }
         if mode == EncoderMode::Intra8 && profile != EncoderProfile::High {
@@ -1547,6 +1574,7 @@ impl Encoder for H264Encoder {
             profile,
             transform_bypass,
             scaling_matrix,
+            bt709,
             level,
         })?;
         let transform_8x8_mode = mode == EncoderMode::Intra8
@@ -1567,6 +1595,7 @@ impl Encoder for H264Encoder {
             qp,
             gop_size,
             search_range,
+            analysis,
             scene_cut_threshold,
             max_references: decoded_picture_buffer_size,
             b_frames,
@@ -1801,29 +1830,44 @@ fn encode_sps(configuration: &SequenceConfiguration) -> Result<Vec<u8>> {
             ((configuration.coded_height - configuration.height) / 2) as u64,
         )?;
     }
-    writer.write_bit(configuration.hrd.is_some())?; // vui_parameters_present_flag
-    if let Some(hrd) = configuration.hrd {
+    let vui_present = configuration.hrd.is_some() || configuration.bt709;
+    writer.write_bit(vui_present)?; // vui_parameters_present_flag
+    if vui_present {
         writer.write_bit(false)?; // aspect_ratio_info_present_flag
         writer.write_bit(false)?; // overscan_info_present_flag
-        writer.write_bit(false)?; // video_signal_type_present_flag
+        writer.write_bit(configuration.bt709)?; // video_signal_type_present_flag
+        if configuration.bt709 {
+            writer.write_bits(5, 3)?; // video_format: unspecified
+            writer.write_bit(false)?; // video_full_range_flag: limited range
+            writer.write_bit(true)?; // colour_description_present_flag
+            writer.write_bits(1, 8)?; // colour_primaries: BT.709
+            writer.write_bits(1, 8)?; // transfer_characteristics: BT.709
+            writer.write_bits(1, 8)?; // matrix_coefficients: BT.709
+        }
         writer.write_bit(false)?; // chroma_loc_info_present_flag
-        writer.write_bit(true)?; // timing_info_present_flag
-        writer.write_bits(u64::from(hrd.num_units_in_tick), 32)?;
-        writer.write_bits(u64::from(hrd.time_scale), 32)?;
-        writer.write_bit(false)?; // fixed_frame_rate_flag
-        writer.write_bit(true)?; // nal_hrd_parameters_present_flag
-        write_ue(&mut writer, 0)?; // cpb_cnt_minus1
-        writer.write_bits(u64::from(hrd.bit_rate_scale), 4)?;
-        writer.write_bits(u64::from(hrd.cpb_size_scale), 4)?;
-        write_ue(&mut writer, u64::from(hrd.bit_rate_value_minus1))?;
-        write_ue(&mut writer, u64::from(hrd.cpb_size_value_minus1))?;
-        writer.write_bit(false)?; // cbr_flag
-        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
-        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
-        writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
-        writer.write_bits(0, 5)?; // time_offset_length
+        writer.write_bit(configuration.hrd.is_some())?; // timing_info_present_flag
+        if let Some(hrd) = configuration.hrd {
+            writer.write_bits(u64::from(hrd.num_units_in_tick), 32)?;
+            writer.write_bits(u64::from(hrd.time_scale), 32)?;
+            writer.write_bit(false)?; // fixed_frame_rate_flag
+        }
+        writer.write_bit(configuration.hrd.is_some())?; // nal_hrd_parameters_present_flag
+        if let Some(hrd) = configuration.hrd {
+            write_ue(&mut writer, 0)?; // cpb_cnt_minus1
+            writer.write_bits(u64::from(hrd.bit_rate_scale), 4)?;
+            writer.write_bits(u64::from(hrd.cpb_size_scale), 4)?;
+            write_ue(&mut writer, u64::from(hrd.bit_rate_value_minus1))?;
+            write_ue(&mut writer, u64::from(hrd.cpb_size_value_minus1))?;
+            writer.write_bit(false)?; // cbr_flag
+            writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+            writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+            writer.write_bits(u64::from(HrdState::DELAY_BITS - 1), 5)?;
+            writer.write_bits(0, 5)?; // time_offset_length
+        }
         writer.write_bit(false)?; // vcl_hrd_parameters_present_flag
-        writer.write_bit(false)?; // low_delay_hrd_flag
+        if configuration.hrd.is_some() {
+            writer.write_bit(false)?; // low_delay_hrd_flag
+        }
         writer.write_bit(false)?; // pic_struct_present_flag
         writer.write_bit(false)?; // bitstream_restriction_flag
     }
@@ -1900,7 +1944,22 @@ fn encode_idr(
                 macroblocks_wide,
                 macroblocks_high,
             ),
-            _ => unreachable!("configuration gates CABAC macroblock modes"),
+            EncoderMode::Intra4 | EncoderMode::Inter => encode_cabac_intra4_idr(
+                frame,
+                configuration,
+                rbsp,
+                &padded,
+                macroblocks_wide,
+                macroblocks_high,
+            ),
+            EncoderMode::Intra8 => encode_cabac_intra8_idr(
+                frame,
+                configuration,
+                rbsp,
+                &padded,
+                macroblocks_wide,
+                macroblocks_high,
+            ),
         };
     }
     let macroblock_qps = adaptive_macroblock_qps(
@@ -2196,16 +2255,18 @@ fn encode_cabac_ipcm_idr(
 }
 
 #[derive(Debug)]
-struct CabacIntra16CodedBlocks {
+struct CabacIntraCodedBlocks {
+    patterns: Vec<u8>,
     luma_dc: Vec<bool>,
     chroma_dc: Vec<[bool; 2]>,
     luma_ac: Vec<[bool; 16]>,
     chroma_ac: Vec<[[bool; 4]; 2]>,
 }
 
-impl CabacIntra16CodedBlocks {
+impl CabacIntraCodedBlocks {
     fn new(macroblock_count: usize) -> Self {
         Self {
+            patterns: vec![0; macroblock_count],
             luma_dc: vec![false; macroblock_count],
             chroma_dc: vec![[false; 2]; macroblock_count],
             luma_ac: vec![[false; 16]; macroblock_count],
@@ -2234,7 +2295,7 @@ fn encode_cabac_intra16_idr(
     );
     let mut contexts = CabacIContexts::new(configuration.qp)?;
     let mut arithmetic = CabacEncoder::new();
-    let mut coded_blocks = CabacIntra16CodedBlocks::new(macroblock_count);
+    let mut coded_blocks = CabacIntraCodedBlocks::new(macroblock_count);
     let mut chroma_prediction_modes = vec![0_u8; macroblock_count];
     let mut previous_qp = configuration.qp;
     let mut previous_qp_delta = 0;
@@ -2466,14 +2527,607 @@ fn encode_cabac_intra16_idr(
     })
 }
 
+#[allow(clippy::too_many_lines)]
+fn encode_cabac_intra4_idr(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    mut rbsp: Vec<u8>,
+    source: &[Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    debug_assert!(matches!(
+        configuration.mode,
+        EncoderMode::Intra4 | EncoderMode::Inter
+    ));
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let macroblock_qps = adaptive_macroblock_qps(
+        &source[0],
+        configuration.coded_width,
+        configuration.coded_height,
+        configuration.qp,
+        configuration.aq_strength,
+    );
+    let mut contexts = CabacIContexts::new(configuration.qp)?;
+    let mut arithmetic = CabacEncoder::new();
+    let mut coded_blocks = CabacIntraCodedBlocks::new(macroblock_count);
+    let mut luma_modes = vec![[2_u8; 16]; macroblock_count];
+    let mut chroma_prediction_modes = vec![0_u8; macroblock_count];
+    let transform_8x8 = vec![false; macroblock_count];
+    let mut previous_qp = configuration.qp;
+    let mut previous_qp_delta = 0;
+    let mut reconstructed: [Vec<u8>; 3] = std::array::from_fn(|component| {
+        let divisor = if component == 0 { 1 } else { 2 };
+        vec![0; configuration.coded_width / divisor * configuration.coded_height / divisor]
+    });
+
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let macroblock_qp = macroblock_qps[address];
+            let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+            let mut levels = [[0_i32; 16]; 16];
+            for block_index in 0..16 {
+                let (block_x, block_y) = luma_block_position(block_index);
+                let origin_x = macroblock_x * 16 + block_x * 4;
+                let origin_y = macroblock_y * 16 + block_y * 4;
+                let (mode, prediction) = (0..=8)
+                    .filter_map(|mode| {
+                        intra4_prediction(
+                            &reconstructed[0],
+                            configuration.coded_width,
+                            origin_x,
+                            origin_y,
+                            block_index,
+                            mode,
+                            macroblock_y > 0,
+                            macroblock_x > 0,
+                        )
+                        .map(|prediction| {
+                            let sad = block_sad(
+                                &source[0],
+                                configuration.coded_width,
+                                origin_x,
+                                origin_y,
+                                4,
+                                &prediction,
+                            );
+                            (mode, prediction, sad)
+                        })
+                    })
+                    .min_by_key(|(_, _, sad)| *sad)
+                    .map(|(mode, prediction, _)| (mode, prediction))
+                    .expect("Intra4 DC prediction is always available");
+                luma_modes[address][block_index] = mode;
+                levels[block_index] = quantize_intra4_luma_block(
+                    &source[0],
+                    configuration.coded_width,
+                    origin_x,
+                    origin_y,
+                    &prediction,
+                    macroblock_qp,
+                    configuration.transform_bypass,
+                    mode,
+                    configuration.scaling_matrix.four_by_four(true),
+                );
+                if configuration.transform_bypass {
+                    let samples: [u8; 16] = std::array::from_fn(|index| {
+                        source[0][(origin_y + index / 4) * configuration.coded_width
+                            + origin_x
+                            + index % 4]
+                    });
+                    place_block(
+                        &mut reconstructed[0],
+                        configuration.coded_width,
+                        origin_x,
+                        origin_y,
+                        4,
+                        &samples,
+                    );
+                } else {
+                    reconstruct_intra4_luma_block(
+                        &mut reconstructed[0],
+                        configuration.coded_width,
+                        origin_x,
+                        origin_y,
+                        &prediction,
+                        &levels[block_index],
+                        macroblock_qp,
+                        configuration.scaling_matrix.four_by_four(true),
+                    );
+                }
+            }
+
+            let (chroma_mode, chroma_predictions) = select_chroma_prediction(
+                [&source[1], &source[2]],
+                [&reconstructed[1], &reconstructed[2]],
+                configuration.coded_width / 2,
+                macroblock_x,
+                macroblock_y,
+            );
+            let chroma_qp = chroma_qp(macroblock_qp);
+            let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+                quantize_chroma_residual(
+                    &source[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    &chroma_predictions[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                )
+            });
+            let luma_pattern = luma_coded_block_pattern(&levels);
+            let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
+            let coded_block_pattern = luma_pattern | chroma_pattern << 4;
+
+            encode_cabac_i_macroblock_type(&mut arithmetic, &mut contexts, 0, 0)?;
+            if configuration.transform_8x8_mode {
+                let left = !address.is_multiple_of(macroblocks_wide) && transform_8x8[address - 1];
+                let top = address >= macroblocks_wide && transform_8x8[address - macroblocks_wide];
+                arithmetic.decision(
+                    &mut contexts.transform_size_8x8[usize::from(left) + usize::from(top)],
+                    false,
+                )?;
+            }
+            for block_index in 0..16 {
+                let predicted =
+                    predicted_intra4_mode(&luma_modes, address, block_index, macroblocks_wide);
+                let mode = luma_modes[address][block_index];
+                arithmetic.decision(&mut contexts.intra4_prediction_mode[0], mode == predicted)?;
+                if mode != predicted {
+                    let remaining = mode - u8::from(mode > predicted);
+                    for bit in 0..3 {
+                        arithmetic.decision(
+                            &mut contexts.intra4_prediction_mode[1],
+                            remaining & (1 << bit) != 0,
+                        )?;
+                    }
+                }
+            }
+            encode_cabac_chroma_prediction_mode(
+                &mut arithmetic,
+                &mut contexts,
+                chroma_mode,
+                address,
+                macroblocks_wide,
+                &chroma_prediction_modes,
+            )?;
+            chroma_prediction_modes[address] = chroma_mode;
+            encode_cabac_coded_block_pattern(
+                &mut arithmetic,
+                &mut contexts,
+                coded_block_pattern,
+                address,
+                macroblocks_wide,
+                &coded_blocks.patterns,
+            )?;
+            coded_blocks.patterns[address] = coded_block_pattern;
+            if coded_block_pattern == 0 {
+                previous_qp_delta = 0;
+            } else {
+                encode_cabac_macroblock_qp_delta(
+                    &mut arithmetic,
+                    &mut contexts,
+                    qp_delta,
+                    previous_qp_delta,
+                )?;
+                previous_qp_delta = qp_delta;
+                previous_qp = macroblock_qp;
+            }
+
+            for group in 0..4 {
+                if luma_pattern & (1 << group) == 0 {
+                    continue;
+                }
+                for (block_index, block_levels) in levels.iter().enumerate().skip(group * 4).take(4)
+                {
+                    let coded_context = cabac_intra_luma_ac_coded_context(
+                        address,
+                        macroblocks_wide,
+                        block_index,
+                        &coded_blocks.luma_ac,
+                    );
+                    let coded = block_levels.iter().any(|&level| level != 0);
+                    arithmetic
+                        .decision(&mut contexts.luma_4x4_coded_block[coded_context], coded)?;
+                    coded_blocks.luma_ac[address][block_index] = coded;
+                    if coded {
+                        encode_cabac_residual_block(
+                            &mut arithmetic,
+                            &mut contexts.luma_4x4_significant,
+                            &mut contexts.luma_4x4_last,
+                            &mut contexts.luma_4x4_abs_level,
+                            block_levels,
+                        )?;
+                    }
+                }
+            }
+            encode_cabac_chroma_residuals(
+                &mut arithmetic,
+                &mut contexts,
+                &chroma_residuals,
+                chroma_pattern,
+                address,
+                macroblocks_wide,
+                &mut coded_blocks,
+            )?;
+
+            for (component, prediction) in chroma_predictions.iter().enumerate() {
+                reconstruct_chroma(
+                    &mut reconstructed[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    prediction,
+                    &chroma_residuals[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                );
+            }
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    let visible = visible_frame(frame, configuration, &reconstructed);
+    Ok(EncodedFrame {
+        nal: make_nal(0x65, rbsp),
+        reconstructed: visible,
+        coded_reconstruction: reconstructed,
+        motion_l0: vec![[None; 16]; macroblock_count],
+        reference_l0_poc: vec![[None; 16]; macroblock_count],
+        macroblock_intra: vec![true; macroblock_count],
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_cabac_intra8_idr(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    mut rbsp: Vec<u8>,
+    source: &[Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    debug_assert_eq!(configuration.mode, EncoderMode::Intra8);
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let macroblock_qps = adaptive_macroblock_qps(
+        &source[0],
+        configuration.coded_width,
+        configuration.coded_height,
+        configuration.qp,
+        configuration.aq_strength,
+    );
+    let mut contexts = CabacIContexts::new(configuration.qp)?;
+    let mut arithmetic = CabacEncoder::new();
+    let mut coded_blocks = CabacIntraCodedBlocks::new(macroblock_count);
+    let mut luma_modes = vec![[2_u8; 16]; macroblock_count];
+    let mut chroma_prediction_modes = vec![0_u8; macroblock_count];
+    let mut transform_8x8 = vec![false; macroblock_count];
+    let mut previous_qp = configuration.qp;
+    let mut previous_qp_delta = 0;
+    let mut reconstructed: [Vec<u8>; 3] = std::array::from_fn(|component| {
+        let divisor = if component == 0 { 1 } else { 2 };
+        vec![0; configuration.coded_width / divisor * configuration.coded_height / divisor]
+    });
+
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let macroblock_qp = macroblock_qps[address];
+            let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+            let mut levels = [[0_i32; 64]; 4];
+            for (group, group_levels) in levels.iter_mut().enumerate() {
+                let origin_x = macroblock_x * 16 + (group % 2) * 8;
+                let origin_y = macroblock_y * 16 + (group / 2) * 8;
+                let (mode, prediction) = (0..=8)
+                    .filter_map(|mode| {
+                        intra8_prediction(
+                            &reconstructed[0],
+                            configuration.coded_width,
+                            origin_x,
+                            origin_y,
+                            group,
+                            mode,
+                            macroblock_y > 0,
+                            macroblock_x > 0,
+                        )
+                        .map(|prediction| {
+                            let sad = block_sad(
+                                &source[0],
+                                configuration.coded_width,
+                                origin_x,
+                                origin_y,
+                                8,
+                                &prediction,
+                            );
+                            (mode, prediction, sad)
+                        })
+                    })
+                    .min_by_key(|(_, _, sad)| *sad)
+                    .map(|(mode, prediction, _)| (mode, prediction))
+                    .expect("Intra8 DC prediction is always available");
+                luma_modes[address][group * 4..group * 4 + 4].fill(mode);
+                *group_levels = quantize_intra8_luma_block(
+                    &source[0],
+                    configuration.coded_width,
+                    origin_x,
+                    origin_y,
+                    &prediction,
+                    macroblock_qp,
+                    configuration.scaling_matrix.eight_by_eight(true),
+                );
+                reconstruct_intra8_luma_block(
+                    &mut reconstructed[0],
+                    configuration.coded_width,
+                    origin_x,
+                    origin_y,
+                    &prediction,
+                    group_levels,
+                    macroblock_qp,
+                    configuration.scaling_matrix.eight_by_eight(true),
+                );
+            }
+
+            let (chroma_mode, chroma_predictions) = select_chroma_prediction(
+                [&source[1], &source[2]],
+                [&reconstructed[1], &reconstructed[2]],
+                configuration.coded_width / 2,
+                macroblock_x,
+                macroblock_y,
+            );
+            let chroma_qp = chroma_qp(macroblock_qp);
+            let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+                quantize_chroma_residual(
+                    &source[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    &chroma_predictions[component],
+                    chroma_qp,
+                    false,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                )
+            });
+            let luma_pattern = (0..4).fold(0_u8, |pattern, group| {
+                pattern | (u8::from(levels[group].iter().any(|&level| level != 0)) << group)
+            });
+            let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
+            let coded_block_pattern = luma_pattern | chroma_pattern << 4;
+
+            encode_cabac_i_macroblock_type(&mut arithmetic, &mut contexts, 0, 0)?;
+            let transform_context = usize::from(macroblock_x != 0 && transform_8x8[address - 1])
+                + usize::from(macroblock_y != 0 && transform_8x8[address - macroblocks_wide]);
+            arithmetic.decision(&mut contexts.transform_size_8x8[transform_context], true)?;
+            transform_8x8[address] = true;
+            for group in 0..4 {
+                let block_index = group * 4;
+                let predicted =
+                    predicted_intra4_mode(&luma_modes, address, block_index, macroblocks_wide);
+                let mode = luma_modes[address][block_index];
+                arithmetic.decision(&mut contexts.intra4_prediction_mode[0], mode == predicted)?;
+                if mode != predicted {
+                    let remaining = mode - u8::from(mode > predicted);
+                    for bit in 0..3 {
+                        arithmetic.decision(
+                            &mut contexts.intra4_prediction_mode[1],
+                            remaining & (1 << bit) != 0,
+                        )?;
+                    }
+                }
+            }
+            encode_cabac_chroma_prediction_mode(
+                &mut arithmetic,
+                &mut contexts,
+                chroma_mode,
+                address,
+                macroblocks_wide,
+                &chroma_prediction_modes,
+            )?;
+            chroma_prediction_modes[address] = chroma_mode;
+            encode_cabac_coded_block_pattern(
+                &mut arithmetic,
+                &mut contexts,
+                coded_block_pattern,
+                address,
+                macroblocks_wide,
+                &coded_blocks.patterns,
+            )?;
+            coded_blocks.patterns[address] = coded_block_pattern;
+            if coded_block_pattern == 0 {
+                previous_qp_delta = 0;
+            } else {
+                encode_cabac_macroblock_qp_delta(
+                    &mut arithmetic,
+                    &mut contexts,
+                    qp_delta,
+                    previous_qp_delta,
+                )?;
+                previous_qp_delta = qp_delta;
+                previous_qp = macroblock_qp;
+            }
+
+            for (group, group_levels) in levels.iter().enumerate() {
+                if luma_pattern & (1 << group) == 0 {
+                    continue;
+                }
+                encode_cabac_residual_8x8(
+                    &mut arithmetic,
+                    &mut contexts.luma_8x8_significant,
+                    &mut contexts.luma_8x8_last,
+                    &mut contexts.luma_8x8_abs_level,
+                    group_levels,
+                )?;
+                coded_blocks.luma_ac[address][group * 4..group * 4 + 4].fill(true);
+            }
+            encode_cabac_chroma_residuals(
+                &mut arithmetic,
+                &mut contexts,
+                &chroma_residuals,
+                chroma_pattern,
+                address,
+                macroblocks_wide,
+                &mut coded_blocks,
+            )?;
+
+            for (component, prediction) in chroma_predictions.iter().enumerate() {
+                reconstruct_chroma(
+                    &mut reconstructed[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    prediction,
+                    &chroma_residuals[component],
+                    chroma_qp,
+                    false,
+                    Some(chroma_mode),
+                    configuration.scaling_matrix.four_by_four(true),
+                );
+            }
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    let visible = visible_frame(frame, configuration, &reconstructed);
+    Ok(EncodedFrame {
+        nal: make_nal(0x65, rbsp),
+        reconstructed: visible,
+        coded_reconstruction: reconstructed,
+        motion_l0: vec![[None; 16]; macroblock_count],
+        reference_l0_poc: vec![[None; 16]; macroblock_count],
+        macroblock_intra: vec![true; macroblock_count],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_cabac_chroma_residuals(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacIContexts,
+    residuals: &[ChromaResidual; 2],
+    chroma_pattern: u8,
+    address: usize,
+    macroblocks_wide: usize,
+    coded_blocks: &mut CabacIntraCodedBlocks,
+) -> Result<()> {
+    if chroma_pattern != 0 {
+        for (component, residual) in residuals.iter().enumerate() {
+            let coded_context =
+                cabac_intra_dc_coded_context(address, macroblocks_wide, |neighbor| {
+                    coded_blocks.chroma_dc[neighbor][component]
+                });
+            let coded = residual.dc.iter().any(|&level| level != 0);
+            arithmetic.decision(&mut contexts.chroma_dc_coded_block[coded_context], coded)?;
+            coded_blocks.chroma_dc[address][component] = coded;
+            if coded {
+                encode_cabac_residual_block(
+                    arithmetic,
+                    &mut contexts.chroma_dc_significant,
+                    &mut contexts.chroma_dc_last,
+                    &mut contexts.chroma_dc_abs_level,
+                    &residual.dc,
+                )?;
+            }
+        }
+    }
+    if chroma_pattern == 2 {
+        for (component, residual) in residuals.iter().enumerate() {
+            for (block_index, levels) in residual.ac.iter().enumerate() {
+                let coded_context = cabac_intra_chroma_ac_coded_context(
+                    address,
+                    macroblocks_wide,
+                    component,
+                    block_index,
+                    &coded_blocks.chroma_ac,
+                );
+                let coded = levels.iter().any(|&level| level != 0);
+                arithmetic.decision(&mut contexts.chroma_ac_coded_block[coded_context], coded)?;
+                coded_blocks.chroma_ac[address][component][block_index] = coded;
+                if coded {
+                    encode_cabac_residual_block(
+                        arithmetic,
+                        &mut contexts.chroma_ac_significant,
+                        &mut contexts.chroma_ac_last,
+                        &mut contexts.chroma_ac_abs_level,
+                        levels,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_cabac_coded_block_pattern(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacIContexts,
+    pattern: u8,
+    address: usize,
+    macroblocks_wide: usize,
+    patterns: &[u8],
+) -> Result<()> {
+    let left = if address.is_multiple_of(macroblocks_wide) {
+        15
+    } else {
+        patterns[address - 1]
+    };
+    let top = if address >= macroblocks_wide {
+        patterns[address - macroblocks_wide]
+    } else {
+        15
+    };
+    let mut luma = 0_u8;
+    for (bit, context_index) in [
+        usize::from(left & 0x02 == 0) + 2 * usize::from(top & 0x04 == 0),
+        usize::from(pattern & 0x01 == 0) + 2 * usize::from(top & 0x08 == 0),
+        usize::from(left & 0x08 == 0) + 2 * usize::from(pattern & 0x01 == 0),
+        usize::from(pattern & 0x04 == 0) + 2 * usize::from(pattern & 0x02 == 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let value = pattern & (1 << bit) != 0;
+        arithmetic.decision(&mut contexts.coded_block_pattern_luma[context_index], value)?;
+        luma |= u8::from(value) << bit;
+    }
+    debug_assert_eq!(luma, pattern & 15);
+
+    let chroma = pattern >> 4;
+    let left_chroma = left >> 4;
+    let top_chroma = top >> 4;
+    let first_context = usize::from(left_chroma > 0) + 2 * usize::from(top_chroma > 0);
+    arithmetic.decision(
+        &mut contexts.coded_block_pattern_chroma[first_context],
+        chroma != 0,
+    )?;
+    if chroma != 0 {
+        let second_context = 4 + usize::from(left_chroma == 2) + 2 * usize::from(top_chroma == 2);
+        arithmetic.decision(
+            &mut contexts.coded_block_pattern_chroma[second_context],
+            chroma == 2,
+        )?;
+    }
+    Ok(())
+}
+
 fn encode_cabac_i_macroblock_type(
     arithmetic: &mut CabacEncoder,
     contexts: &mut CabacIContexts,
     macroblock_type: u8,
     context_increment: usize,
 ) -> Result<()> {
-    debug_assert!((1..=24).contains(&macroblock_type));
-    arithmetic.decision(&mut contexts.macroblock_type[3 + context_increment], true)?;
+    debug_assert!(macroblock_type <= 24);
+    arithmetic.decision(
+        &mut contexts.macroblock_type[3 + context_increment],
+        macroblock_type != 0,
+    )?;
+    if macroblock_type == 0 {
+        return Ok(());
+    }
     arithmetic.terminate(false)?;
     let code = macroblock_type - 1;
     arithmetic.decision(&mut contexts.macroblock_type[6], code >= 12)?;
@@ -2548,11 +3202,6 @@ fn encode_cabac_residual_block(
     absolute_level_contexts: &mut [crate::cabac::ContextState],
     levels: &[i32],
 ) -> Result<()> {
-    const LEVEL_ONE_CONTEXT: [usize; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
-    const LEVEL_GT_ONE_CONTEXT: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
-    const AFTER_LEVEL_ONE: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
-    const AFTER_LEVEL_GT_ONE: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
-
     let last_nonzero = levels
         .iter()
         .rposition(|&level| level != 0)
@@ -2569,12 +3218,68 @@ fn encode_cabac_residual_block(
         }
     }
 
-    let mut node_context = 0;
-    for &level in levels[..=last_nonzero]
+    encode_cabac_coefficient_levels(
+        arithmetic,
+        absolute_level_contexts,
+        &levels[..=last_nonzero],
+    )
+}
+
+fn encode_cabac_residual_8x8(
+    arithmetic: &mut CabacEncoder,
+    significant_contexts: &mut [crate::cabac::ContextState; 15],
+    last_contexts: &mut [crate::cabac::ContextState; 9],
+    absolute_level_contexts: &mut [crate::cabac::ContextState; 10],
+    levels: &[i32; 64],
+) -> Result<()> {
+    const SIGNIFICANT_CONTEXT: [usize; 63] = [
+        0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9,
+        8, 7, 7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9,
+        11, 12, 13, 11, 14, 10, 12,
+    ];
+    const LAST_CONTEXT: [usize; 63] = [
+        0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+        8, 8, 8,
+    ];
+
+    let last_nonzero = levels
         .iter()
-        .rev()
-        .filter(|&&level| level != 0)
-    {
+        .rposition(|&level| level != 0)
+        .expect("coded CABAC 8x8 residual block contains a coefficient");
+    for (position, &level) in levels.iter().enumerate().take(63) {
+        let significant = level != 0;
+        arithmetic.decision(
+            &mut significant_contexts[SIGNIFICANT_CONTEXT[position]],
+            significant,
+        )?;
+        if significant {
+            let last = position == last_nonzero;
+            arithmetic.decision(&mut last_contexts[LAST_CONTEXT[position]], last)?;
+            if last {
+                break;
+            }
+        }
+    }
+    encode_cabac_coefficient_levels(
+        arithmetic,
+        absolute_level_contexts,
+        &levels[..=last_nonzero],
+    )
+}
+
+fn encode_cabac_coefficient_levels(
+    arithmetic: &mut CabacEncoder,
+    absolute_level_contexts: &mut [crate::cabac::ContextState],
+    levels: &[i32],
+) -> Result<()> {
+    const LEVEL_ONE_CONTEXT: [usize; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+    const LEVEL_GT_ONE_CONTEXT: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
+    const AFTER_LEVEL_ONE: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
+    const AFTER_LEVEL_GT_ONE: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
+
+    let mut node_context = 0;
+    for &level in levels.iter().rev().filter(|&&level| level != 0) {
         let absolute_level = level.unsigned_abs();
         arithmetic.decision(
             &mut absolute_level_contexts[LEVEL_ONE_CONTEXT[node_context]],
@@ -2699,6 +3404,9 @@ fn encode_p_picture(
     }
     writer.write_bit(false)?; // ref_pic_list_modification_flag_l0
     writer.write_bit(false)?; // adaptive_ref_pic_marking_mode_flag
+    if configuration.entropy_coding == EntropyCoding::Cabac {
+        write_ue(&mut writer, 0)?; // cabac_init_idc
+    }
     write_se(&mut writer, i64::from(configuration.qp - 26))?;
     write_ue(&mut writer, 1)?; // disable_deblocking_filter_idc
 
@@ -2706,6 +3414,19 @@ fn encode_p_picture(
     let macroblocks_high = configuration.coded_height / 16;
     let macroblock_count = macroblocks_wide * macroblocks_high;
     let source = padded_planes(frame, configuration);
+    if configuration.entropy_coding == EntropyCoding::Cabac {
+        writer.align_to_byte_with(true); // cabac_alignment_one_bit
+        return encode_cabac_p_picture_data(
+            frame,
+            configuration,
+            references,
+            active_references_minus1,
+            writer.into_bytes(),
+            &source,
+            macroblocks_wide,
+            macroblocks_high,
+        );
+    }
     let macroblock_qps = adaptive_macroblock_qps(
         &source[0],
         configuration.coded_width,
@@ -2723,7 +3444,7 @@ fn encode_p_picture(
         for macroblock_x in 0..macroblocks_wide {
             let address = macroblock_y * macroblocks_wide + macroblock_x;
             let macroblock_qp = macroblock_qps[address];
-            let decision = select_inter_partitions(
+            let decision = select_inter_partitions_with_analysis(
                 &source,
                 references,
                 configuration.coded_width,
@@ -2731,6 +3452,7 @@ fn encode_p_picture(
                 macroblock_x,
                 macroblock_y,
                 configuration.search_range,
+                configuration.analysis,
                 &motions,
                 address,
                 macroblocks_wide,
@@ -2746,7 +3468,7 @@ fn encode_p_picture(
                 macroblock_y,
                 &decision.luma_prediction,
                 macroblock_qp,
-                transform_8x8_allowed,
+                transform_8x8_allowed && configuration.analysis == AnalysisPreset::Full,
                 configuration.transform_bypass,
                 configuration.scaling_matrix,
             );
@@ -2909,6 +3631,814 @@ fn encode_p_picture(
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn encode_cabac_p_picture_data(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    references: &VecDeque<EncoderReference>,
+    active_references_minus1: u32,
+    mut rbsp: Vec<u8>,
+    source: &[Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let macroblock_qps = adaptive_macroblock_qps(
+        &source[0],
+        configuration.coded_width,
+        configuration.coded_height,
+        configuration.qp,
+        configuration.aq_strength,
+    );
+    let mut contexts = CabacPContexts::new(configuration.qp, 0)?;
+    let mut arithmetic = CabacEncoder::new();
+    let mut coded_blocks = CabacIntraCodedBlocks::new(macroblock_count);
+    let mut skipped = vec![false; macroblock_count];
+    let mut transform_8x8 = vec![false; macroblock_count];
+    let mut reference_indices = vec![[None; 16]; macroblock_count];
+    let mut motion_differences = vec![[MotionVector::default(); 16]; macroblock_count];
+    let mut motions = vec![[None; 16]; macroblock_count];
+    let mut reconstructed = references
+        .front()
+        .expect("P picture has at least one short-term reference")
+        .planes
+        .clone();
+    let mut previous_qp = configuration.qp;
+    let mut previous_qp_delta = 0;
+
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let macroblock_qp = macroblock_qps[address];
+            let decision = select_inter_partitions_with_analysis(
+                source,
+                references,
+                configuration.coded_width,
+                configuration.coded_height,
+                macroblock_x,
+                macroblock_y,
+                configuration.search_range,
+                configuration.analysis,
+                &motions,
+                address,
+                macroblocks_wide,
+            );
+            let transform_allowed = configuration.transform_8x8_mode
+                && decision.partitions.iter().all(|selected| {
+                    selected.partition.block_width >= 2 && selected.partition.block_height >= 2
+                });
+            let luma_levels = select_inter_luma_residual(
+                &source[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &decision.luma_prediction,
+                macroblock_qp,
+                transform_allowed && configuration.analysis == AnalysisPreset::Full,
+                configuration.transform_bypass,
+                configuration.scaling_matrix,
+            );
+            let chroma_qp = chroma_qp(macroblock_qp);
+            let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+                quantize_chroma_residual(
+                    &source[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    &decision.chroma_predictions[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
+                )
+            });
+            let luma_pattern = luma_levels.coded_block_pattern();
+            let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
+            let coded_block_pattern = luma_pattern | chroma_pattern << 4;
+
+            reconstruct_inter_luma(
+                &mut reconstructed[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &decision.luma_prediction,
+                &luma_levels,
+                macroblock_qp,
+                configuration.scaling_matrix,
+            );
+            for (component, prediction) in decision.chroma_predictions.iter().enumerate() {
+                reconstruct_chroma(
+                    &mut reconstructed[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    prediction,
+                    &chroma_residuals[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
+                );
+            }
+
+            let skip_motion = p_skip_motion(&motions, address, macroblocks_wide);
+            let is_skipped = coded_block_pattern == 0
+                && decision.macroblock_type == 0
+                && decision.partitions[0].reference_index == 0
+                && decision.partitions[0].motion == skip_motion;
+            let skip_context =
+                usize::from(!address.is_multiple_of(macroblocks_wide) && !skipped[address - 1])
+                    + usize::from(
+                        address >= macroblocks_wide && !skipped[address - macroblocks_wide],
+                    );
+            arithmetic.decision(&mut contexts.skip[skip_context], is_skipped)?;
+            if is_skipped {
+                skipped[address] = true;
+                previous_qp_delta = 0;
+                reference_indices[address].fill(Some(0));
+                set_partition_motion(
+                    &mut motions[address],
+                    InterPartition {
+                        block_x: 0,
+                        block_y: 0,
+                        block_width: 4,
+                        block_height: 4,
+                        prediction_kind: MotionPredictionKind::Normal,
+                    },
+                    MotionState {
+                        vector: skip_motion,
+                        reference_index: Some(0),
+                    },
+                );
+                arithmetic.terminate(address + 1 == macroblock_count)?;
+                continue;
+            }
+
+            encode_cabac_p_macroblock_type(
+                &mut arithmetic,
+                &mut contexts,
+                decision.macroblock_type,
+            )?;
+            if decision.macroblock_type == 3 {
+                for sub_type in decision.sub_macroblock_types {
+                    encode_cabac_p_sub_macroblock_type(&mut arithmetic, &mut contexts, sub_type)?;
+                }
+            }
+            for partition in p_reference_partitions(decision.macroblock_type) {
+                let selected = decision
+                    .partitions
+                    .iter()
+                    .find(|selected| {
+                        selected.partition.block_x == partition.block_x
+                            && selected.partition.block_y == partition.block_y
+                    })
+                    .expect("P reference partition starts with an encoded motion partition");
+                let context_increment = cabac_reference_index_context_encoder(
+                    address,
+                    macroblocks_wide,
+                    partition.block_x,
+                    partition.block_y,
+                    &reference_indices,
+                );
+                encode_cabac_reference_index(
+                    &mut arithmetic,
+                    &mut contexts,
+                    context_increment,
+                    selected.reference_index,
+                    active_references_minus1,
+                )?;
+                set_cabac_partition_reference_encoder(
+                    &mut reference_indices,
+                    address,
+                    partition,
+                    selected.reference_index,
+                );
+            }
+            for selected in &decision.partitions {
+                let difference = MotionVector {
+                    x: selected.motion.x - selected.predicted.x,
+                    y: selected.motion.y - selected.predicted.y,
+                };
+                encode_cabac_partition_motion_difference(
+                    &mut arithmetic,
+                    &mut contexts,
+                    address,
+                    macroblocks_wide,
+                    selected.partition,
+                    difference,
+                    &mut motion_differences,
+                )?;
+            }
+            encode_cabac_p_coded_block_pattern(
+                &mut arithmetic,
+                &mut contexts,
+                coded_block_pattern,
+                address,
+                macroblocks_wide,
+                &coded_blocks.patterns,
+            )?;
+            coded_blocks.patterns[address] = coded_block_pattern;
+            if transform_allowed && luma_pattern != 0 {
+                let left = !address.is_multiple_of(macroblocks_wide) && transform_8x8[address - 1];
+                let top = address >= macroblocks_wide && transform_8x8[address - macroblocks_wide];
+                arithmetic.decision(
+                    &mut contexts.transform_size_8x8[usize::from(left) + usize::from(top)],
+                    luma_levels.uses_8x8(),
+                )?;
+                transform_8x8[address] = luma_levels.uses_8x8();
+            }
+            if coded_block_pattern == 0 {
+                previous_qp_delta = 0;
+            } else {
+                let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+                encode_cabac_p_macroblock_qp_delta(
+                    &mut arithmetic,
+                    &mut contexts,
+                    qp_delta,
+                    previous_qp_delta,
+                )?;
+                previous_qp_delta = qp_delta;
+                previous_qp = macroblock_qp;
+            }
+            encode_cabac_p_residuals(
+                &mut arithmetic,
+                &mut contexts,
+                &luma_levels,
+                &chroma_residuals,
+                luma_pattern,
+                chroma_pattern,
+                address,
+                macroblocks_wide,
+                &mut coded_blocks,
+            )?;
+            for selected in decision.partitions {
+                set_partition_motion(
+                    &mut motions[address],
+                    selected.partition,
+                    MotionState {
+                        vector: selected.motion,
+                        reference_index: Some(selected.reference_index),
+                    },
+                );
+            }
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    let reference_l0_poc = motions
+        .iter()
+        .map(|blocks| {
+            std::array::from_fn(|block| {
+                blocks[block]
+                    .and_then(|motion| motion.reference_index)
+                    .and_then(|index| references.get(usize::from(index)))
+                    .map(|reference| reference.pic_order_count)
+            })
+        })
+        .collect();
+    Ok(EncodedFrame {
+        nal: make_nal(0x41, rbsp),
+        reconstructed: visible_frame(frame, configuration, &reconstructed),
+        coded_reconstruction: reconstructed,
+        motion_l0: motions,
+        reference_l0_poc,
+        macroblock_intra: vec![false; macroblock_count],
+    })
+}
+
+fn encode_cabac_p_macroblock_type(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    macroblock_type: u8,
+) -> Result<()> {
+    debug_assert!(macroblock_type <= 3);
+    arithmetic.decision(&mut contexts.macroblock_type[0], false)?;
+    match macroblock_type {
+        0 => {
+            arithmetic.decision(&mut contexts.macroblock_type[1], false)?;
+            arithmetic.decision(&mut contexts.macroblock_type[2], false)
+        }
+        1 => {
+            arithmetic.decision(&mut contexts.macroblock_type[1], true)?;
+            arithmetic.decision(&mut contexts.macroblock_type[3], true)
+        }
+        2 => {
+            arithmetic.decision(&mut contexts.macroblock_type[1], true)?;
+            arithmetic.decision(&mut contexts.macroblock_type[3], false)
+        }
+        3 => {
+            arithmetic.decision(&mut contexts.macroblock_type[1], false)?;
+            arithmetic.decision(&mut contexts.macroblock_type[2], true)
+        }
+        _ => unreachable!("P macroblock type is in 0..=3"),
+    }
+}
+
+fn encode_cabac_p_sub_macroblock_type(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    sub_type: u8,
+) -> Result<()> {
+    debug_assert!(sub_type <= 3);
+    arithmetic.decision(&mut contexts.sub_macroblock_type[0], sub_type == 0)?;
+    if sub_type == 0 {
+        return Ok(());
+    }
+    arithmetic.decision(&mut contexts.sub_macroblock_type[1], sub_type >= 2)?;
+    if sub_type >= 2 {
+        arithmetic.decision(&mut contexts.sub_macroblock_type[2], sub_type == 2)?;
+    }
+    Ok(())
+}
+
+fn p_reference_partitions(macroblock_type: u8) -> Vec<InterPartition> {
+    match macroblock_type {
+        0 => vec![InterPartition {
+            block_x: 0,
+            block_y: 0,
+            block_width: 4,
+            block_height: 4,
+            prediction_kind: MotionPredictionKind::Normal,
+        }],
+        1 => vec![
+            InterPartition {
+                block_x: 0,
+                block_y: 0,
+                block_width: 4,
+                block_height: 2,
+                prediction_kind: MotionPredictionKind::Top16x8,
+            },
+            InterPartition {
+                block_x: 0,
+                block_y: 2,
+                block_width: 4,
+                block_height: 2,
+                prediction_kind: MotionPredictionKind::Bottom16x8,
+            },
+        ],
+        2 => vec![
+            InterPartition {
+                block_x: 0,
+                block_y: 0,
+                block_width: 2,
+                block_height: 4,
+                prediction_kind: MotionPredictionKind::Left8x16,
+            },
+            InterPartition {
+                block_x: 2,
+                block_y: 0,
+                block_width: 2,
+                block_height: 4,
+                prediction_kind: MotionPredictionKind::Right8x16,
+            },
+        ],
+        3 => (0..4)
+            .map(|sub_index| InterPartition {
+                block_x: (sub_index % 2) * 2,
+                block_y: (sub_index / 2) * 2,
+                block_width: 2,
+                block_height: 2,
+                prediction_kind: MotionPredictionKind::Normal,
+            })
+            .collect(),
+        _ => unreachable!("P macroblock type is in 0..=3"),
+    }
+}
+
+fn encode_cabac_reference_index(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    context_increment: usize,
+    reference_index: u8,
+    active_references_minus1: u32,
+) -> Result<()> {
+    if active_references_minus1 == 0 {
+        return Ok(());
+    }
+    debug_assert!(u32::from(reference_index) <= active_references_minus1);
+    let mut context_index = context_increment;
+    for _ in 0..reference_index {
+        arithmetic.decision(&mut contexts.reference_index[context_index], true)?;
+        context_index = (context_index >> 2) + 4;
+    }
+    arithmetic.decision(&mut contexts.reference_index[context_index], false)
+}
+
+fn cabac_reference_index_context_encoder(
+    address: usize,
+    macroblocks_wide: usize,
+    block_x: usize,
+    block_y: usize,
+    reference_indices: &[[Option<u8>; 16]],
+) -> usize {
+    let macroblock_x = address % macroblocks_wide;
+    let macroblock_y = address / macroblocks_wide;
+    let absolute_x = macroblock_x * 4 + block_x;
+    let absolute_y = macroblock_y * 4 + block_y;
+    usize::from(
+        cabac_reference_at_encoder(
+            absolute_x.cast_signed() - 1,
+            absolute_y.cast_signed(),
+            macroblocks_wide,
+            reference_indices,
+        )
+        .is_some_and(|index| index > 0),
+    ) + 2 * usize::from(
+        cabac_reference_at_encoder(
+            absolute_x.cast_signed(),
+            absolute_y.cast_signed() - 1,
+            macroblocks_wide,
+            reference_indices,
+        )
+        .is_some_and(|index| index > 0),
+    )
+}
+
+fn cabac_reference_at_encoder(
+    block_x: isize,
+    block_y: isize,
+    macroblocks_wide: usize,
+    reference_indices: &[[Option<u8>; 16]],
+) -> Option<u8> {
+    let blocks_wide = macroblocks_wide * 4;
+    let blocks_high = reference_indices.len().div_ceil(macroblocks_wide) * 4;
+    let block_x = usize::try_from(block_x).ok().filter(|&x| x < blocks_wide)?;
+    let block_y = usize::try_from(block_y).ok().filter(|&y| y < blocks_high)?;
+    let address = (block_y / 4) * macroblocks_wide + block_x / 4;
+    reference_indices.get(address)?[luma_block_index(block_x % 4, block_y % 4)]
+}
+
+fn set_cabac_partition_reference_encoder(
+    reference_indices: &mut [[Option<u8>; 16]],
+    address: usize,
+    partition: InterPartition,
+    reference_index: u8,
+) {
+    for block_y in partition.block_y..partition.block_y + partition.block_height {
+        for block_x in partition.block_x..partition.block_x + partition.block_width {
+            reference_indices[address][luma_block_index(block_x, block_y)] = Some(reference_index);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_cabac_partition_motion_difference(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    address: usize,
+    macroblocks_wide: usize,
+    partition: InterPartition,
+    difference: MotionVector,
+    motion_differences: &mut [[MotionVector; 16]],
+) -> Result<()> {
+    let horizontal_context = cabac_mvd_neighbor_sum_encoder(
+        address,
+        macroblocks_wide,
+        partition.block_x,
+        partition.block_y,
+        motion_differences,
+        |vector| vector.x,
+    );
+    let vertical_context = cabac_mvd_neighbor_sum_encoder(
+        address,
+        macroblocks_wide,
+        partition.block_x,
+        partition.block_y,
+        motion_differences,
+        |vector| vector.y,
+    );
+    encode_cabac_motion_difference(
+        arithmetic,
+        &mut contexts.motion_x,
+        horizontal_context,
+        difference.x,
+    )?;
+    encode_cabac_motion_difference(
+        arithmetic,
+        &mut contexts.motion_y,
+        vertical_context,
+        difference.y,
+    )?;
+    for block_y in partition.block_y..partition.block_y + partition.block_height {
+        for block_x in partition.block_x..partition.block_x + partition.block_width {
+            motion_differences[address][luma_block_index(block_x, block_y)] = difference;
+        }
+    }
+    Ok(())
+}
+
+fn encode_cabac_motion_difference(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut [crate::cabac::ContextState; 7],
+    neighboring_absolute_sum: u32,
+    difference: i32,
+) -> Result<()> {
+    let magnitude = difference.unsigned_abs();
+    let initial_context =
+        usize::from(neighboring_absolute_sum > 2) + usize::from(neighboring_absolute_sum > 32);
+    arithmetic.decision(&mut contexts[initial_context], magnitude != 0)?;
+    if magnitude == 0 {
+        return Ok(());
+    }
+    let mut encoded_magnitude = 1_u32;
+    let mut context_index = 3;
+    while encoded_magnitude < magnitude.min(9) {
+        arithmetic.decision(&mut contexts[context_index], true)?;
+        if encoded_magnitude < 4 {
+            context_index += 1;
+        }
+        encoded_magnitude += 1;
+    }
+    if magnitude < 9 {
+        arithmetic.decision(&mut contexts[context_index], false)?;
+    } else {
+        encode_cabac_unsigned_bypass_order(arithmetic, magnitude - 9, 3)?;
+    }
+    arithmetic.bypass(difference < 0)
+}
+
+fn encode_cabac_unsigned_bypass_order(
+    arithmetic: &mut CabacEncoder,
+    mut value: u32,
+    order: u8,
+) -> Result<()> {
+    let mut suffix_bits = u32::from(order);
+    while value >= 1_u32 << suffix_bits {
+        arithmetic.bypass(true)?;
+        value -= 1_u32 << suffix_bits;
+        suffix_bits += 1;
+    }
+    arithmetic.bypass(false)?;
+    for bit in (0..suffix_bits).rev() {
+        arithmetic.bypass(value & (1 << bit) != 0)?;
+    }
+    Ok(())
+}
+
+fn cabac_mvd_neighbor_sum_encoder(
+    address: usize,
+    macroblocks_wide: usize,
+    block_x: usize,
+    block_y: usize,
+    differences: &[[MotionVector; 16]],
+    component: impl Fn(MotionVector) -> i32,
+) -> u32 {
+    let left = if block_x > 0 {
+        component(differences[address][luma_block_index(block_x - 1, block_y)]).unsigned_abs()
+    } else if address.is_multiple_of(macroblocks_wide) {
+        0
+    } else {
+        component(differences[address - 1][luma_block_index(3, block_y)]).unsigned_abs()
+    };
+    let top = if block_y > 0 {
+        component(differences[address][luma_block_index(block_x, block_y - 1)]).unsigned_abs()
+    } else if address < macroblocks_wide {
+        0
+    } else {
+        component(differences[address - macroblocks_wide][luma_block_index(block_x, 3)])
+            .unsigned_abs()
+    };
+    left.saturating_add(top)
+}
+
+fn encode_cabac_p_coded_block_pattern(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    pattern: u8,
+    address: usize,
+    macroblocks_wide: usize,
+    patterns: &[u8],
+) -> Result<()> {
+    let left = if address.is_multiple_of(macroblocks_wide) {
+        15
+    } else {
+        patterns[address - 1]
+    };
+    let top = if address >= macroblocks_wide {
+        patterns[address - macroblocks_wide]
+    } else {
+        15
+    };
+    for (bit, context_index) in [
+        usize::from(left & 0x02 == 0) + 2 * usize::from(top & 0x04 == 0),
+        usize::from(pattern & 0x01 == 0) + 2 * usize::from(top & 0x08 == 0),
+        usize::from(left & 0x08 == 0) + 2 * usize::from(pattern & 0x01 == 0),
+        usize::from(pattern & 0x04 == 0) + 2 * usize::from(pattern & 0x02 == 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        arithmetic.decision(
+            &mut contexts.coded_block_pattern_luma[context_index],
+            pattern & (1 << bit) != 0,
+        )?;
+    }
+    let chroma = pattern >> 4;
+    let left_chroma = left >> 4;
+    let top_chroma = top >> 4;
+    let first_context = usize::from(left_chroma > 0) + 2 * usize::from(top_chroma > 0);
+    arithmetic.decision(
+        &mut contexts.coded_block_pattern_chroma[first_context],
+        chroma != 0,
+    )?;
+    if chroma != 0 {
+        let second_context = 4 + usize::from(left_chroma == 2) + 2 * usize::from(top_chroma == 2);
+        arithmetic.decision(
+            &mut contexts.coded_block_pattern_chroma[second_context],
+            chroma == 2,
+        )?;
+    }
+    Ok(())
+}
+
+fn encode_cabac_p_macroblock_qp_delta(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    delta: i32,
+    previous_delta: i32,
+) -> Result<()> {
+    arithmetic.decision(
+        &mut contexts.macroblock_qp_delta[usize::from(previous_delta != 0)],
+        delta != 0,
+    )?;
+    if delta == 0 {
+        return Ok(());
+    }
+    let magnitude = delta.unsigned_abs();
+    let code = if delta > 0 {
+        magnitude * 2 - 1
+    } else {
+        magnitude * 2
+    };
+    for index in 1..code {
+        let context_index = if index == 1 { 2 } else { 3 };
+        arithmetic.decision(&mut contexts.macroblock_qp_delta[context_index], true)?;
+    }
+    let context_index = if code == 1 { 2 } else { 3 };
+    arithmetic.decision(&mut contexts.macroblock_qp_delta[context_index], false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_cabac_p_residuals(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacPContexts,
+    luma_levels: &InterLumaResidual,
+    chroma_residuals: &[ChromaResidual; 2],
+    luma_pattern: u8,
+    chroma_pattern: u8,
+    address: usize,
+    macroblocks_wide: usize,
+    coded_blocks: &mut CabacIntraCodedBlocks,
+) -> Result<()> {
+    match luma_levels {
+        InterLumaResidual::FourByFour(levels) | InterLumaResidual::BypassFourByFour(levels) => {
+            for group in 0..4 {
+                if luma_pattern & (1 << group) == 0 {
+                    continue;
+                }
+                for block_index in group * 4..group * 4 + 4 {
+                    let block_levels = &levels[block_index];
+                    let coded_context = cabac_inter_luma_coded_context_encoder(
+                        address,
+                        macroblocks_wide,
+                        block_index,
+                        &coded_blocks.luma_ac,
+                    );
+                    let coded = block_levels.iter().any(|&level| level != 0);
+                    arithmetic.decision(&mut contexts.luma_coded_block[coded_context], coded)?;
+                    coded_blocks.luma_ac[address][block_index] = coded;
+                    if coded {
+                        encode_cabac_residual_block(
+                            arithmetic,
+                            &mut contexts.luma_significant,
+                            &mut contexts.luma_last,
+                            &mut contexts.luma_abs_level,
+                            block_levels,
+                        )?;
+                    }
+                }
+            }
+        }
+        InterLumaResidual::EightByEight(levels) => {
+            for (group, group_levels) in levels.iter().enumerate() {
+                if luma_pattern & (1 << group) == 0 {
+                    continue;
+                }
+                encode_cabac_residual_8x8(
+                    arithmetic,
+                    &mut contexts.luma_8x8_significant,
+                    &mut contexts.luma_8x8_last,
+                    &mut contexts.luma_8x8_abs_level,
+                    group_levels,
+                )?;
+                for block in group * 4..group * 4 + 4 {
+                    coded_blocks.luma_ac[address][block] = true;
+                }
+            }
+        }
+    }
+    if chroma_pattern != 0 {
+        for (component, residual) in chroma_residuals.iter().enumerate() {
+            let coded_context =
+                cabac_inter_dc_coded_context_encoder(address, macroblocks_wide, |neighbor| {
+                    coded_blocks.chroma_dc[neighbor][component]
+                });
+            let coded = residual.dc.iter().any(|&level| level != 0);
+            arithmetic.decision(&mut contexts.chroma_dc_coded_block[coded_context], coded)?;
+            coded_blocks.chroma_dc[address][component] = coded;
+            if coded {
+                encode_cabac_residual_block(
+                    arithmetic,
+                    &mut contexts.chroma_dc_significant,
+                    &mut contexts.chroma_dc_last,
+                    &mut contexts.chroma_dc_abs_level,
+                    &residual.dc,
+                )?;
+            }
+        }
+    }
+    if chroma_pattern == 2 {
+        for (component, residual) in chroma_residuals.iter().enumerate() {
+            for (block_index, block_levels) in residual.ac.iter().enumerate() {
+                let coded_context = cabac_inter_chroma_coded_context_encoder(
+                    address,
+                    macroblocks_wide,
+                    component,
+                    block_index,
+                    &coded_blocks.chroma_ac,
+                );
+                let coded = block_levels.iter().any(|&level| level != 0);
+                arithmetic.decision(&mut contexts.chroma_ac_coded_block[coded_context], coded)?;
+                coded_blocks.chroma_ac[address][component][block_index] = coded;
+                if coded {
+                    encode_cabac_residual_block(
+                        arithmetic,
+                        &mut contexts.chroma_ac_significant,
+                        &mut contexts.chroma_ac_last,
+                        &mut contexts.chroma_ac_abs_level,
+                        block_levels,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cabac_inter_dc_coded_context_encoder(
+    address: usize,
+    macroblocks_wide: usize,
+    neighbor_is_coded: impl Fn(usize) -> bool,
+) -> usize {
+    let left = !address.is_multiple_of(macroblocks_wide) && neighbor_is_coded(address - 1);
+    let top = address >= macroblocks_wide && neighbor_is_coded(address - macroblocks_wide);
+    usize::from(left) + 2 * usize::from(top)
+}
+
+fn cabac_inter_luma_coded_context_encoder(
+    address: usize,
+    macroblocks_wide: usize,
+    block_index: usize,
+    coded: &[[bool; 16]],
+) -> usize {
+    let (block_x, block_y) = luma_block_position(block_index);
+    let left = if block_x > 0 {
+        coded[address][luma_block_index(block_x - 1, block_y)]
+    } else {
+        !address.is_multiple_of(macroblocks_wide)
+            && coded[address - 1][luma_block_index(3, block_y)]
+    };
+    let top = if block_y > 0 {
+        coded[address][luma_block_index(block_x, block_y - 1)]
+    } else {
+        address >= macroblocks_wide
+            && coded[address - macroblocks_wide][luma_block_index(block_x, 3)]
+    };
+    usize::from(left) + 2 * usize::from(top)
+}
+
+fn cabac_inter_chroma_coded_context_encoder(
+    address: usize,
+    macroblocks_wide: usize,
+    component: usize,
+    block_index: usize,
+    coded: &[[[bool; 4]; 2]],
+) -> usize {
+    let block_x = block_index % 2;
+    let block_y = block_index / 2;
+    let left = if block_x > 0 {
+        coded[address][component][block_index - 1]
+    } else {
+        !address.is_multiple_of(macroblocks_wide) && coded[address - 1][component][block_y * 2 + 1]
+    };
+    let top = if block_y > 0 {
+        coded[address][component][block_index - 2]
+    } else {
+        address >= macroblocks_wide && coded[address - macroblocks_wide][component][2 + block_x]
+    };
+    usize::from(left) + 2 * usize::from(top)
+}
+
 #[allow(clippy::too_many_lines)]
 fn encode_b_picture(
     frame: &VideoFrame,
@@ -2929,6 +4459,9 @@ fn encode_b_picture(
     writer.write_bit(false)?; // num_ref_idx_active_override_flag
     writer.write_bit(false)?; // ref_pic_list_modification_flag_l0
     writer.write_bit(false)?; // ref_pic_list_modification_flag_l1
+    if configuration.entropy_coding == EntropyCoding::Cabac {
+        write_ue(&mut writer, 0)?; // cabac_init_idc
+    }
     write_se(&mut writer, i64::from(configuration.qp - 26))?;
     write_ue(&mut writer, 1)?; // disable_deblocking_filter_idc
 
@@ -2936,6 +4469,20 @@ fn encode_b_picture(
     let macroblocks_high = configuration.coded_height / 16;
     let macroblock_count = macroblocks_wide * macroblocks_high;
     let source = padded_planes(frame, configuration);
+    if configuration.entropy_coding == EntropyCoding::Cabac {
+        writer.align_to_byte_with(true); // cabac_alignment_one_bit
+        return encode_cabac_b_picture_data(
+            frame,
+            configuration,
+            previous,
+            future,
+            picture_order_count,
+            writer.into_bytes(),
+            &source,
+            macroblocks_wide,
+            macroblocks_high,
+        );
+    }
     let macroblock_qps = adaptive_macroblock_qps(
         &source[0],
         configuration.coded_width,
@@ -2954,7 +4501,7 @@ fn encode_b_picture(
         for macroblock_x in 0..macroblocks_wide {
             let address = macroblock_y * macroblocks_wide + macroblock_x;
             let macroblock_qp = macroblock_qps[address];
-            let decision = select_b_inter_partitions(
+            let decision = select_b_inter_partitions_with_analysis(
                 &source,
                 previous,
                 future,
@@ -2963,6 +4510,7 @@ fn encode_b_picture(
                 macroblock_x,
                 macroblock_y,
                 configuration.search_range,
+                configuration.analysis,
                 &motions_l0,
                 &motions_l1,
                 address,
@@ -2984,7 +4532,7 @@ fn encode_b_picture(
                 macroblock_y,
                 &decision.luma_prediction,
                 macroblock_qp,
-                transform_8x8_allowed,
+                transform_8x8_allowed && configuration.analysis == AnalysisPreset::Full,
                 configuration.transform_bypass,
                 configuration.scaling_matrix,
             );
@@ -3113,6 +4661,330 @@ fn encode_b_picture(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn encode_cabac_b_picture_data(
+    frame: &VideoFrame,
+    configuration: &Configuration,
+    previous: &EncoderReference,
+    future: &EncoderReference,
+    picture_order_count: i32,
+    mut rbsp: Vec<u8>,
+    source: &[Vec<u8>; 3],
+    macroblocks_wide: usize,
+    macroblocks_high: usize,
+) -> Result<EncodedFrame> {
+    let macroblock_count = macroblocks_wide * macroblocks_high;
+    let macroblock_qps = adaptive_macroblock_qps(
+        &source[0],
+        configuration.coded_width,
+        configuration.coded_height,
+        configuration.qp,
+        configuration.aq_strength,
+    );
+    let mut contexts = CabacBContexts::new(configuration.qp, 0)?;
+    let mut arithmetic = CabacEncoder::new();
+    let mut coded_blocks = CabacIntraCodedBlocks::new(macroblock_count);
+    let mut skipped = vec![false; macroblock_count];
+    let mut direct = vec![false; macroblock_count];
+    let mut transform_8x8 = vec![false; macroblock_count];
+    let mut motion_differences_l0 = vec![[MotionVector::default(); 16]; macroblock_count];
+    let mut motion_differences_l1 = vec![[MotionVector::default(); 16]; macroblock_count];
+    let mut motions_l0 = vec![[None; 16]; macroblock_count];
+    let mut motions_l1 = vec![[None; 16]; macroblock_count];
+    let mut reconstructed = previous.planes.clone();
+    let mut previous_qp = configuration.qp;
+    let mut previous_qp_delta = 0;
+
+    for macroblock_y in 0..macroblocks_high {
+        for macroblock_x in 0..macroblocks_wide {
+            let address = macroblock_y * macroblocks_wide + macroblock_x;
+            let macroblock_qp = macroblock_qps[address];
+            let decision = select_b_inter_partitions_with_analysis(
+                source,
+                previous,
+                future,
+                configuration.coded_width,
+                configuration.coded_height,
+                macroblock_x,
+                macroblock_y,
+                configuration.search_range,
+                configuration.analysis,
+                &motions_l0,
+                &motions_l1,
+                address,
+                macroblocks_wide,
+                BDirectContext {
+                    mode: configuration.b_direct_mode,
+                    picture_order_count,
+                },
+            );
+            let transform_allowed = configuration.transform_8x8_mode
+                && decision.partitions.iter().all(|selected| {
+                    let partition = selected.partition();
+                    partition.block_width >= 2 && partition.block_height >= 2
+                });
+            let luma_levels = select_inter_luma_residual(
+                &source[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &decision.luma_prediction,
+                macroblock_qp,
+                transform_allowed && configuration.analysis == AnalysisPreset::Full,
+                configuration.transform_bypass,
+                configuration.scaling_matrix,
+            );
+            let chroma_qp = chroma_qp(macroblock_qp);
+            let chroma_residuals: [ChromaResidual; 2] = std::array::from_fn(|component| {
+                quantize_chroma_residual(
+                    &source[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    &decision.chroma_predictions[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
+                )
+            });
+            let luma_pattern = luma_levels.coded_block_pattern();
+            let chroma_pattern = chroma_coded_block_pattern(&chroma_residuals);
+            let coded_block_pattern = luma_pattern | chroma_pattern << 4;
+
+            reconstruct_inter_luma(
+                &mut reconstructed[0],
+                configuration.coded_width,
+                macroblock_x,
+                macroblock_y,
+                &decision.luma_prediction,
+                &luma_levels,
+                macroblock_qp,
+                configuration.scaling_matrix,
+            );
+            for (component, prediction) in decision.chroma_predictions.iter().enumerate() {
+                reconstruct_chroma(
+                    &mut reconstructed[component + 1],
+                    configuration.coded_width / 2,
+                    macroblock_x,
+                    macroblock_y,
+                    prediction,
+                    &chroma_residuals[component],
+                    chroma_qp,
+                    configuration.transform_bypass,
+                    None,
+                    configuration.scaling_matrix.four_by_four(false),
+                );
+            }
+
+            let is_skipped = decision.direct && coded_block_pattern == 0;
+            let skip_context =
+                usize::from(!address.is_multiple_of(macroblocks_wide) && !skipped[address - 1])
+                    + usize::from(
+                        address >= macroblocks_wide && !skipped[address - macroblocks_wide],
+                    );
+            arithmetic.decision(&mut contexts.skip[skip_context], is_skipped)?;
+            if is_skipped {
+                skipped[address] = true;
+                direct[address] = true;
+                previous_qp_delta = 0;
+                commit_b_motion_history(
+                    &decision,
+                    &mut motions_l0[address],
+                    &mut motions_l1[address],
+                );
+                arithmetic.terminate(address + 1 == macroblock_count)?;
+                continue;
+            }
+
+            let type_context =
+                usize::from(!address.is_multiple_of(macroblocks_wide) && !direct[address - 1])
+                    + usize::from(
+                        address >= macroblocks_wide && !direct[address - macroblocks_wide],
+                    );
+            encode_cabac_b_macroblock_type(
+                &mut arithmetic,
+                &mut contexts,
+                decision.macroblock_type,
+                type_context,
+            )?;
+            if decision.macroblock_type == 22 {
+                for sub_type in decision.sub_macroblock_types {
+                    encode_cabac_b_sub_macroblock_type(&mut arithmetic, &mut contexts, sub_type)?;
+                }
+            }
+            for selected in decision
+                .partitions
+                .iter()
+                .filter(|selected| !selected.direct)
+                .filter_map(|selected| selected.list0)
+            {
+                encode_cabac_partition_motion_difference(
+                    &mut arithmetic,
+                    &mut contexts.inter,
+                    address,
+                    macroblocks_wide,
+                    selected.partition,
+                    MotionVector {
+                        x: selected.motion.x - selected.predicted.x,
+                        y: selected.motion.y - selected.predicted.y,
+                    },
+                    &mut motion_differences_l0,
+                )?;
+            }
+            for selected in decision
+                .partitions
+                .iter()
+                .filter(|selected| !selected.direct)
+                .filter_map(|selected| selected.list1)
+            {
+                encode_cabac_partition_motion_difference(
+                    &mut arithmetic,
+                    &mut contexts.inter,
+                    address,
+                    macroblocks_wide,
+                    selected.partition,
+                    MotionVector {
+                        x: selected.motion.x - selected.predicted.x,
+                        y: selected.motion.y - selected.predicted.y,
+                    },
+                    &mut motion_differences_l1,
+                )?;
+            }
+            let all_direct = decision.macroblock_type == 0
+                || decision.macroblock_type == 22
+                    && decision.partitions.iter().all(|selected| selected.direct);
+            direct[address] = all_direct;
+            commit_b_motion_history(
+                &decision,
+                &mut motions_l0[address],
+                &mut motions_l1[address],
+            );
+            encode_cabac_p_coded_block_pattern(
+                &mut arithmetic,
+                &mut contexts.inter,
+                coded_block_pattern,
+                address,
+                macroblocks_wide,
+                &coded_blocks.patterns,
+            )?;
+            coded_blocks.patterns[address] = coded_block_pattern;
+            if transform_allowed && luma_pattern != 0 {
+                let left = !address.is_multiple_of(macroblocks_wide) && transform_8x8[address - 1];
+                let top = address >= macroblocks_wide && transform_8x8[address - macroblocks_wide];
+                arithmetic.decision(
+                    &mut contexts.inter.transform_size_8x8[usize::from(left) + usize::from(top)],
+                    luma_levels.uses_8x8(),
+                )?;
+                transform_8x8[address] = luma_levels.uses_8x8();
+            }
+            if coded_block_pattern == 0 {
+                previous_qp_delta = 0;
+            } else {
+                let qp_delta = macroblock_qp_delta(previous_qp, macroblock_qp);
+                encode_cabac_p_macroblock_qp_delta(
+                    &mut arithmetic,
+                    &mut contexts.inter,
+                    qp_delta,
+                    previous_qp_delta,
+                )?;
+                previous_qp_delta = qp_delta;
+                previous_qp = macroblock_qp;
+            }
+            encode_cabac_p_residuals(
+                &mut arithmetic,
+                &mut contexts.inter,
+                &luma_levels,
+                &chroma_residuals,
+                luma_pattern,
+                chroma_pattern,
+                address,
+                macroblocks_wide,
+                &mut coded_blocks,
+            )?;
+            arithmetic.terminate(address + 1 == macroblock_count)?;
+        }
+    }
+    rbsp.extend_from_slice(&arithmetic.finish()?);
+    Ok(EncodedFrame {
+        nal: make_nal(0x01, rbsp),
+        reconstructed: visible_frame(frame, configuration, &reconstructed),
+        coded_reconstruction: reconstructed,
+        motion_l0: Vec::new(),
+        reference_l0_poc: Vec::new(),
+        macroblock_intra: Vec::new(),
+    })
+}
+
+fn encode_cabac_b_macroblock_type(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacBContexts,
+    macroblock_type: u8,
+    context_increment: usize,
+) -> Result<()> {
+    debug_assert!(macroblock_type <= 22);
+    arithmetic.decision(
+        &mut contexts.macroblock_type[context_increment],
+        macroblock_type != 0,
+    )?;
+    if macroblock_type == 0 {
+        return Ok(());
+    }
+    arithmetic.decision(&mut contexts.macroblock_type[3], macroblock_type >= 3)?;
+    if macroblock_type <= 2 {
+        return arithmetic.decision(&mut contexts.macroblock_type[5], macroblock_type == 2);
+    }
+    let (bits, extra) = match macroblock_type {
+        3..=10 => (macroblock_type - 3, None),
+        11 => (14, None),
+        12..=21 => (
+            macroblock_type / 2 + 2,
+            Some(!macroblock_type.is_multiple_of(2)),
+        ),
+        22 => (15, None),
+        _ => unreachable!("B macroblock type is in 0..=22"),
+    };
+    arithmetic.decision(&mut contexts.macroblock_type[4], bits & 8 != 0)?;
+    for shift in (0..3).rev() {
+        arithmetic.decision(&mut contexts.macroblock_type[5], bits & (1 << shift) != 0)?;
+    }
+    if let Some(extra) = extra {
+        arithmetic.decision(&mut contexts.macroblock_type[5], extra)?;
+    }
+    Ok(())
+}
+
+fn encode_cabac_b_sub_macroblock_type(
+    arithmetic: &mut CabacEncoder,
+    contexts: &mut CabacBContexts,
+    sub_type: u8,
+) -> Result<()> {
+    debug_assert!(sub_type <= 12);
+    arithmetic.decision(&mut contexts.sub_macroblock_type[0], sub_type != 0)?;
+    if sub_type == 0 {
+        return Ok(());
+    }
+    arithmetic.decision(&mut contexts.sub_macroblock_type[1], sub_type >= 3)?;
+    if sub_type <= 2 {
+        return arithmetic.decision(&mut contexts.sub_macroblock_type[3], sub_type == 2);
+    }
+    arithmetic.decision(&mut contexts.sub_macroblock_type[2], sub_type >= 7)?;
+    if sub_type >= 7 {
+        arithmetic.decision(&mut contexts.sub_macroblock_type[3], sub_type >= 11)?;
+        if sub_type >= 11 {
+            return arithmetic.decision(&mut contexts.sub_macroblock_type[3], sub_type == 12);
+        }
+    }
+    let remainder = if sub_type >= 7 {
+        sub_type - 7
+    } else {
+        sub_type - 3
+    };
+    arithmetic.decision(&mut contexts.sub_macroblock_type[3], remainder & 2 != 0)?;
+    arithmetic.decision(&mut contexts.sub_macroblock_type[3], remainder & 1 != 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn select_b_inter_partitions(
     source: &[Vec<u8>; 3],
     previous: &EncoderReference,
@@ -3128,6 +5000,97 @@ fn select_b_inter_partitions(
     macroblocks_wide: usize,
     direct_context: BDirectContext,
 ) -> BInterDecision {
+    select_b_inter_partitions_with_analysis(
+        source,
+        previous,
+        future,
+        coded_width,
+        coded_height,
+        macroblock_x,
+        macroblock_y,
+        search_range,
+        AnalysisPreset::Full,
+        history_l0,
+        history_l1,
+        address,
+        macroblocks_wide,
+        direct_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn select_b_inter_partitions_with_analysis(
+    source: &[Vec<u8>; 3],
+    previous: &EncoderReference,
+    future: &EncoderReference,
+    coded_width: usize,
+    coded_height: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    search_range: i32,
+    analysis: AnalysisPreset,
+    history_l0: &[[Option<MotionState>; 16]],
+    history_l1: &[[Option<MotionState>; 16]],
+    address: usize,
+    macroblocks_wide: usize,
+    direct_context: BDirectContext,
+) -> BInterDecision {
+    let direct = match direct_context.mode {
+        BDirectMode::Spatial => Some(select_spatial_direct_b_prediction(
+            source,
+            previous,
+            future,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            history_l0,
+            history_l1,
+            address,
+            macroblocks_wide,
+        )),
+        BDirectMode::Temporal => select_temporal_direct_b_prediction(
+            source,
+            previous,
+            future,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            address,
+            direct_context.picture_order_count,
+        ),
+    };
+    if analysis == AnalysisPreset::Fast && direct.as_ref().is_some_and(|(cost, _)| *cost <= 4_096) {
+        return direct.expect("low-error fast direct candidate exists").1;
+    }
+    if analysis == AnalysisPreset::Fast {
+        let mut decisions = (1_u8..=3)
+            .map(|macroblock_type| {
+                select_fast_b16_candidate(
+                    source,
+                    previous,
+                    future,
+                    coded_width,
+                    coded_height,
+                    macroblock_x,
+                    macroblock_y,
+                    search_range,
+                    history_l0,
+                    history_l1,
+                    address,
+                    macroblocks_wide,
+                    macroblock_type,
+                )
+            })
+            .collect::<Vec<_>>();
+        decisions.extend(direct);
+        return decisions
+            .into_iter()
+            .min_by_key(|(cost, decision)| (*cost, decision.macroblock_type))
+            .map(|(_, decision)| decision)
+            .expect("fast B inter prediction candidates exist");
+    }
     let mut decisions = (1_u8..=21)
         .map(|macroblock_type| {
             let mut trial_l0 = history_l0.to_vec();
@@ -3146,6 +5109,7 @@ fn select_b_inter_partitions(
                     macroblock_x,
                     macroblock_y,
                     search_range,
+                    analysis,
                     &mut trial_l0,
                     &mut trial_l1,
                     address,
@@ -3197,38 +5161,133 @@ fn select_b_inter_partitions(
         macroblocks_wide,
         direct_context,
     ));
-    let direct = match direct_context.mode {
-        BDirectMode::Spatial => Some(select_spatial_direct_b_prediction(
-            source,
-            previous,
-            future,
-            coded_width,
-            coded_height,
-            macroblock_x,
-            macroblock_y,
-            history_l0,
-            history_l1,
-            address,
-            macroblocks_wide,
-        )),
-        BDirectMode::Temporal => select_temporal_direct_b_prediction(
-            source,
-            previous,
-            future,
-            coded_width,
-            coded_height,
-            macroblock_x,
-            macroblock_y,
-            address,
-            direct_context.picture_order_count,
-        ),
-    };
     decisions.extend(direct);
     decisions
         .into_iter()
         .min_by_key(|(cost, decision)| (*cost, decision.macroblock_type))
         .map(|(_, decision)| decision)
         .expect("B inter prediction candidates exist")
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn select_fast_b16_candidate(
+    source: &[Vec<u8>; 3],
+    previous: &EncoderReference,
+    future: &EncoderReference,
+    coded_width: usize,
+    coded_height: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    search_range: i32,
+    history_l0: &[[Option<MotionState>; 16]],
+    history_l1: &[[Option<MotionState>; 16]],
+    address: usize,
+    macroblocks_wide: usize,
+    macroblock_type: u8,
+) -> (u64, BInterDecision) {
+    let direction = match macroblock_type {
+        1 => BPrediction::L0,
+        2 => BPrediction::L1,
+        3 => BPrediction::Bi,
+        _ => unreachable!("fast B16 macroblock type is in 1..=3"),
+    };
+    let partition = InterPartition {
+        block_x: 0,
+        block_y: 0,
+        block_width: 4,
+        block_height: 4,
+        prediction_kind: MotionPredictionKind::Normal,
+    };
+    let list0 = direction.uses_l0().then(|| {
+        select_b_partition_motion(
+            source,
+            &previous.planes,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            search_range,
+            AnalysisPreset::Fast,
+            history_l0,
+            address,
+            macroblocks_wide,
+            partition,
+        )
+    });
+    let list1 = direction.uses_l1().then(|| {
+        select_b_partition_motion(
+            source,
+            &future.planes,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            search_range,
+            AnalysisPreset::Fast,
+            history_l1,
+            address,
+            macroblocks_wide,
+            partition,
+        )
+    });
+    let prediction_l0 = list0.map(|selected| {
+        inter_prediction_for_partition(
+            &previous.planes,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            partition,
+            selected.motion,
+        )
+    });
+    let prediction_l1 = list1.map(|selected| {
+        inter_prediction_for_partition(
+            &future.planes,
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            partition,
+            selected.motion,
+        )
+    });
+    let mut prediction = [vec![0; 256], vec![0; 64], vec![0; 64]];
+    place_b_partition_prediction(
+        &mut prediction,
+        prediction_l0.as_ref(),
+        prediction_l1.as_ref(),
+        partition,
+    );
+    let motion_rate = [list0, list1]
+        .into_iter()
+        .flatten()
+        .map(|selected| motion_difference_rate(selected.motion, selected.predicted))
+        .sum::<u64>();
+    let cost = block_sad(
+        &source[0],
+        coded_width,
+        macroblock_x * 16,
+        macroblock_y * 16,
+        16,
+        &prediction[0],
+    ) + motion_rate * 2
+        + u64::from(matches!(direction, BPrediction::Bi)) * 4;
+    (
+        cost,
+        BInterDecision {
+            macroblock_type,
+            direct: false,
+            sub_macroblock_types: [0; 4],
+            partitions: vec![BSelectedPartition {
+                list0,
+                list1,
+                direct: false,
+            }],
+            luma_prediction: prediction[0].clone(),
+            chroma_predictions: [prediction[1].clone(), prediction[2].clone()],
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3637,6 +5696,7 @@ fn select_b8x8_partitions(
                     macroblock_x,
                     macroblock_y,
                     search_range,
+                    AnalysisPreset::Full,
                     &mut trial_l0,
                     &mut trial_l1,
                     address,
@@ -3711,6 +5771,7 @@ fn select_and_place_b_partition(
     macroblock_x: usize,
     macroblock_y: usize,
     search_range: i32,
+    analysis: AnalysisPreset,
     history_l0: &mut [[Option<MotionState>; 16]],
     history_l1: &mut [[Option<MotionState>; 16]],
     address: usize,
@@ -3728,6 +5789,7 @@ fn select_and_place_b_partition(
             macroblock_x,
             macroblock_y,
             search_range,
+            analysis,
             history_l0,
             address,
             macroblocks_wide,
@@ -3743,6 +5805,7 @@ fn select_and_place_b_partition(
             macroblock_x,
             macroblock_y,
             search_range,
+            analysis,
             history_l1,
             address,
             macroblocks_wide,
@@ -3803,6 +5866,7 @@ fn select_b_partition_motion(
     macroblock_x: usize,
     macroblock_y: usize,
     search_range: i32,
+    analysis: AnalysisPreset,
     history: &[[Option<MotionState>; 16]],
     address: usize,
     macroblocks_wide: usize,
@@ -3820,6 +5884,7 @@ fn select_b_partition_motion(
         partition.block_height * 4,
         search_range,
         predicted,
+        analysis,
     );
     SelectedPartition {
         partition,
@@ -4172,7 +6237,8 @@ const INTER_CODED_BLOCK_PATTERN: [u8; 48] = [
     36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn select_inter_partitions(
     source: &[Vec<u8>; 3],
     references: &VecDeque<EncoderReference>,
@@ -4185,9 +6251,43 @@ fn select_inter_partitions(
     address: usize,
     macroblocks_wide: usize,
 ) -> InterDecision {
+    select_inter_partitions_with_analysis(
+        source,
+        references,
+        coded_width,
+        coded_height,
+        macroblock_x,
+        macroblock_y,
+        search_range,
+        AnalysisPreset::Full,
+        motions,
+        address,
+        macroblocks_wide,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn select_inter_partitions_with_analysis(
+    source: &[Vec<u8>; 3],
+    references: &VecDeque<EncoderReference>,
+    coded_width: usize,
+    coded_height: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    search_range: i32,
+    analysis: AnalysisPreset,
+    motions: &[[Option<MotionState>; 16]],
+    address: usize,
+    macroblocks_wide: usize,
+) -> InterDecision {
     references
         .iter()
         .enumerate()
+        .take(if analysis == AnalysisPreset::Fast {
+            1
+        } else {
+            references.len()
+        })
         .map(|(reference_index, reference)| {
             let reference_index =
                 u8::try_from(reference_index).expect("configured H.264 reference index fits u8");
@@ -4200,6 +6300,7 @@ fn select_inter_partitions(
                 macroblock_x,
                 macroblock_y,
                 search_range,
+                analysis,
                 motions,
                 address,
                 macroblocks_wide,
@@ -4227,10 +6328,97 @@ fn select_inter_partitions_for_reference(
     macroblock_x: usize,
     macroblock_y: usize,
     search_range: i32,
+    analysis: AnalysisPreset,
     motions: &[[Option<MotionState>; 16]],
     address: usize,
     macroblocks_wide: usize,
 ) -> (u64, InterDecision) {
+    const FAST_SPLIT_SAD_THRESHOLD: u64 = 4_096;
+    let fast_whole = if analysis == AnalysisPreset::Fast {
+        let partition = InterPartition {
+            block_x: 0,
+            block_y: 0,
+            block_width: 4,
+            block_height: 4,
+            prediction_kind: MotionPredictionKind::Normal,
+        };
+        let predicted = partition_motion_predictor(
+            motions,
+            address,
+            macroblocks_wide,
+            partition,
+            reference_index,
+        );
+        let motion = estimate_partition_motion(
+            &source[0],
+            &reference[0],
+            coded_width,
+            coded_height,
+            macroblock_x * 16,
+            macroblock_y * 16,
+            16,
+            16,
+            search_range,
+            predicted,
+            analysis,
+        );
+        let mut luma_prediction = vec![0; 256];
+        let mut chroma_predictions: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0; 64]);
+        predict_inter_luma_partition(
+            &mut luma_prediction,
+            &reference[0],
+            coded_width,
+            coded_height,
+            macroblock_x,
+            macroblock_y,
+            partition,
+            motion,
+        );
+        for component in 0..2 {
+            predict_inter_chroma_partition(
+                &mut chroma_predictions[component],
+                &reference[component + 1],
+                coded_width / 2,
+                coded_height / 2,
+                macroblock_x,
+                macroblock_y,
+                partition,
+                motion,
+            );
+        }
+        let cost = block_sad(
+            &source[0],
+            coded_width,
+            macroblock_x * 16,
+            macroblock_y * 16,
+            16,
+            &luma_prediction,
+        ) + u64::from((motion.x - predicted.x).unsigned_abs()) * 2
+            + u64::from((motion.y - predicted.y).unsigned_abs()) * 2;
+        Some((
+            cost,
+            InterDecision {
+                macroblock_type: 0,
+                sub_macroblock_types: [0; 4],
+                partitions: vec![SelectedPartition {
+                    partition,
+                    predicted,
+                    motion,
+                    reference_index,
+                }],
+                luma_prediction,
+                chroma_predictions,
+            },
+        ))
+    } else {
+        None
+    };
+    if fast_whole
+        .as_ref()
+        .is_some_and(|(cost, _)| *cost <= FAST_SPLIT_SAD_THRESHOLD)
+    {
+        return fast_whole.expect("fast whole-macroblock candidate exists");
+    }
     let candidates = [
         (
             0,
@@ -4283,15 +6471,17 @@ fn select_inter_partitions_for_reference(
     ];
     let mut decisions = candidates
         .into_iter()
+        .filter(|(macroblock_type, _)| analysis == AnalysisPreset::Full || *macroblock_type != 0)
         .map(|(macroblock_type, partitions)| {
-            let mut candidate_motions = motions.to_vec();
+            let mut candidate_motions = [None; 16];
             let mut selected = Vec::with_capacity(partitions.len());
             let mut luma_prediction = vec![0; 256];
             let mut chroma_predictions: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0; 64]);
             let mut motion_rate = 0_u64;
             for partition in partitions {
-                let predicted = partition_motion_predictor(
+                let predicted = partition_motion_predictor_with_current(
                     &candidate_motions,
+                    motions,
                     address,
                     macroblocks_wide,
                     partition,
@@ -4308,6 +6498,7 @@ fn select_inter_partitions_for_reference(
                     partition.block_height * 4,
                     search_range,
                     predicted,
+                    analysis,
                 );
                 motion_rate += u64::from((motion.x - predicted.x).unsigned_abs())
                     + u64::from((motion.y - predicted.y).unsigned_abs());
@@ -4334,7 +6525,7 @@ fn select_inter_partitions_for_reference(
                     );
                 }
                 set_partition_motion(
-                    &mut candidate_motions[address],
+                    &mut candidate_motions,
                     partition,
                     MotionState {
                         vector: motion,
@@ -4371,6 +6562,7 @@ fn select_inter_partitions_for_reference(
             )
         })
         .collect::<Vec<_>>();
+    decisions.extend(fast_whole);
     decisions.push(select_p8x8_partitions(
         source,
         reference,
@@ -4380,6 +6572,7 @@ fn select_inter_partitions_for_reference(
         macroblock_x,
         macroblock_y,
         search_range,
+        analysis,
         motions,
         address,
         macroblocks_wide,
@@ -4400,11 +6593,12 @@ fn select_p8x8_partitions(
     macroblock_x: usize,
     macroblock_y: usize,
     search_range: i32,
+    analysis: AnalysisPreset,
     motions: &[[Option<MotionState>; 16]],
     address: usize,
     macroblocks_wide: usize,
 ) -> (u64, InterDecision) {
-    let mut candidate_motions = motions.to_vec();
+    let mut candidate_motions = [None; 16];
     let mut luma_prediction = vec![0; 256];
     let mut chroma_predictions: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0; 64]);
     let mut sub_macroblock_types = [0_u8; 4];
@@ -4413,14 +6607,15 @@ fn select_p8x8_partitions(
     for (sub_index, sub_macroblock_type) in sub_macroblock_types.iter_mut().enumerate() {
         let mut best: Option<P8x8Candidate> = None;
         for sub_type in 0..=3 {
-            let mut trial_motions = candidate_motions.clone();
+            let mut trial_motions = candidate_motions;
             let mut trial_luma = luma_prediction.clone();
             let mut trial_chroma = chroma_predictions.clone();
             let mut trial_selected = Vec::new();
             let mut motion_rate = 0_u64;
             for partition in p_sub_partitions(sub_index, sub_type) {
-                let predicted = partition_motion_predictor(
+                let predicted = partition_motion_predictor_with_current(
                     &trial_motions,
+                    motions,
                     address,
                     macroblocks_wide,
                     partition,
@@ -4437,6 +6632,7 @@ fn select_p8x8_partitions(
                     partition.block_height * 4,
                     search_range,
                     predicted,
+                    analysis,
                 );
                 motion_rate += u64::from((motion.x - predicted.x).unsigned_abs())
                     + u64::from((motion.y - predicted.y).unsigned_abs());
@@ -4463,7 +6659,7 @@ fn select_p8x8_partitions(
                     );
                 }
                 set_partition_motion(
-                    &mut trial_motions[address],
+                    &mut trial_motions,
                     partition,
                     MotionState {
                         vector: motion,
@@ -4581,8 +6777,171 @@ fn prediction_region_sad(
         .sum()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn estimate_partition_motion(
+    source: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    partition_width: usize,
+    partition_height: usize,
+    search_range: i32,
+    predicted: MotionVector,
+    analysis: AnalysisPreset,
+) -> MotionVector {
+    if analysis == AnalysisPreset::Full {
+        return estimate_partition_motion_full(
+            source,
+            reference,
+            width,
+            height,
+            origin_x,
+            origin_y,
+            partition_width,
+            partition_height,
+            search_range,
+            predicted,
+        );
+    }
+    let limit = search_range * 4;
+    let predicted_integer = MotionVector {
+        x: round_to_integer_sample(predicted.x).clamp(-limit, limit),
+        y: round_to_integer_sample(predicted.y).clamp(-limit, limit),
+    };
+    let mut best = (u64::MAX, i32::MAX, i32::MAX, 0_i32, 0_i32);
+    evaluate_integer_motion_candidate(
+        source,
+        reference,
+        width,
+        height,
+        origin_x,
+        origin_y,
+        partition_width,
+        partition_height,
+        predicted,
+        predicted_integer,
+        analysis,
+        &mut best,
+    );
+    evaluate_integer_motion_candidate(
+        source,
+        reference,
+        width,
+        height,
+        origin_x,
+        origin_y,
+        partition_width,
+        partition_height,
+        predicted,
+        MotionVector { x: 0, y: 0 },
+        analysis,
+        &mut best,
+    );
+
+    let mut step = 1_i32;
+    while step <= search_range / 2 {
+        step *= 2;
+    }
+    while step != 0 {
+        loop {
+            let center = MotionVector {
+                x: best.4,
+                y: best.3,
+            };
+            for (dx, dy) in [(0, -step), (-step, 0), (step, 0), (0, step)] {
+                let candidate = MotionVector {
+                    x: center.x + dx * 4,
+                    y: center.y + dy * 4,
+                };
+                if candidate.x.abs() <= limit && candidate.y.abs() <= limit {
+                    evaluate_integer_motion_candidate(
+                        source,
+                        reference,
+                        width,
+                        height,
+                        origin_x,
+                        origin_y,
+                        partition_width,
+                        partition_height,
+                        predicted,
+                        candidate,
+                        analysis,
+                        &mut best,
+                    );
+                }
+            }
+            if (best.4, best.3) == (center.x, center.y) {
+                break;
+            }
+        }
+        step /= 2;
+    }
+
+    for subpel_step in [2, 1] {
+        let center = MotionVector {
+            x: best.4,
+            y: best.3,
+        };
+        for (dx, dy) in [
+            (0, -subpel_step),
+            (-subpel_step, 0),
+            (subpel_step, 0),
+            (0, subpel_step),
+            (-subpel_step, -subpel_step),
+            (subpel_step, -subpel_step),
+            (-subpel_step, subpel_step),
+            (subpel_step, subpel_step),
+        ] {
+            let motion = MotionVector {
+                x: center.x + dx,
+                y: center.y + dy,
+            };
+            if motion.x.abs() > limit || motion.y.abs() > limit {
+                continue;
+            }
+            let sad = if analysis == AnalysisPreset::Fast {
+                partition_bilinear_motion_sad_bounded(
+                    source,
+                    reference,
+                    width,
+                    height,
+                    origin_x,
+                    origin_y,
+                    partition_width,
+                    partition_height,
+                    motion,
+                    best.0,
+                )
+            } else {
+                partition_motion_sad_bounded(
+                    source,
+                    reference,
+                    width,
+                    height,
+                    origin_x,
+                    origin_y,
+                    partition_width,
+                    partition_height,
+                    motion,
+                    best.0,
+                )
+            };
+            let candidate = motion_candidate(sad, motion, predicted);
+            if candidate < best {
+                best = candidate;
+            }
+        }
+    }
+    MotionVector {
+        x: best.4,
+        y: best.3,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_partition_motion_full(
     source: &[u8],
     reference: &[u8],
     width: usize,
@@ -4597,9 +6956,11 @@ fn estimate_partition_motion(
     let mut best = (u64::MAX, i32::MAX, i32::MAX, 0_i32, 0_i32);
     for dy in -search_range..=search_range {
         for dx in -search_range..=search_range {
-            let motion_x = dx * 4;
-            let motion_y = dy * 4;
-            let sad = partition_motion_sad(
+            let motion = MotionVector {
+                x: dx * 4,
+                y: dy * 4,
+            };
+            let sad = partition_integer_motion_sad_bounded(
                 source,
                 reference,
                 width,
@@ -4608,14 +6969,10 @@ fn estimate_partition_motion(
                 origin_y,
                 partition_width,
                 partition_height,
-                MotionVector {
-                    x: motion_x,
-                    y: motion_y,
-                },
+                motion,
+                best.0,
             );
-            let rate_proxy = (motion_x - predicted.x).abs() + (motion_y - predicted.y).abs();
-            let displacement = motion_x.abs() + motion_y.abs();
-            let candidate = (sad, rate_proxy, displacement, motion_y, motion_x);
+            let candidate = motion_candidate(sad, motion, predicted);
             if candidate < best {
                 best = candidate;
             }
@@ -4628,7 +6985,11 @@ fn estimate_partition_motion(
     let limit = search_range * 4;
     for motion_y in (integer_best.y - 3).max(-limit)..=(integer_best.y + 3).min(limit) {
         for motion_x in (integer_best.x - 3).max(-limit)..=(integer_best.x + 3).min(limit) {
-            let sad = partition_motion_sad(
+            let motion = MotionVector {
+                x: motion_x,
+                y: motion_y,
+            };
+            let sad = partition_motion_sad_bounded(
                 source,
                 reference,
                 width,
@@ -4637,14 +6998,10 @@ fn estimate_partition_motion(
                 origin_y,
                 partition_width,
                 partition_height,
-                MotionVector {
-                    x: motion_x,
-                    y: motion_y,
-                },
+                motion,
+                best.0,
             );
-            let rate_proxy = (motion_x - predicted.x).abs() + (motion_y - predicted.y).abs();
-            let displacement = motion_x.abs() + motion_y.abs();
-            let candidate = (sad, rate_proxy, displacement, motion_y, motion_x);
+            let candidate = motion_candidate(sad, motion, predicted);
             if candidate < best {
                 best = candidate;
             }
@@ -4656,8 +7013,74 @@ fn estimate_partition_motion(
     }
 }
 
+fn round_to_integer_sample(value: i32) -> i32 {
+    if value >= 0 {
+        (value + 2) / 4 * 4
+    } else {
+        (value - 2) / 4 * 4
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn partition_motion_sad(
+fn evaluate_integer_motion_candidate(
+    source: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    partition_width: usize,
+    partition_height: usize,
+    predicted: MotionVector,
+    motion: MotionVector,
+    analysis: AnalysisPreset,
+    best: &mut (u64, i32, i32, i32, i32),
+) {
+    let sad = if analysis == AnalysisPreset::Fast {
+        partition_fast_integer_motion_sad_bounded(
+            source,
+            reference,
+            width,
+            height,
+            origin_x,
+            origin_y,
+            partition_width,
+            partition_height,
+            motion,
+            best.0,
+        )
+    } else {
+        partition_integer_motion_sad_bounded(
+            source,
+            reference,
+            width,
+            height,
+            origin_x,
+            origin_y,
+            partition_width,
+            partition_height,
+            motion,
+            best.0,
+        )
+    };
+    let candidate = motion_candidate(sad, motion, predicted);
+    if candidate < *best {
+        *best = candidate;
+    }
+}
+
+fn motion_candidate(
+    sad: u64,
+    motion: MotionVector,
+    predicted: MotionVector,
+) -> (u64, i32, i32, i32, i32) {
+    let rate_proxy = (motion.x - predicted.x).abs() + (motion.y - predicted.y).abs();
+    let displacement = motion.x.abs() + motion.y.abs();
+    (sad, rate_proxy, displacement, motion.y, motion.x)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_integer_motion_sad_bounded(
     source: &[u8],
     reference: &[u8],
     width: usize,
@@ -4667,19 +7090,163 @@ fn partition_motion_sad(
     partition_width: usize,
     partition_height: usize,
     motion: MotionVector,
+    maximum: u64,
 ) -> u64 {
-    (0..partition_height)
-        .flat_map(|y| {
-            (0..partition_width).map(move |x| {
-                let source_sample = source[(origin_y + y) * width + origin_x + x];
-                let x_q4 =
-                    i32::try_from(origin_x + x).expect("coded coordinate fits") * 4 + motion.x;
-                let y_q4 =
-                    i32::try_from(origin_y + y).expect("coded coordinate fits") * 4 + motion.y;
-                u64::from(source_sample.abs_diff(luma_qpel(reference, width, height, x_q4, y_q4)))
-            })
-        })
-        .sum()
+    debug_assert_eq!(motion.x.rem_euclid(4), 0);
+    debug_assert_eq!(motion.y.rem_euclid(4), 0);
+    let offset_x = motion.x / 4;
+    let offset_y = motion.y / 4;
+    let mut sad = 0_u64;
+    for y in 0..partition_height {
+        let reference_y = i32::try_from(origin_y + y).expect("coded coordinate fits") + offset_y;
+        for x in 0..partition_width {
+            let source_sample = source[(origin_y + y) * width + origin_x + x];
+            let reference_x =
+                i32::try_from(origin_x + x).expect("coded coordinate fits") + offset_x;
+            sad += u64::from(source_sample.abs_diff(reference_sample(
+                reference,
+                width,
+                height,
+                reference_x,
+                reference_y,
+            )));
+        }
+        if sad > maximum {
+            break;
+        }
+    }
+    sad
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_fast_integer_motion_sad_bounded(
+    source: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    partition_width: usize,
+    partition_height: usize,
+    motion: MotionVector,
+    maximum: u64,
+) -> u64 {
+    debug_assert_eq!(motion.x.rem_euclid(4), 0);
+    debug_assert_eq!(motion.y.rem_euclid(4), 0);
+    let offset_x = motion.x / 4;
+    let offset_y = motion.y / 4;
+    let sample_step = if partition_width >= 16 && partition_height >= 16 {
+        4
+    } else {
+        2
+    };
+    let scale = u64::try_from(sample_step * sample_step).expect("sample step fits u64");
+    let mut sad = 0_u64;
+    for y in (0..partition_height).step_by(sample_step) {
+        let reference_y = i32::try_from(origin_y + y).expect("coded coordinate fits") + offset_y;
+        for x in (0..partition_width).step_by(sample_step) {
+            let source_sample = source[(origin_y + y) * width + origin_x + x];
+            let reference_x =
+                i32::try_from(origin_x + x).expect("coded coordinate fits") + offset_x;
+            sad += u64::from(source_sample.abs_diff(reference_sample(
+                reference,
+                width,
+                height,
+                reference_x,
+                reference_y,
+            ))) * scale;
+        }
+        if sad > maximum {
+            break;
+        }
+    }
+    sad
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_motion_sad_bounded(
+    source: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    partition_width: usize,
+    partition_height: usize,
+    motion: MotionVector,
+    maximum: u64,
+) -> u64 {
+    let mut sad = 0_u64;
+    for y in 0..partition_height {
+        for x in 0..partition_width {
+            let source_sample = source[(origin_y + y) * width + origin_x + x];
+            let x_q4 = i32::try_from(origin_x + x).expect("coded coordinate fits") * 4 + motion.x;
+            let y_q4 = i32::try_from(origin_y + y).expect("coded coordinate fits") * 4 + motion.y;
+            sad +=
+                u64::from(source_sample.abs_diff(luma_qpel(reference, width, height, x_q4, y_q4)));
+        }
+        if sad > maximum {
+            break;
+        }
+    }
+    sad
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_bilinear_motion_sad_bounded(
+    source: &[u8],
+    reference: &[u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    partition_width: usize,
+    partition_height: usize,
+    motion: MotionVector,
+    maximum: u64,
+) -> u64 {
+    let sample_step = if partition_width >= 16 && partition_height >= 16 {
+        4
+    } else {
+        2
+    };
+    let scale = u64::try_from(sample_step * sample_step).expect("sample step fits u64");
+    let mut sad = 0_u64;
+    for y in (0..partition_height).step_by(sample_step) {
+        for x in (0..partition_width).step_by(sample_step) {
+            let source_sample = source[(origin_y + y) * width + origin_x + x];
+            let x_q4 = i32::try_from(origin_x + x).expect("coded coordinate fits") * 4 + motion.x;
+            let y_q4 = i32::try_from(origin_y + y).expect("coded coordinate fits") * 4 + motion.y;
+            sad += u64::from(
+                source_sample.abs_diff(luma_bilinear_qpel(reference, width, height, x_q4, y_q4)),
+            ) * scale;
+        }
+        if sad > maximum {
+            break;
+        }
+    }
+    sad
+}
+
+fn luma_bilinear_qpel(plane: &[u8], width: usize, height: usize, x_q4: i32, y_q4: i32) -> u8 {
+    let x = x_q4.div_euclid(4);
+    let y = y_q4.div_euclid(4);
+    let fraction_x = x_q4.rem_euclid(4);
+    let fraction_y = y_q4.rem_euclid(4);
+    let top_left = i32::from(reference_sample(plane, width, height, x, y));
+    let top_right = i32::from(reference_sample(plane, width, height, x + 1, y));
+    let bottom_left = i32::from(reference_sample(plane, width, height, x, y + 1));
+    let bottom_right = i32::from(reference_sample(plane, width, height, x + 1, y + 1));
+    u8::try_from(
+        (((4 - fraction_x) * (4 - fraction_y) * top_left
+            + fraction_x * (4 - fraction_y) * top_right
+            + (4 - fraction_x) * fraction_y * bottom_left
+            + fraction_x * fraction_y * bottom_right
+            + 8)
+            >> 4)
+            .clamp(0, 255),
+    )
+    .expect("clamped luma interpolation fits u8")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4695,6 +7262,24 @@ fn predict_inter_luma_partition(
 ) {
     let partition_x = partition.block_x * 4;
     let partition_y = partition.block_y * 4;
+    if motion.x.rem_euclid(4) == 0 && motion.y.rem_euclid(4) == 0 {
+        copy_integer_prediction(
+            output,
+            16,
+            partition_x,
+            partition_y,
+            reference,
+            width,
+            height,
+            i32::try_from(macroblock_x * 16 + partition_x).expect("coded width is bounded")
+                + motion.x / 4,
+            i32::try_from(macroblock_y * 16 + partition_y).expect("coded height is bounded")
+                + motion.y / 4,
+            partition.block_width * 4,
+            partition.block_height * 4,
+        );
+        return;
+    }
     for y in 0..partition.block_height * 4 {
         for x in 0..partition.block_width * 4 {
             let destination_x = partition_x + x;
@@ -4727,6 +7312,24 @@ fn predict_inter_chroma_partition(
 ) {
     let partition_x = partition.block_x * 2;
     let partition_y = partition.block_y * 2;
+    if motion.x.rem_euclid(8) == 0 && motion.y.rem_euclid(8) == 0 {
+        copy_integer_prediction(
+            output,
+            8,
+            partition_x,
+            partition_y,
+            reference,
+            width,
+            height,
+            i32::try_from(macroblock_x * 8 + partition_x).expect("coded width is bounded")
+                + motion.x / 8,
+            i32::try_from(macroblock_y * 8 + partition_y).expect("coded height is bounded")
+                + motion.y / 8,
+            partition.block_width * 2,
+            partition.block_height * 2,
+        );
+        return;
+    }
     for y in 0..partition.block_height * 2 {
         for x in 0..partition.block_width * 2 {
             let destination_x = partition_x + x;
@@ -4746,11 +7349,67 @@ fn predict_inter_chroma_partition(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn copy_integer_prediction(
+    output: &mut [u8],
+    output_stride: usize,
+    destination_x: usize,
+    destination_y: usize,
+    reference: &[u8],
+    reference_stride: usize,
+    reference_height: usize,
+    reference_x: i32,
+    reference_y: i32,
+    block_width: usize,
+    block_height: usize,
+) {
+    let contiguous_x = usize::try_from(reference_x)
+        .ok()
+        .filter(|&x| x.saturating_add(block_width) <= reference_stride);
+    let maximum_y = i32::try_from(reference_height - 1).expect("reference height fits i32");
+    let maximum_x = i32::try_from(reference_stride - 1).expect("reference width fits i32");
+    for y in 0..block_height {
+        let source_y = usize::try_from(
+            (reference_y + i32::try_from(y).expect("block height fits i32")).clamp(0, maximum_y),
+        )
+        .expect("clamped source row is non-negative");
+        let destination = (destination_y + y) * output_stride + destination_x;
+        if let Some(source_x) = contiguous_x {
+            let source = source_y * reference_stride + source_x;
+            output[destination..destination + block_width]
+                .copy_from_slice(&reference[source..source + block_width]);
+        } else {
+            for x in 0..block_width {
+                let source_x = usize::try_from(
+                    (reference_x + i32::try_from(x).expect("block width fits i32"))
+                        .clamp(0, maximum_x),
+                )
+                .expect("clamped source column is non-negative");
+                output[destination + x] = reference[source_y * reference_stride + source_x];
+            }
+        }
+    }
+}
+
 fn chroma_epel(plane: &[u8], width: usize, height: usize, x_q8: i32, y_q8: i32) -> u8 {
     let integer_x = x_q8.div_euclid(8);
     let integer_y = y_q8.div_euclid(8);
     let fraction_x = x_q8.rem_euclid(8);
     let fraction_y = y_q8.rem_euclid(8);
+    if let (Ok(x), Ok(y)) = (usize::try_from(integer_x), usize::try_from(integer_y))
+        && x + 1 < width
+        && y + 1 < height
+    {
+        let top = y * width + x;
+        return chroma_bilinear_sample(
+            plane[top],
+            plane[top + 1],
+            plane[top + width],
+            plane[top + width + 1],
+            fraction_x,
+            fraction_y,
+        );
+    }
     let top_left = i32::from(reference_sample(plane, width, height, integer_x, integer_y));
     let top_right = i32::from(reference_sample(
         plane,
@@ -4773,6 +7432,28 @@ fn chroma_epel(plane: &[u8], width: usize, height: usize, x_q8: i32, y_q8: i32) 
         integer_x + 1,
         integer_y + 1,
     ));
+    chroma_bilinear_sample(
+        u8::try_from(top_left).expect("reference sample fits u8"),
+        u8::try_from(top_right).expect("reference sample fits u8"),
+        u8::try_from(bottom_left).expect("reference sample fits u8"),
+        u8::try_from(bottom_right).expect("reference sample fits u8"),
+        fraction_x,
+        fraction_y,
+    )
+}
+
+fn chroma_bilinear_sample(
+    top_left: u8,
+    top_right: u8,
+    bottom_left: u8,
+    bottom_right: u8,
+    fraction_x: i32,
+    fraction_y: i32,
+) -> u8 {
+    let top_left = i32::from(top_left);
+    let top_right = i32::from(top_right);
+    let bottom_left = i32::from(bottom_left);
+    let bottom_right = i32::from(bottom_right);
     u8::try_from(
         (((8 - fraction_x) * (8 - fraction_y) * top_left
             + fraction_x * (8 - fraction_y) * top_right
@@ -4786,6 +7467,12 @@ fn chroma_epel(plane: &[u8], width: usize, height: usize, x_q8: i32, y_q8: i32) 
 }
 
 fn reference_sample(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
+    if let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y))
+        && x < width
+        && y < height
+    {
+        return plane[y * width + x];
+    }
     let x = usize::try_from(x.clamp(0, i32::try_from(width - 1).expect("width fits i32")))
         .expect("clamped coordinate is non-negative");
     let y = usize::try_from(y.clamp(0, i32::try_from(height - 1).expect("height fits i32")))
@@ -4855,12 +7542,40 @@ fn half_horizontal(plane: &[u8], width: usize, height: usize, x: i32, y: i32) ->
 }
 
 fn half_horizontal_raw(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> i32 {
+    if let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y))
+        && x >= 2
+        && x + 3 < width
+        && y < height
+    {
+        let index = y * width + x;
+        return i32::from(plane[index - 2]) - 5 * i32::from(plane[index - 1])
+            + 20 * i32::from(plane[index])
+            + 20 * i32::from(plane[index + 1])
+            - 5 * i32::from(plane[index + 2])
+            + i32::from(plane[index + 3]);
+    }
     let taps = [-2, -1, 0, 1, 2, 3]
         .map(|offset| i32::from(reference_sample(plane, width, height, x + offset, y)));
     taps[0] - 5 * taps[1] + 20 * taps[2] + 20 * taps[3] - 5 * taps[4] + taps[5]
 }
 
 fn half_vertical(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
+    if let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y))
+        && x < width
+        && y >= 2
+        && y + 3 < height
+    {
+        let index = y * width + x;
+        return clip_u8(
+            (i32::from(plane[index - 2 * width]) - 5 * i32::from(plane[index - width])
+                + 20 * i32::from(plane[index])
+                + 20 * i32::from(plane[index + width])
+                - 5 * i32::from(plane[index + 2 * width])
+                + i32::from(plane[index + 3 * width])
+                + 16)
+                >> 5,
+        );
+    }
     let taps = [-2, -1, 0, 1, 2, 3]
         .map(|offset| i32::from(reference_sample(plane, width, height, x, y + offset)));
     clip_u8((taps[0] - 5 * taps[1] + 20 * taps[2] + 20 * taps[3] - 5 * taps[4] + taps[5] + 16) >> 5)
@@ -4898,6 +7613,55 @@ fn partition_motion_predictor(
         block_y - 1,
     )
     .or_else(|| motion_at(motions, macroblocks_wide, block_x - 1, block_y - 1));
+    if b.is_none() && c.is_none() && a.is_some() {
+        b = a;
+        c = a;
+    }
+    let preferred = match partition.prediction_kind {
+        MotionPredictionKind::Top16x8 => b,
+        MotionPredictionKind::Bottom16x8 | MotionPredictionKind::Left8x16 => a,
+        MotionPredictionKind::Right8x16 => c,
+        MotionPredictionKind::Normal => None,
+    };
+    if let Some(preferred) =
+        preferred.filter(|motion| motion.reference_index == Some(reference_index))
+    {
+        return preferred.vector;
+    }
+    let candidates = [a, b, c];
+    let mut matching = candidates
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.reference_index == Some(reference_index));
+    if let Some(candidate) = matching.next()
+        && matching.next().is_none()
+    {
+        return candidate.vector;
+    }
+    let candidates = candidates.map(|motion| motion.map_or(MotionVector::default(), |v| v.vector));
+    MotionVector {
+        x: median3(candidates.map(|motion| motion.x)),
+        y: median3(candidates.map(|motion| motion.y)),
+    }
+}
+
+fn partition_motion_predictor_with_current(
+    current: &[Option<MotionState>; 16],
+    motions: &[[Option<MotionState>; 16]],
+    address: usize,
+    macroblocks_wide: usize,
+    partition: InterPartition,
+    reference_index: u8,
+) -> MotionVector {
+    let macroblock_x = address % macroblocks_wide;
+    let macroblock_y = address / macroblocks_wide;
+    let block_x = (macroblock_x * 4 + partition.block_x).cast_signed();
+    let block_y = (macroblock_y * 4 + partition.block_y).cast_signed();
+    let at = |x, y| motion_at_with_current(motions, current, address, macroblocks_wide, x, y);
+    let a = at(block_x - 1, block_y);
+    let mut b = at(block_x, block_y - 1);
+    let mut c = at(block_x + partition.block_width.cast_signed(), block_y - 1)
+        .or_else(|| at(block_x - 1, block_y - 1));
     if b.is_none() && c.is_none() && a.is_some() {
         b = a;
         c = a;
@@ -4976,6 +7740,27 @@ fn motion_at(
     let block_y = usize::try_from(block_y).ok().filter(|&y| y < blocks_high)?;
     let address = (block_y / 4) * macroblocks_wide + block_x / 4;
     motions[address][luma_block_index(block_x % 4, block_y % 4)]
+}
+
+fn motion_at_with_current(
+    motions: &[[Option<MotionState>; 16]],
+    current: &[Option<MotionState>; 16],
+    current_address: usize,
+    macroblocks_wide: usize,
+    block_x: isize,
+    block_y: isize,
+) -> Option<MotionState> {
+    let blocks_wide = macroblocks_wide * 4;
+    let blocks_high = motions.len().div_ceil(macroblocks_wide) * 4;
+    let block_x = usize::try_from(block_x).ok().filter(|&x| x < blocks_wide)?;
+    let block_y = usize::try_from(block_y).ok().filter(|&y| y < blocks_high)?;
+    let address = (block_y / 4) * macroblocks_wide + block_x / 4;
+    let block = luma_block_index(block_x % 4, block_y % 4);
+    if address == current_address {
+        current[block]
+    } else {
+        motions[address][block]
+    }
 }
 
 fn set_partition_motion(
@@ -7731,20 +10516,36 @@ mod tests {
     }
 
     #[test]
-    fn cabac_rejects_baseline_and_unimplemented_compressed_modes() {
-        for (mode, profile) in [("ipcm", "baseline"), ("intra4", "auto")] {
-            let mut invalid = settings(16, 16);
-            invalid.options.insert("mode".into(), mode.into());
-            invalid.options.insert("profile".into(), profile.into());
-            invalid.options.insert("entropy".into(), "cabac".into());
-            assert!(H264Encoder::default().configure(&invalid).is_err());
-        }
+    fn cabac_rejects_baseline_and_unknown_entropy_names() {
+        let mut invalid = settings(16, 16);
+        invalid.options.insert("profile".into(), "baseline".into());
+        invalid.options.insert("entropy".into(), "cabac".into());
+        assert!(H264Encoder::default().configure(&invalid).is_err());
 
         let mut invalid = settings(16, 16);
         invalid
             .options
             .insert("entropy".into(), "arithmetic".into());
         assert!(H264Encoder::default().configure(&invalid).is_err());
+    }
+
+    #[test]
+    fn signals_bt709_limited_range_in_vui() {
+        let mut encoder_settings = settings(16, 16);
+        encoder_settings
+            .options
+            .insert("color".into(), "bt709".into());
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&encoder_settings).unwrap();
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        let vui = parse_sps(&avcc.sequence_parameter_sets[0])
+            .unwrap()
+            .vui
+            .unwrap();
+        assert_eq!(vui.video_full_range, Some(false));
+        assert_eq!(vui.colour_primaries, Some(1));
+        assert_eq!(vui.transfer_characteristics, Some(1));
+        assert_eq!(vui.matrix_coefficients, Some(1));
     }
 
     #[test]
@@ -7794,6 +10595,305 @@ mod tests {
     }
 
     #[test]
+    fn cabac_intra4_round_trips_prediction_residuals_and_lossless_bypass() {
+        for (qp, adaptive, scaling_matrix, bypass) in [
+            (12, false, "flat", false),
+            (38, true, "flat", false),
+            (27, false, "jvt", false),
+            (0, false, "flat", true),
+        ] {
+            let frame = if adaptive {
+                mixed_activity_frame(32, 32, 0)
+            } else {
+                patterned_frame(32, 32)
+            };
+            let mut encoder_settings = settings(32, 32);
+            encoder_settings
+                .options
+                .insert("mode".into(), "intra4".into());
+            encoder_settings
+                .options
+                .insert("entropy".into(), "cabac".into());
+            encoder_settings.options.insert("qp".into(), qp.to_string());
+            encoder_settings
+                .options
+                .insert("scaling_matrix".into(), scaling_matrix.into());
+            if adaptive {
+                encoder_settings
+                    .options
+                    .insert("aq_strength".into(), "6".into());
+            }
+            if bypass {
+                encoder_settings
+                    .options
+                    .insert("transform_bypass".into(), "true".into());
+            }
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            encoder.send_frame(frame.clone()).unwrap();
+            let packet = encoder.receive_packet().unwrap().unwrap();
+            let reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+            if bypass {
+                assert_frames_pixels_equal(&reconstruction, &frame);
+            }
+
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            decoder.send_packet(packet.clone()).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), &reconstruction);
+            verify_with_ffmpeg(&avcc, &packet.data, &reconstruction);
+        }
+    }
+
+    #[test]
+    fn cabac_intra8_round_trips_transform_contexts_aq_and_scaling_matrices() {
+        for (qp, adaptive, scaling_matrix) in
+            [(12, false, "flat"), (38, true, "flat"), (27, false, "jvt")]
+        {
+            let frame = if adaptive {
+                mixed_activity_frame(32, 32, 0)
+            } else {
+                patterned_frame(32, 32)
+            };
+            let mut encoder_settings = settings(32, 32);
+            encoder_settings
+                .options
+                .insert("mode".into(), "intra8".into());
+            encoder_settings
+                .options
+                .insert("entropy".into(), "cabac".into());
+            encoder_settings.options.insert("qp".into(), qp.to_string());
+            encoder_settings
+                .options
+                .insert("scaling_matrix".into(), scaling_matrix.into());
+            if adaptive {
+                encoder_settings
+                    .options
+                    .insert("aq_strength".into(), "6".into());
+            }
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            assert_eq!(
+                parse_sps(&avcc.sequence_parameter_sets[0])
+                    .unwrap()
+                    .profile_idc,
+                PROFILE_HIGH
+            );
+            encoder.send_frame(frame).unwrap();
+            let packet = encoder.receive_packet().unwrap().unwrap();
+            let reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            decoder.send_packet(packet.clone()).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), &reconstruction);
+            verify_with_ffmpeg(&avcc, &packet.data, &reconstruction);
+        }
+    }
+
+    #[test]
+    fn cabac_p_slices_round_trip_skip_partitions_references_and_residual_transforms() {
+        for (profile, qp, bypass, scaling_matrix) in [
+            ("main", 24, false, "flat"),
+            ("high", 27, false, "jvt"),
+            ("high", 0, true, "flat"),
+        ] {
+            let mut encoder_settings = settings(32, 32);
+            encoder_settings
+                .options
+                .insert("mode".into(), "inter".into());
+            encoder_settings
+                .options
+                .insert("entropy".into(), "cabac".into());
+            encoder_settings
+                .options
+                .insert("profile".into(), profile.into());
+            encoder_settings.options.insert("qp".into(), qp.to_string());
+            encoder_settings
+                .options
+                .insert("max_refs".into(), "2".into());
+            encoder_settings
+                .options
+                .insert("search_range".into(), "8".into());
+            encoder_settings
+                .options
+                .insert("scaling_matrix".into(), scaling_matrix.into());
+            if bypass {
+                encoder_settings
+                    .options
+                    .insert("transform_bypass".into(), "true".into());
+            }
+
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            assert!(
+                parse_pps(&avcc.picture_parameter_sets[0])
+                    .unwrap()
+                    .entropy_coding_mode
+            );
+            let first = frame_with_pts(patterned_frame(32, 32), 0);
+            encoder.send_frame(first).unwrap();
+            let mut packets = vec![encoder.receive_packet().unwrap().unwrap()];
+            let mut reconstructions = vec![encoder.receive_reconstructed_frame().unwrap().unwrap()];
+            let inputs = [
+                frame_with_pts(reconstructions[0].clone(), 1),
+                split_motion_frame(&reconstructions[0], true, 2),
+                subpartition_motion_frame(&reconstructions[0], 3),
+            ];
+            for input in inputs {
+                encoder.send_frame(input).unwrap();
+                packets.push(encoder.receive_packet().unwrap().unwrap());
+                reconstructions.push(encoder.receive_reconstructed_frame().unwrap().unwrap());
+            }
+            assert!(packets[0].flags.contains(PacketFlags::KEY));
+            assert!(
+                packets[1..]
+                    .iter()
+                    .all(|packet| !packet.flags.contains(PacketFlags::KEY))
+            );
+
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            for (packet, expected) in packets.iter().cloned().zip(&reconstructions) {
+                decoder.send_packet(packet).unwrap();
+                assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+            }
+            verify_sequence_with_ffmpeg(&avcc, &packets, &reconstructions);
+        }
+    }
+
+    #[test]
+    fn cabac_b_slices_round_trip_direct_partitioned_and_lossless_modes() {
+        for (direct_mode, qp, bypass, scaling_matrix, adaptive) in [
+            ("spatial", 24, false, "flat", true),
+            ("temporal", 27, false, "jvt", false),
+            ("spatial", 0, true, "flat", false),
+        ] {
+            let mut encoder_settings = settings(32, 16);
+            for (name, value) in [
+                ("mode", "inter"),
+                ("entropy", "cabac"),
+                ("profile", "high"),
+                ("b_frames", "1"),
+                ("max_refs", "2"),
+                ("search_range", "8"),
+                ("b_direct", direct_mode),
+                ("scaling_matrix", scaling_matrix),
+            ] {
+                encoder_settings.options.insert(name.into(), value.into());
+            }
+            encoder_settings.options.insert("qp".into(), qp.to_string());
+            if bypass {
+                encoder_settings
+                    .options
+                    .insert("transform_bypass".into(), "true".into());
+            }
+            if adaptive {
+                encoder_settings
+                    .options
+                    .insert("aq_strength".into(), "6".into());
+            }
+
+            let mut encoder = H264Encoder::default();
+            let descriptor = encoder.configure(&encoder_settings).unwrap();
+            let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+            assert!(
+                parse_pps(&avcc.picture_parameter_sets[0])
+                    .unwrap()
+                    .entropy_coding_mode
+            );
+            let first = frame_with_pts(patterned_frame(32, 16), 0);
+            encoder.send_frame(first).unwrap();
+            let idr_packet = encoder.receive_packet().unwrap().unwrap();
+            let idr_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+            let middle = if direct_mode == "temporal" {
+                shifted_frame(&idr_reconstruction, 1, 0, 1)
+            } else {
+                subpartition_motion_frame(&idr_reconstruction, 1)
+            };
+            let future = shifted_frame(&idr_reconstruction, 2, 0, 2);
+            encoder.send_frame(middle).unwrap();
+            encoder.send_frame(future).unwrap();
+            let future_packet = encoder.receive_packet().unwrap().unwrap();
+            let b_packet = encoder.receive_packet().unwrap().unwrap();
+            let future_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+            let b_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+            let packets = [idr_packet, future_packet, b_packet];
+
+            let mut decoder = H264Decoder::default();
+            decoder.configure(&descriptor).unwrap();
+            for (packet, expected) in packets.iter().cloned().zip([
+                &idr_reconstruction,
+                &future_reconstruction,
+                &b_reconstruction,
+            ]) {
+                decoder.send_packet(packet).unwrap();
+                assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+            }
+            verify_sequence_with_ffmpeg(
+                &avcc,
+                &packets,
+                &[idr_reconstruction, b_reconstruction, future_reconstruction],
+            );
+        }
+    }
+
+    #[test]
+    fn cabac_b_type_trees_round_trip_every_inter_code() {
+        for context_increment in 0..=2 {
+            for macroblock_type in 0..=22 {
+                let mut encoder_contexts = CabacBContexts::new(26, 0).unwrap();
+                let mut arithmetic = CabacEncoder::new();
+                encode_cabac_b_macroblock_type(
+                    &mut arithmetic,
+                    &mut encoder_contexts,
+                    macroblock_type,
+                    context_increment,
+                )
+                .unwrap();
+                arithmetic.terminate(true).unwrap();
+                let bytes = arithmetic.finish().unwrap();
+                let mut bits = BitReader::new(&bytes);
+                let mut decoder = crate::cabac::CabacDecoder::new(&mut bits).unwrap();
+                let mut decoder_contexts = CabacBContexts::new(26, 0).unwrap();
+                assert_eq!(
+                    crate::decoder::decode_cabac_b_macroblock_type(
+                        &mut decoder,
+                        &mut decoder_contexts.macroblock_type,
+                        context_increment,
+                    )
+                    .unwrap(),
+                    u32::from(macroblock_type)
+                );
+                assert!(decoder.terminate().unwrap());
+            }
+        }
+        for sub_type in 0..=12 {
+            let mut encoder_contexts = CabacBContexts::new(26, 0).unwrap();
+            let mut arithmetic = CabacEncoder::new();
+            encode_cabac_b_sub_macroblock_type(&mut arithmetic, &mut encoder_contexts, sub_type)
+                .unwrap();
+            arithmetic.terminate(true).unwrap();
+            let bytes = arithmetic.finish().unwrap();
+            let mut bits = BitReader::new(&bytes);
+            let mut decoder = crate::cabac::CabacDecoder::new(&mut bits).unwrap();
+            let mut decoder_contexts = CabacBContexts::new(26, 0).unwrap();
+            assert_eq!(
+                crate::decoder::decode_cabac_b_sub_macroblock_type(
+                    &mut decoder,
+                    &mut decoder_contexts.sub_macroblock_type,
+                )
+                .unwrap(),
+                u32::from(sub_type)
+            );
+            assert!(decoder.terminate().unwrap());
+        }
+    }
+
+    #[test]
     fn rejects_invalid_format_dimensions_and_planes() {
         let mut encoder = H264Encoder::default();
         let mut invalid = settings(17, 16);
@@ -7805,6 +10905,7 @@ mod tests {
         for (name, value) in [
             ("gop_size", "0"),
             ("search_range", "65"),
+            ("analysis", "slow"),
             ("scene_cut_threshold", "256"),
             ("max_refs", "0"),
             ("max_refs", "5"),
@@ -9269,6 +12370,105 @@ mod tests {
             &decode_order_packets,
             &[idr_reconstruction, b_reconstruction, future_reconstruction],
         );
+    }
+
+    #[test]
+    fn fast_analysis_round_trips_hierarchical_p_and_direct_b_pictures() {
+        let mut settings = settings(32, 16);
+        for (name, value) in [
+            ("mode", "inter"),
+            ("profile", "high"),
+            ("entropy", "cabac"),
+            ("analysis", "fast"),
+            ("max_refs", "2"),
+            ("b_frames", "1"),
+            ("search_range", "8"),
+        ] {
+            settings.options.insert(name.into(), value.into());
+        }
+        let mut encoder = H264Encoder::default();
+        let descriptor = encoder.configure(&settings).unwrap();
+        let first = frame_with_pts(patterned_frame(32, 16), 0);
+        let middle = shifted_frame(&first, 1, 0, 1);
+        let future = shifted_frame(&first, 2, 0, 2);
+        encoder.send_frame(first).unwrap();
+        let idr_packet = encoder.receive_packet().unwrap().unwrap();
+        let idr_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        encoder.send_frame(middle).unwrap();
+        encoder.send_frame(future).unwrap();
+        let p_packet = encoder.receive_packet().unwrap().unwrap();
+        let b_packet = encoder.receive_packet().unwrap().unwrap();
+        let p_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        let b_reconstruction = encoder.receive_reconstructed_frame().unwrap().unwrap();
+        let packets = [idr_packet, p_packet, b_packet];
+        let mut decoder = H264Decoder::default();
+        decoder.configure(&descriptor).unwrap();
+        for (packet, expected) in
+            packets
+                .iter()
+                .cloned()
+                .zip([&idr_reconstruction, &p_reconstruction, &b_reconstruction])
+        {
+            decoder.send_packet(packet).unwrap();
+            assert_frames_pixels_equal(&decoder.receive_frame().unwrap().unwrap(), expected);
+        }
+        let avcc = AvcDecoderConfigurationRecord::parse(&descriptor.configuration).unwrap();
+        verify_sequence_with_ffmpeg(
+            &avcc,
+            &packets,
+            &[idr_reconstruction, b_reconstruction, p_reconstruction],
+        );
+    }
+
+    #[test]
+    fn fast_analysis_splits_high_error_partial_motion_instead_of_leaving_ghosts() {
+        let mut settings = settings(32, 16);
+        for (name, value) in [
+            ("mode", "inter"),
+            ("profile", "high"),
+            ("entropy", "cabac"),
+            ("analysis", "fast"),
+            ("search_range", "8"),
+        ] {
+            settings.options.insert(name.into(), value.into());
+        }
+        let mut first = frame_with_pts(constant_frame(32, 16, [16, 128, 128]), 0);
+        let first_stride = first.planes[0].stride;
+        for y in 4..12 {
+            for x in 0..8 {
+                first.planes[0].data[y * first_stride + x] = 235;
+            }
+        }
+        let mut encoder = H264Encoder::default();
+        encoder.configure(&settings).unwrap();
+        encoder.send_frame(first).unwrap();
+        encoder.receive_packet().unwrap().unwrap();
+        encoder.receive_reconstructed_frame().unwrap().unwrap();
+
+        let mut moved = frame_with_pts(constant_frame(32, 16, [16, 128, 128]), 1);
+        let moved_stride = moved.planes[0].stride;
+        for y in 4..12 {
+            for x in 8..16 {
+                moved.planes[0].data[y * moved_stride + x] = 235;
+            }
+        }
+        let configuration = encoder.configuration.as_ref().unwrap();
+        let source = padded_planes(&moved, configuration);
+        let decision = select_inter_partitions_with_analysis(
+            &source,
+            &encoder.references,
+            configuration.coded_width,
+            configuration.coded_height,
+            0,
+            0,
+            configuration.search_range,
+            AnalysisPreset::Fast,
+            &[[None; 16]; 2],
+            0,
+            2,
+        );
+        assert_ne!(decision.macroblock_type, 0);
+        assert!(decision.partitions.len() > 1);
     }
 
     #[test]

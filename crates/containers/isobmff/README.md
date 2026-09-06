@@ -12,13 +12,15 @@
 - applies a rate-1.0 media edit with an optional leading empty edit for presentation timing; and
 - seeks to the closest preceding video sync sample.
 
-Its first writing slice accepts one generic, already-timed H.264 video packet stream and emits a
-non-fragmented MP4. It preserves opaque `avcC`, rotation, pixel aspect, colour declarations, sample
-payloads, composition offsets, durations, and sync flags. Codec-aware code decides whether packets
-are safe to copy; the muxer does not parse H.264.
+Its writing slice accepts complete, already-timed H.264 video and AAC audio packet streams and
+emits a non-fragmented Fast Start MP4 with `moov` before `mdat`. Samples are physically
+interleaved by decode time, each track keeps its exact media clock, and AAC configuration is wrapped
+in `esds`. A single rate-1 media edit can trim leading codec priming without removing its encoded
+preroll sample. The writer preserves opaque `avcC`, rotation, pixel aspect, colour declarations,
+sample payloads, composition offsets, durations, and sync flags. Codec-aware code decides whether
+packets are safe to copy; the muxer does not parse H.264 or AAC access units.
 
 The crate deliberately has no dependency on codec crates; parameter sets, AAC configuration fields,
 and coded access-unit syntax remain codec concerns. Fragmented MP4, arbitrary multi-segment or
-non-unit-rate edit lists, multiple sample descriptions, incremental I/O, DRM,
-richer metadata preservation, audio/multitrack muxing, interleaving, and files above 4 GiB are not
-implemented yet.
+non-unit-rate edit lists, multiple sample descriptions, incremental I/O, DRM, richer metadata
+preservation, general codecs/multitrack layouts, and files above 4 GiB are not implemented yet.

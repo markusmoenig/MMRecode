@@ -1,0 +1,8 @@
+new "Eldiron Patron Credits" using youtube-1080p30
+add scene Patrons 1:00
+cd Patrons
+scene load ../../examples/mmfx/eldiron-patrons.mmfx
+info
+save as eldiron-patrons.mmrecode
+export plan using youtube-1080p
+export eldiron-patrons-youtube.mp4 using youtube-1080p

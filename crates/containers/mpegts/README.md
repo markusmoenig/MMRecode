@@ -24,8 +24,8 @@ H.222.0 systems syntax out of codec crates and exchanges encoded data through th
 
 - The muxer emits one program containing one MPEG-2 Video stream and optionally one MPEG-1 Audio
   Layer II stream. Other audio codecs, subtitles, metadata, and multiple programs are not emitted.
-- Demuxing discovers multiple programs and common stream types. MPEG Layer II is framed and
-  extractable but not decoded to PCM by MMRecode yet.
+- Demuxing discovers multiple programs and common stream types. MPEG Layer II is framed,
+  extractable, and decoded to PCM by the codec layer's Rust/Symphonia path.
 - Only 188-byte packets are accepted. 192-byte M2TS and 204-byte error-protected packets are not.
 - Scrambling, conditional access, DVB/ATSC service tables, splice metadata, live CBR null-packet
   scheduling, network jitter recovery, and timestamp-wrap-aware seeking remain follow-on work.

@@ -27,12 +27,17 @@ mmrecode
 
 Kitty and Ghostty use the direct Kitty graphics path. MMRecode also selects Sixel or iTerm2 images
 when available and falls back to portable 24-bit Unicode rendering in other true-color terminals.
+Kitty-protocol sessions use the broadly compatible temporary-file transport by default. POSIX
+shared-memory delivery remains an experimental opt-in while capability negotiation is developed.
 
 ## The editor runs in your terminal
 
 The full-screen workspace contains the monitor, timeline, inspector, contextual help, and command
 prompt. Navigate compositions with familiar commands, edit without changing tools, and preview
-moving video with synchronized audio in the same workspace.
+sequential clips, black gaps, and animated MMFX scenes from one project clock in the same workspace.
+The preview clock and input path stay independent of slow rendering: frame conversion is
+asynchronous and latest-frame-wins, terminal proxies are bounded, and live stage timings expose
+decode, conversion, and delivery bottlenecks without changing full-resolution export.
 
 ```text
 Untitled > import projects/output.ts as Clip0
@@ -68,7 +73,9 @@ time. Media remains reusable while every placement retains its own timing and ov
 
 MMFX is MMRecode's portable scene and visual-effects system for titles, typography, graphics,
 layout, animation, transitions, and compositing. Its strict CSS-shaped language compiles to typed
-scene data and renders predictably without depending on a browser or a particular GPU API.
+scene data, then to an explicit display list and render graph. The scalar CPU reference backend and
+future accelerated backends therefore share semantics without depending on a browser or a
+particular GPU API.
 
 ## A reusable media layer
 

@@ -19,6 +19,7 @@ members = [
     "crates/playback",
     "crates/quality",
     "crates/render",
+    "crates/terminal-shm",
     "crates/testkit",
 ]
 resolver = "3"
@@ -36,6 +37,7 @@ base64-simd = "=0.8.0"
 directories = "=6.0.0"
 eframe = { version = "=0.35.0", default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }
 image = { version = "=0.25.6", default-features = false }
+memmap2 = "=0.9.11"
 mmrecode-bitstream = { path = "crates/bitstream" }
 mmrecode-aac = { path = "crates/codecs/aac" }
 mmrecode-capi = { path = "crates/capi" }
@@ -52,16 +54,20 @@ mmrecode-isobmff = { path = "crates/containers/isobmff" }
 mmrecode-playback = { path = "crates/playback" }
 mmrecode-quality = { path = "crates/quality" }
 mmrecode-render = { path = "crates/render" }
+mmrecode-terminal-shm = { path = "crates/terminal-shm" }
 mmrecode-testkit = { path = "crates/testkit" }
 mmrecode-y4m = { path = "crates/containers/y4m" }
 parley = "=0.9.0"
+pollster = "=0.4.0"
 ratatui = { version = "=0.30.1", default-features = false, features = ["crossterm"] }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 rodio = { version = "=0.22.2", default-features = false, features = ["playback", "symphonia-mp2"] }
+rustix = { version = "=1.1.4", features = ["shm"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 swash = "=0.2.10"
 zeno = "=0.3.3"
+wgpu = { version = "=29.0.4", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "gles"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

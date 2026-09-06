@@ -35,6 +35,52 @@ pub trait AudioDecoder {
     fn flush(&mut self) -> Result<()>;
 }
 
+/// Generic compressed-audio encoder settings shared across codec implementations.
+#[derive(Clone, Debug)]
+pub struct AudioEncoderSettings {
+    /// PCM samples per second for each channel.
+    pub sample_rate: u32,
+    /// Number of interleaved input channels.
+    pub channels: u16,
+    /// Input sample storage format.
+    pub sample_format: crate::AudioSampleFormat,
+    /// Optional target bitrate in bits per second.
+    pub bitrate: Option<u64>,
+    /// Codec-specific options. Stable options should eventually become typed fields.
+    pub options: BTreeMap<String, String>,
+}
+
+/// A stateful compressed-audio encoder with explicit input and output queues.
+pub trait AudioEncoder {
+    /// Configures the encoder and returns the descriptor required by a muxer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the settings are invalid or unsupported.
+    fn configure(&mut self, settings: &AudioEncoderSettings) -> Result<CodecDescriptor>;
+
+    /// Submits one uncompressed audio frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the frame is invalid or cannot be accepted in the current state.
+    fn send_frame(&mut self, frame: AudioFrame) -> Result<()>;
+
+    /// Receives one encoded packet, if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding fails.
+    fn receive_packet(&mut self) -> Result<Option<Packet>>;
+
+    /// Signals end of input and drains delayed packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delayed input cannot be encoded.
+    fn flush(&mut self) -> Result<()>;
+}
+
 /// Generic video encoder settings shared across codec implementations.
 #[derive(Clone, Debug)]
 pub struct VideoEncoderSettings {

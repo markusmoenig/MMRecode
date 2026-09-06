@@ -16,8 +16,30 @@ use mmrecode_core::{
 };
 use mmrecode_edit::{Clip, ClipId, EditSequence, SourceId, TimeRange, Track, TrackId};
 
+mod audio;
+pub use audio::{AudioMixSettings, AudioPlacement, mix_audio_timeline};
+
 mod compositor;
 pub use compositor::scale_yuv420_to_canvas;
+
+mod device_cache;
+pub use device_cache::{DeviceResourceCache, DeviceResourceCacheStats, DeviceResourceStatus};
+
+mod frame_graph;
+pub use frame_graph::{
+    CompositeOperator, CompositionBackend, CompositionGraph, CompositionPass,
+    CpuCompositionBackend, FrameAlphaMode, FrameDelivery, FrameDescriptor, FrameFormat,
+    FrameHandle, FrameResidency, FrameResourceKey, FrameResourceNamespace, FrameResourceProvider,
+    FrameResourceView, FrameScaleFilter, Rgba8ResourceView, Yuv420AlphaResourceView,
+    Yuv420ResourceView,
+};
+
+#[cfg(feature = "wgpu")]
+mod wgpu_backend;
+#[cfg(feature = "wgpu")]
+pub use wgpu_backend::{
+    WgpuCompositionBackend, WgpuPreviewFrame, WgpuPreviewRenderer, WgpuRgbaTarget,
+};
 
 mod project_timeline;
 pub use project_timeline::{FlattenedProjectPlacement, flatten_project_timeline};

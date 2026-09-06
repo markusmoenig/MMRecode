@@ -8,16 +8,25 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
-    hash::{DefaultHasher, Hash as _, Hasher as _},
+    hash::{DefaultHasher, Hash as _, Hasher},
     ops::Range,
 };
 
 use image::{RgbaImage, imageops::FilterType};
+#[cfg(test)]
+use mmrecode_core::ColorRange;
 use mmrecode_core::{
-    ColorRange, Error, PixelFormat, Rational, Result, Timestamp, TimestampRounding, VideoFrame,
+    Error, PixelFormat, Rational, Result, Timestamp, TimestampRounding, VideoFrame,
 };
 use mmrecode_edit::{MediaId, MediaProject, MmfxSource, VisualScaleMode};
 use mmrecode_mmfx::{PreparedScene, RenderResources, Scene, SceneTime};
+
+use crate::{
+    CompositeOperator, CompositionBackend, CompositionGraph, CompositionPass,
+    CpuCompositionBackend, FrameDelivery, FrameDescriptor, FrameFormat, FrameHandle,
+    FrameResidency, FrameResourceKey, FrameResourceNamespace, FrameResourceProvider,
+    FrameResourceView, Rgba8ResourceView, Yuv420AlphaResourceView,
+};
 
 const FRAME_CACHE_LIMIT: usize = 16;
 const SCALED_FRAME_CACHE_LIMIT: usize = 32;
@@ -389,12 +398,14 @@ impl ProjectCompositor {
                 self.canvas.1
             )));
         }
-        for (asset, local_frame) in self.active_assets(frame, 0) {
-            if let Some(overlay) = self.overlay_for(asset, local_frame)? {
-                overlay.blend_rgba(base);
-            }
-        }
-        Ok(())
+        let graph = self.composition_graph_rgba8(
+            frame,
+            0,
+            base.width(),
+            base.height(),
+            FrameDelivery::Preview,
+        )?;
+        self.execute_rgba8_graph(&graph, base)
     }
 
     /// Blends active layers into an arbitrary preview-sized sRGBA8 image in place.
@@ -409,38 +420,14 @@ impl ProjectCompositor {
         if base.dimensions() == self.canvas {
             return self.composite_rgba8(frame, base);
         }
-        let target = base.dimensions();
-        let canvas = self.canvas;
-        for (asset_key, local_frame) in self.active_assets(frame, 0) {
-            let frame_key = self
-                .assets
-                .get(&asset_key)
-                .map_or(-1, |asset| if asset.animated { local_frame } else { -1 });
-            let scaled_key = (asset_key, frame_key, target.0, target.1);
-            if !self.scaled_assets.contains_key(&scaled_key) {
-                let Some(source_canvas) = self
-                    .overlay_for(asset_key, local_frame)?
-                    .map(|source| source.to_canvas(canvas))
-                else {
-                    continue;
-                };
-                let scaled = image::imageops::resize(
-                    &source_canvas,
-                    target.0,
-                    target.1,
-                    FilterType::Triangle,
-                );
-                let Some(prepared) = PreparedOverlay::from_canvas(&scaled) else {
-                    continue;
-                };
-                self.scaled_assets.insert(scaled_key, prepared);
-            }
-            self.touch_scaled_asset(scaled_key);
-            if let Some(overlay) = self.scaled_assets.get(&scaled_key) {
-                overlay.blend_rgba(base);
-            }
-        }
-        Ok(())
+        let graph = self.composition_graph_rgba8(
+            frame,
+            0,
+            base.width(),
+            base.height(),
+            FrameDelivery::Preview,
+        )?;
+        self.execute_rgba8_graph(&graph, base)
     }
 
     /// Blends active cached layers directly into a planar 4:2:0 frame in place.
@@ -470,21 +457,240 @@ impl ProjectCompositor {
         first_order: usize,
     ) -> Result<()> {
         validate_yuv_canvas(base, self.canvas)?;
-        for (asset, local_frame) in self.active_assets(frame, first_order) {
-            if let Some(overlay) = self.overlay_for(asset, local_frame)? {
-                overlay.blend_yuv420(base);
-            }
-        }
-        Ok(())
+        let width = u32::try_from(base.width)
+            .map_err(|error| Error::InvalidData(format!("frame width is invalid: {error}")))?;
+        let height = u32::try_from(base.height)
+            .map_err(|error| Error::InvalidData(format!("frame height is invalid: {error}")))?;
+        let graph = self.composition_graph_yuv420(
+            frame,
+            first_order,
+            width,
+            height,
+            base.color.clone(),
+            FrameDelivery::Encoder,
+        )?;
+        self.execute_yuv420_graph(&graph, base)
     }
 
-    fn active_assets(&self, frame: i64, first_order: usize) -> Vec<(AssetKey, i64)> {
+    /// Build the exact MMFX composition schedule for an sRGBA8 project or preview target.
+    ///
+    /// The returned handles contain stable semantic keys and explicit residency. The optional wgpu
+    /// backend retains uploaded textures by key and executes the same pass order as the CPU path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an active animated scene frame cannot be rendered or scaled.
+    pub fn composition_graph_rgba8(
+        &mut self,
+        frame: i64,
+        first_order: usize,
+        width: u32,
+        height: u32,
+        delivery: FrameDelivery,
+    ) -> Result<CompositionGraph> {
+        let descriptor = FrameDescriptor::rgba8(width, height);
+        self.build_composition_graph(frame, first_order, &descriptor, delivery)
+    }
+
+    /// Build the exact MMFX conversion/composition schedule for a YUV 4:2:0 target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an active animated scene frame cannot be rendered.
+    pub fn composition_graph_yuv420(
+        &mut self,
+        frame: i64,
+        first_order: usize,
+        width: u32,
+        height: u32,
+        color: mmrecode_core::ColorDescription,
+        delivery: FrameDelivery,
+    ) -> Result<CompositionGraph> {
+        let descriptor = FrameDescriptor::yuv420p8(width, height, color);
+        self.build_composition_graph(frame, first_order, &descriptor, delivery)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build_composition_graph(
+        &mut self,
+        frame: i64,
+        first_order: usize,
+        target_descriptor: &FrameDescriptor,
+        delivery: FrameDelivery,
+    ) -> Result<CompositionGraph> {
+        if target_descriptor.width == 0 || target_descriptor.height == 0 {
+            return Err(Error::InvalidData(
+                "composition graph target dimensions must be positive".into(),
+            ));
+        }
+        let target = FrameHandle {
+            key: FrameResourceKey {
+                namespace: FrameResourceNamespace::DecodedVideo,
+                owner: 0,
+                revision: self.revision,
+                local_frame: frame,
+                width: target_descriptor.width,
+                height: target_descriptor.height,
+                variant: format_variant(target_descriptor.format),
+            },
+            descriptor: target_descriptor.clone(),
+            residency: FrameResidency::Cpu,
+        };
+        let preview = (target_descriptor.width, target_descriptor.height) != self.canvas;
+        let canvas = self.canvas;
+        let mut passes = Vec::new();
+        for (asset_key, local_frame, source_revision) in self.active_assets(frame, first_order) {
+            let frame_key = self
+                .assets
+                .get(&asset_key)
+                .map_or(-1, |asset| if asset.animated { local_frame } else { -1 });
+            let namespace = if preview {
+                let scaled_key = (
+                    asset_key,
+                    frame_key,
+                    target_descriptor.width,
+                    target_descriptor.height,
+                );
+                if !self.scaled_assets.contains_key(&scaled_key) {
+                    let Some(source_canvas) = self
+                        .overlay_for(asset_key, local_frame)?
+                        .map(|source| source.to_canvas(canvas))
+                    else {
+                        continue;
+                    };
+                    let scaled = image::imageops::resize(
+                        &source_canvas,
+                        target_descriptor.width,
+                        target_descriptor.height,
+                        FilterType::Triangle,
+                    );
+                    let Some(prepared) = PreparedOverlay::from_canvas(&scaled) else {
+                        continue;
+                    };
+                    self.scaled_assets.insert(scaled_key, prepared);
+                }
+                self.touch_scaled_asset(scaled_key);
+                FrameResourceNamespace::MmfxPreview
+            } else {
+                if self.overlay_for(asset_key, local_frame)?.is_none() {
+                    continue;
+                }
+                FrameResourceNamespace::MmfxCanvas
+            };
+            let key = FrameResourceKey {
+                namespace,
+                owner: asset_key.media_id.0,
+                revision: source_revision,
+                local_frame: frame_key,
+                width: target_descriptor.width,
+                height: target_descriptor.height,
+                variant: u32::from(asset_key.scale_mode),
+            };
+            let Some((x, y, width, height)) = self.overlay_geometry(key) else {
+                continue;
+            };
+            let source = FrameHandle {
+                key,
+                descriptor: FrameDescriptor::rgba8(width, height),
+                residency: FrameResidency::Cpu,
+            };
+            let source = if target_descriptor.format == FrameFormat::Yuv420p8 {
+                let converted = FrameHandle {
+                    key: FrameResourceKey {
+                        namespace: FrameResourceNamespace::ColorConversion,
+                        ..key
+                    },
+                    descriptor: FrameDescriptor {
+                        format: FrameFormat::Yuv420p8Alpha,
+                        color: target_descriptor.color.clone(),
+                        ..source.descriptor.clone()
+                    },
+                    residency: FrameResidency::Cpu,
+                };
+                passes.push(CompositionPass::ColorConvert {
+                    source,
+                    target: converted.clone(),
+                });
+                converted
+            } else {
+                source
+            };
+            passes.push(CompositionPass::Composite {
+                source,
+                target: target.clone(),
+                x,
+                y,
+                operator: CompositeOperator::SourceOver,
+            });
+        }
+        passes.push(CompositionPass::Deliver {
+            source: target.clone(),
+            delivery,
+        });
+        Ok(CompositionGraph::new(target, passes))
+    }
+
+    fn execute_rgba8_graph(&self, graph: &CompositionGraph, base: &mut RgbaImage) -> Result<()> {
+        CpuCompositionBackend.execute(graph, base, self)
+    }
+
+    fn execute_yuv420_graph(&self, graph: &CompositionGraph, base: &mut VideoFrame) -> Result<()> {
+        CpuCompositionBackend.execute(graph, base, self)
+    }
+
+    fn overlay_geometry(&self, key: FrameResourceKey) -> Option<(u32, u32, u32, u32)> {
+        self.overlay_by_resource(key)
+            .map(|overlay| (overlay.x, overlay.y, overlay.width, overlay.height))
+    }
+
+    fn overlay_by_resource(&self, mut key: FrameResourceKey) -> Option<&PreparedOverlay> {
+        if key.namespace == FrameResourceNamespace::ColorConversion {
+            key.namespace = if (key.width, key.height) == self.canvas {
+                FrameResourceNamespace::MmfxCanvas
+            } else {
+                FrameResourceNamespace::MmfxPreview
+            };
+        }
+        let asset_key = AssetKey {
+            media_id: MediaId(key.owner),
+            scale_mode: u8::try_from(key.variant).ok()?,
+        };
+        if self.assets.get(&asset_key)?.good_signature != Some(key.revision) {
+            return None;
+        }
+        match key.namespace {
+            FrameResourceNamespace::MmfxPreview => {
+                self.scaled_assets
+                    .get(&(asset_key, key.local_frame, key.width, key.height))
+            }
+            FrameResourceNamespace::MmfxCanvas => {
+                let asset = self.assets.get(&asset_key)?;
+                if asset.animated {
+                    asset
+                        .frame_overlays
+                        .get(&key.local_frame)
+                        .and_then(Option::as_ref)
+                } else {
+                    asset.static_overlay.as_ref()
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn active_assets(&self, frame: i64, first_order: usize) -> Vec<(AssetKey, i64, u64)> {
         self.layers
             .iter()
             .filter(|layer| {
                 layer.composition_order >= first_order && layer.timeline.contains(&frame)
             })
-            .filter_map(|layer| Some((layer.asset, layer.source_frame(frame)?)))
+            .filter_map(|layer| {
+                Some((
+                    layer.asset,
+                    layer.source_frame(frame)?,
+                    layer.source_signature,
+                ))
+            })
             .collect()
     }
 
@@ -544,6 +750,35 @@ impl ProjectCompositor {
             if let Some(oldest) = self.scaled_asset_order.pop_front() {
                 self.scaled_assets.remove(&oldest);
             }
+        }
+    }
+}
+
+impl FrameResourceProvider for ProjectCompositor {
+    fn resource(&self, handle: &FrameHandle) -> Option<FrameResourceView<'_>> {
+        let overlay = self.overlay_by_resource(handle.key)?;
+        match handle.descriptor.format {
+            FrameFormat::Rgba8 => Some(FrameResourceView::Rgba8(Rgba8ResourceView {
+                width: overlay.width,
+                height: overlay.height,
+                stride: overlay.width as usize * 4,
+                pixels: &overlay.rgba,
+            })),
+            FrameFormat::Yuv420p8Alpha => {
+                Some(FrameResourceView::Yuv420p8Alpha(Yuv420AlphaResourceView {
+                    width: overlay.width,
+                    height: overlay.height,
+                    rgba: &overlay.rgba,
+                    y_limited: &overlay.y_limited,
+                    y_full: &overlay.y_full,
+                    u_limited: &overlay.u_limited,
+                    v_limited: &overlay.v_limited,
+                    u_full: &overlay.u_full,
+                    v_full: &overlay.v_full,
+                    chroma_alpha: &overlay.chroma_alpha,
+                }))
+            }
+            FrameFormat::Yuv420p8 => None,
         }
     }
 }
@@ -610,13 +845,53 @@ fn time_mapping(
 }
 
 fn source_signature(source: &MmfxSource, canvas: (u32, u32), scale_mode: u8) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    source.source.hash(&mut hasher);
-    source.resource_base.hash(&mut hasher);
-    source.parameter_bindings.hash(&mut hasher);
-    canvas.hash(&mut hasher);
-    scale_mode.hash(&mut hasher);
+    let mut hasher = StableResourceHasher::new();
+    stable_hash_bytes(&mut hasher, source.source.as_bytes());
+    if let Some(path) = &source.resource_base {
+        hasher.write(&[1]);
+        stable_hash_bytes(&mut hasher, path.to_string_lossy().as_bytes());
+    } else {
+        hasher.write(&[0]);
+    }
+    hasher.write(
+        &u64::try_from(source.parameter_bindings.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for (name, value) in &source.parameter_bindings {
+        stable_hash_bytes(&mut hasher, name.as_bytes());
+        stable_hash_bytes(&mut hasher, value.as_bytes());
+    }
+    hasher.write(&canvas.0.to_le_bytes());
+    hasher.write(&canvas.1.to_le_bytes());
+    hasher.write(&[scale_mode]);
     hasher.finish()
+}
+
+fn stable_hash_bytes(hasher: &mut StableResourceHasher, bytes: &[u8]) {
+    hasher.write(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.write(bytes);
+}
+
+struct StableResourceHasher(u64);
+
+impl StableResourceHasher {
+    const fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for StableResourceHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
 }
 
 fn mode_key(mode: VisualScaleMode) -> u8 {
@@ -625,6 +900,14 @@ fn mode_key(mode: VisualScaleMode) -> u8 {
         VisualScaleMode::Stretch => 2,
         VisualScaleMode::Native => 3,
         _ => 0,
+    }
+}
+
+const fn format_variant(format: FrameFormat) -> u32 {
+    match format {
+        FrameFormat::Rgba8 => 1,
+        FrameFormat::Yuv420p8 => 2,
+        FrameFormat::Yuv420p8Alpha => 3,
     }
 }
 
@@ -875,119 +1158,6 @@ impl PreparedOverlay {
         }
         image
     }
-
-    fn blend_rgba(&self, base: &mut RgbaImage) {
-        let base_width = base.width() as usize;
-        let x = self.x as usize;
-        let y = self.y as usize;
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let destination_pixels = base.as_mut();
-        for row in 0..height {
-            let source_start = row * width * 4;
-            let destination_start = ((y + row) * base_width + x) * 4;
-            for column in 0..width {
-                let source = source_start + column * 4;
-                let destination = destination_start + column * 4;
-                blend_rgba_pixel(
-                    &mut destination_pixels[destination..destination + 4],
-                    &self.rgba[source..source + 4],
-                );
-            }
-        }
-    }
-
-    fn blend_yuv420(&self, base: &mut VideoFrame) {
-        let limited = base.color.range == ColorRange::Limited;
-        let (y_plane, chroma) = base.planes.split_at_mut(1);
-        let (u_plane, v_plane) = chroma.split_at_mut(1);
-        let y_plane = &mut y_plane[0];
-        let u_plane = &mut u_plane[0];
-        let v_plane = &mut v_plane[0];
-        let x = self.x as usize;
-        let y = self.y as usize;
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let source_y = if limited {
-            &self.y_limited
-        } else {
-            &self.y_full
-        };
-        for row in 0..height {
-            let source_start = row * width;
-            let destination_start = (y + row) * y_plane.stride + x;
-            for column in 0..width {
-                let source = source_start + column;
-                let alpha = self.rgba[source * 4 + 3];
-                y_plane.data[destination_start + column] = blend_channel(
-                    y_plane.data[destination_start + column],
-                    source_y[source],
-                    alpha,
-                );
-            }
-        }
-        let chroma_width = width / 2;
-        let chroma_height = height / 2;
-        let (source_u, source_v) = if limited {
-            (&self.u_limited, &self.v_limited)
-        } else {
-            (&self.u_full, &self.v_full)
-        };
-        for row in 0..chroma_height {
-            let source_start = row * chroma_width;
-            let destination_u = (y / 2 + row) * u_plane.stride + x / 2;
-            let destination_v = (y / 2 + row) * v_plane.stride + x / 2;
-            for column in 0..chroma_width {
-                let source = source_start + column;
-                let alpha = self.chroma_alpha[source];
-                u_plane.data[destination_u + column] = blend_channel(
-                    u_plane.data[destination_u + column],
-                    source_u[source],
-                    alpha,
-                );
-                v_plane.data[destination_v + column] = blend_channel(
-                    v_plane.data[destination_v + column],
-                    source_v[source],
-                    alpha,
-                );
-            }
-        }
-    }
-}
-
-fn blend_rgba_pixel(destination: &mut [u8], source: &[u8]) {
-    let source_alpha = u32::from(source[3]);
-    if source_alpha == 0 {
-        return;
-    }
-    if source_alpha == 255 || destination[3] == 0 {
-        destination.copy_from_slice(source);
-        return;
-    }
-    let destination_alpha = u32::from(destination[3]);
-    let inverse = 255 - source_alpha;
-    let output_alpha = source_alpha + (destination_alpha * inverse + 127) / 255;
-    for channel in 0..3 {
-        let premultiplied = u32::from(source[channel]) * source_alpha
-            + (u32::from(destination[channel]) * destination_alpha * inverse + 127) / 255;
-        destination[channel] = u8::try_from((premultiplied + output_alpha / 2) / output_alpha)
-            .expect("unpremultiplied u8 channel");
-    }
-    destination[3] = u8::try_from(output_alpha).expect("source-over u8 alpha");
-}
-
-fn blend_channel(destination: u8, source: u8, alpha: u8) -> u8 {
-    if alpha == 0 {
-        destination
-    } else if alpha == 255 {
-        source
-    } else {
-        let alpha = u32::from(alpha);
-        u8::try_from(
-            (u32::from(source) * alpha + u32::from(destination) * (255 - alpha) + 127) / 255,
-        )
-        .expect("blended u8 channel")
-    }
 }
 
 fn rgb_to_yuv(red: u8, green: u8, blue: u8) -> ([u8; 3], [u8; 3]) {
@@ -1230,6 +1400,80 @@ mod tests {
         });
         assert!(!second.changed);
         assert_eq!(second.reused_assets, 1);
+    }
+
+    #[test]
+    fn composition_graph_exposes_stable_preview_and_delivery_resources() {
+        let project = project_with_fx(red_scene());
+        let mut compositor = ProjectCompositor::new();
+        compositor.synchronize(&project, project.root_id(), |_, _, _| {
+            Ok(RenderResources::new())
+        });
+
+        let first = compositor
+            .composition_graph_rgba8(1, 0, 4, 4, FrameDelivery::Preview)
+            .unwrap();
+        let second = compositor
+            .composition_graph_rgba8(1, 0, 4, 4, FrameDelivery::Preview)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.passes().len(), 2);
+        let CompositionPass::Composite { source, target, .. } = &first.passes()[0] else {
+            panic!("first pass should composite the active MMFX layer");
+        };
+        assert_eq!(source.key.namespace, FrameResourceNamespace::MmfxCanvas);
+        assert_eq!(source.residency, FrameResidency::Cpu);
+        assert_eq!(target, first.target());
+        let FrameResourceView::Rgba8(view) = compositor.resource(source).unwrap() else {
+            panic!("canvas resource should expose RGBA pixels");
+        };
+        assert_eq!((view.width, view.height, view.stride), (4, 4, 16));
+        assert_eq!(view.pixels.len(), 64);
+        assert!(matches!(
+            first.passes()[1],
+            CompositionPass::Deliver {
+                delivery: FrameDelivery::Preview,
+                ..
+            }
+        ));
+
+        let yuv = compositor
+            .composition_graph_yuv420(
+                1,
+                0,
+                4,
+                4,
+                ColorDescription {
+                    range: ColorRange::Limited,
+                    ..ColorDescription::default()
+                },
+                FrameDelivery::Encoder,
+            )
+            .unwrap();
+        assert!(matches!(
+            yuv.passes()[0],
+            CompositionPass::ColorConvert { .. }
+        ));
+        let CompositionPass::ColorConvert {
+            target: converted, ..
+        } = &yuv.passes()[0]
+        else {
+            unreachable!();
+        };
+        let FrameResourceView::Yuv420p8Alpha(view) = compositor.resource(converted).unwrap() else {
+            panic!("converted resource should expose YUV and alpha planes");
+        };
+        assert_eq!((view.width, view.height), (4, 4));
+        assert_eq!(view.y_limited.len(), 16);
+        assert_eq!(view.chroma_alpha.len(), 4);
+        assert!(matches!(yuv.passes()[1], CompositionPass::Composite { .. }));
+        assert!(matches!(
+            yuv.passes()[2],
+            CompositionPass::Deliver {
+                delivery: FrameDelivery::Encoder,
+                ..
+            }
+        ));
     }
 
     #[test]

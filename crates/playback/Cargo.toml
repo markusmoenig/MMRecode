@@ -13,7 +13,9 @@ mmrecode-aac.workspace = true
 mmrecode-core.workspace = true
 mmrecode-h264.workspace = true
 mmrecode-isobmff.workspace = true
+mmrecode-mpegaudio.workspace = true
 mmrecode-mpeg2.workspace = true
+mmrecode-mpegts.workspace = true
 
 [lints]
 workspace = true

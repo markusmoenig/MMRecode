@@ -354,8 +354,8 @@ paths for `import`, and child aliases for `cd`.
 Keyboard input belongs to an explicitly focused pane. Tab and Shift-Tab move focus among the
 command prompt, timeline, and scrollable inspector, with the focused border and cursor state always visible. Timeline
 transport and zoom keys are inactive while the command prompt owns input, so ordinary command text
-cannot collide with timeline shortcuts. Ctrl-Space performs completion in the command pane and
-play/pause in the timeline pane. The focused inspector uses arrows, Page Up/Page Down, and Home/End,
+cannot collide with timeline shortcuts. Space performs play/pause in the timeline pane, while
+Ctrl-Space performs completion only in the command pane. The focused inspector uses arrows, Page Up/Page Down, and Home/End,
 and also accepts mouse-wheel scrolling. A later embedded MMFX/code editor joins the same focus cycle; its
 editing mode may retain Tab for indentation while an explicit escape returns to pane navigation.
 
@@ -376,9 +376,18 @@ frame rate, pixel aspect, scan organization, working color, audio sample rate, a
 instead probes the currently focused media and adopts its video format plus supported container
 audio format as one undoable, time-preserving project change. Export remains a
 separate operation because one project may produce several deliveries. `export plan` explains the
-work before writing; `export <file> using <preset>` performs it. The first executable delivery is
-the deliberately constrained `mpeg2-ts` path. YouTube-oriented authoring presets exist now, while
-H.264/MP4 delivery remains explicit future work rather than being silently delegated.
+work before writing; `export <file> using <preset>` performs it. The deliberately constrained
+`mpeg2-ts` path remains available, and the first YouTube upload slice now renders matching 1080p
+or 2160p progressive projects to a Fast Start MP4 with native High Profile H.264, CABAC, two
+B-frames, a half-second closed GOP, rate-specific VBR targets, and limited-range BT.709 signalling.
+The MP4 also carries interleaved AAC-LC at 48 kHz stereo with a 384 kbps target. MPEG-TS Layer II
+and AAC carried beside H.264 in MP4/MOV are decoded, mapped through source trims and timeline
+positions, mixed/resampled, and encoded natively; gaps and sources without audio remain silent.
+Silent-only outputs need no edit list, while program audio uses a single priming trim. The native
+encoder can code nonzero mono/stereo PCM with long-window MDCT,
+quantization, Huffman emission, and packet-budget rate selection. A codec-independent sample-domain
+mixer provides deterministic placement, gain, overlap, mono/stereo mapping, linear resampling, and
+final saturation.
 
 H.264 MP4/MOV is now also an editor input. MMRecode parses the ISO-BMFF sample tables and AVC
 syntax itself, preserving exact DTS/PTS ordering and selecting keyframe/dependency windows for
@@ -530,16 +539,29 @@ protocol and a
 24-bit Unicode half-block fallback. Direct Kitty playback switches between completely uploaded
 image slots instead of blanking the visible placement between frames. Decoding and fallback
 terminal image encoding are asynchronous and use a bounded look-ahead cache, so input
-stays responsive during playback and seeking. `mmrecode edit` now embeds this exact backend beside
+stays responsive during playback and seeking. Preview YUV-to-RGB conversion also runs on a
+latest-request-wins worker; obsolete work may be dropped without slowing the project clock.
+Kitty-protocol sessions default to temporary-file transfer until the terminal explicitly proves it
+can consume POSIX shared memory. `MMRECODE_KITTY_SHM=1` retains an experimental local-only path for
+protocol development; it is never selected for SSH sessions.
+Terminal delivery uses a bounded 960×540 Kitty or 800×450 fallback proxy and exposes live
+view/decode/convert/send measurements, while export retains full project resolution. `mmrecode edit` now embeds this exact backend beside
 the shared command prompt for its first real-source edit loop; no second playback or rendering
 model was introduced. The terminal surface exists before media is imported and uses a compact
 monitor, contextual help/inspector, result area, command prompt, and graphical timeline rather than
 treating the monitor as the entire editor. The timeline combines a time ruler,
 retained/trimmed range, playhead, and codec landmarks such as MPEG-2 I-pictures and H.264 IDRs with
-keyboard/mouse scrubbing. The current-level multi-object projection and recursively mapped MMFX
-composition are implemented over one decoded preview source; complete simultaneous multi-source
-preview and multi-source audio mixing remain later bounded slices. Single-source H.264/AAC clock
-synchronization is implemented.
+keyboard/mouse scrubbing. Its thumbnail, object, and codec raster is cached independently of the
+playhead; playback only refreshes the lightweight position layer when it enters a new visible
+terminal column, while the textual time display remains exact. Newly completed thumbnails are
+collected in the background and incorporated after playback pauses instead of repeatedly rebuilding
+the timeline during transport. The current-level multi-object projection and recursively mapped MMFX
+composition now run from a project-owned playback clock. Sequential MPEG-2/H.264 placements switch
+at project cuts, gaps keep advancing over a black canvas, and scene-only projects animate without
+dummy video. Opened decoder runtimes remain cached, the next cut is pre-rolled, stale display
+frames may be dropped, and MMFX evaluates at the exact project frame. Overlapping video currently
+follows opaque composition order by selecting the topmost active source; simultaneous multi-video
+blending and multi-source audio mixing remain later bounded slices.
 
 The layout may later switch between the complete editing workspace and a full-screen monitor while
 retaining the same session, playback controller, frame cache, and playhead. Likewise, the timeline
@@ -595,6 +617,18 @@ display API's blending behavior.
 An optional WGSL/wgpu backend remains valuable for interactive preview and effects that map well to
 the GPU. It must consume the same IR and must not define MMFX semantics. Preview may use proxies or
 reduced quality; final CPU rendering never has to sacrifice quality to meet a presentation clock.
+
+The first executable boundary now records evaluated MMFX scenes as backend-neutral display lists
+and lowers isolated layers into explicit draw, transform, and composite render-graph passes. The
+scalar renderer executes that graph as the reference backend. The outer project compositor now
+describes decoded-video targets, MMFX resource frames, color conversion, composition, and delivery
+through a second explicit graph. Residency-aware frame handles keep semantic resource keys separate
+from CPU memory or opaque device storage. The first optional wgpu backend now executes positioned
+RGBA composition from this outer graph and retains uploads by stable resource key. GPU scaling,
+color conversion, direct native-surface delivery, and scene-graph lowering remain the next
+acceleration boundaries. The default terminal application already uses a non-blocking readback
+ring, because terminal graphics protocols ultimately require CPU bytes; explicit CPU-only builds
+remain available through `--no-default-features`.
 
 ### Modular authoring plugins
 
@@ -677,7 +711,12 @@ Playback may restart unsupported tracks through the optional FFmpeg bridge,
 but callers can enforce native-only decoding and completion events identify the backend actually
 used. The same Rust subset runs through baseline WebAssembly's cooperative executor. Remaining
 audio tools and conformance coverage will progressively replace the bridge;
-device handling remains application-local. No AAC or H.264 encoder is part of this step.
+device handling remains application-local. The separate AAC encoder now handles deterministic
+long-window nonzero PCM, while the native H.264 encoder and multitrack MP4 writer supply the first
+YouTube delivery path. Imported audio now enters through one container/codec adapter boundary as
+timed PCM. The timeline applies source trims, placement, mixing, and resampling without knowing
+whether that PCM came from MP4/MOV AAC or MPEG-TS Layer II, then delivery encodes the result.
+Compatible encoded-packet copying remains a separate future optimization.
 
 ### Subsequent vertical slices
 

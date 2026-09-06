@@ -1,4 +1,4 @@
-//! MPEG-4 AAC configuration, transport framing, and native decoder foundations.
+//! MPEG-4 AAC configuration, transport framing, and native codec foundations.
 //!
 //! [`AacLcDecoder`] implements the shared audio interface with native Huffman spectral decoding,
 //! inverse quantization, PNS, stereo/pulse/TNS tools, and sine/KBD synthesis. Unsupported modes
@@ -6,12 +6,14 @@
 //! codec crate.
 
 mod decoder;
+mod encoder;
 mod huffman;
 mod syntax;
 mod synthesis;
 mod tables;
 
 pub use decoder::AacLcDecoder;
+pub use encoder::{AAC_LC_PRIMING_SAMPLES, AacLcEncoder};
 
 use mmrecode_bitstream::BitReader;
 use mmrecode_core::{Error, Result};

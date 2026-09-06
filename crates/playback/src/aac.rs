@@ -193,30 +193,18 @@ impl AacPlaybackSource {
         policy: AacDecodePolicy,
     ) -> Result<Self, String> {
         let movie = IsoBmffFile::parse(file_data).map_err(|error| error.to_string())?;
-        let (track_index, track) = movie
+        let (track_index, _) = movie
             .tracks()
             .iter()
             .enumerate()
             .find(|(_, track)| track.descriptor.codec.codec_id.as_str() == "audio/aac")
             .ok_or_else(|| "ISO-BMFF file has no AAC audio track".to_owned())?;
-        let configuration = AudioSpecificConfig::parse(&track.descriptor.codec.configuration)
-            .map_err(|error| error.to_string())?;
-        validate_track_metadata(track, &configuration)?;
-        let index = build_index(track, configuration.clone())?;
-        let trim_start_samples = index.trim_start_samples;
-        let decoded_samples_per_channel = index.decoded_samples_per_channel;
+        let (index, worker) = build_worker(movie, track_index, policy)?;
         let (event_sender, events) = mpsc::channel();
         Ok(Self {
             index,
             executor,
-            worker: Arc::new(AacWorker {
-                movie,
-                track_index,
-                configuration,
-                trim_start_samples,
-                decoded_samples_per_channel,
-                policy,
-            }),
+            worker: Arc::new(worker),
             events,
             event_sender,
             active_generation: Arc::new(AtomicU64::new(0)),
@@ -283,6 +271,38 @@ impl AacPlaybackSource {
             }
         }
     }
+}
+
+fn build_worker(
+    movie: IsoBmffFile,
+    track_index: usize,
+    policy: AacDecodePolicy,
+) -> Result<(AacAudioIndex, AacWorker), String> {
+    let track = movie
+        .tracks()
+        .get(track_index)
+        .ok_or_else(|| "AAC track index is outside the parsed movie".to_owned())?;
+    let configuration = AudioSpecificConfig::parse(&track.descriptor.codec.configuration)
+        .map_err(|error| error.to_string())?;
+    validate_track_metadata(track, &configuration)?;
+    let index = build_index(track, configuration.clone())?;
+    let worker = AacWorker {
+        movie,
+        track_index,
+        configuration,
+        trim_start_samples: index.trim_start_samples,
+        decoded_samples_per_channel: index.decoded_samples_per_channel,
+        policy,
+    };
+    Ok((index, worker))
+}
+
+pub(crate) fn decode_aac_track_native(
+    movie: IsoBmffFile,
+    track_index: usize,
+) -> Result<AudioFrame, String> {
+    let (_, worker) = build_worker(movie, track_index, AacDecodePolicy::NativeOnly)?;
+    decode_native(&worker).map_err(|error| error.to_string())
 }
 
 fn validate_track_metadata(

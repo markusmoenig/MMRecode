@@ -1,0 +1,246 @@
+/*
+ * Eldiron patron credits.
+ * Active Patreon snapshot: 2026-09-06.
+ * Update the display names below when the active audience changes.
+ */
+@scene eldiron-patrons {
+    width: 960px;
+    height: 540px;
+    background: #071016f2;
+
+    @font Inter {
+        src: "builtin:inter";
+    }
+
+    /* Square, stepped framing keeps the card close to Eldiron's retro UI language. */
+    @rect frame-outer {
+        position: absolute;
+        left: 22px;
+        top: 22px;
+        width: 916px;
+        height: 496px;
+        background: #b48745;
+    }
+
+    @rect frame-inner {
+        position: absolute;
+        left: 26px;
+        top: 26px;
+        width: 908px;
+        height: 488px;
+        background: #0b1720;
+    }
+
+    @rect header-rule {
+        position: absolute;
+        left: 48px;
+        top: 67px;
+        width: 864px;
+        height: 2px;
+        background: #5e6e4d;
+    }
+
+    @text label {
+        position: absolute;
+        left: 48px;
+        top: 40px;
+        width: auto;
+        height: auto;
+        content: "ELDIRON  //  PATRON GUILD";
+        font-family: Inter;
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1;
+        color: #d8ad59;
+        white-space: nowrap;
+    }
+
+    @text edition {
+        position: absolute;
+        right: 48px;
+        top: 40px;
+        width: auto;
+        height: auto;
+        content: "HALL OF HEROES";
+        font-family: Inter;
+        font-size: 15px;
+        font-weight: 700;
+        line-height: 1;
+        text-align: end;
+        color: #769b78;
+        white-space: nowrap;
+    }
+
+    @group viewport {
+        position: absolute;
+        left: 48px;
+        top: 70px;
+        width: 864px;
+        height: 412px;
+        overflow: hidden;
+        background: #09141c;
+
+        @group credits {
+            display: column;
+            width: 100%;
+            height: auto;
+            min-height: 1px;
+            padding: 48px;
+            gap: 18px;
+            align-items: center;
+            mm-scroll-direction: block-start;
+            mm-scroll-range: cover;
+            mm-scroll-duration: 300f;
+
+            @text title {
+                width: 100%;
+                height: auto;
+                content: "THANK YOU, ADVENTURERS";
+                font-family: Inter;
+                font-size: 36px;
+                font-weight: 700;
+                line-height: 1.1;
+                text-align: center;
+                color: #ead9ae;
+                white-space: nowrap;
+            }
+
+            @text subtitle {
+                width: 100%;
+                height: auto;
+                content: "YOUR SUPPORT HELPS BUILD THE WORLD OF ELDIRON";
+                font-family: Inter;
+                font-size: 16px;
+                font-weight: 600;
+                line-height: 1.2;
+                text-align: center;
+                color: #78939a;
+                white-space: nowrap;
+            }
+
+            @rect crest-rule {
+                width: 144px;
+                height: 4px;
+                background: #b48745;
+            }
+
+            @text dragon-label {
+                width: 100%;
+                height: auto;
+                content: "[ DRAGON SLAYERS ]";
+                font-family: Inter;
+                font-size: 18px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #d36b55;
+                white-space: nowrap;
+            }
+
+            @text dragon-names {
+                width: 100%;
+                height: auto;
+                content: "Scott Hamill\nMike Plaza";
+                font-family: Inter;
+                font-size: 28px;
+                font-weight: 650;
+                line-height: 1.45;
+                text-align: center;
+                color: #ead9ae;
+            }
+
+            @text adventurer-label {
+                width: 100%;
+                height: auto;
+                content: "[ ADVENTURERS ]";
+                font-family: Inter;
+                font-size: 18px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #d8ad59;
+                white-space: nowrap;
+            }
+
+            @text adventurer-names {
+                width: 100%;
+                height: auto;
+                content: "Fnurrpants\nCharleston Marks\nElias\nThomas Osborne";
+                font-family: Inter;
+                font-size: 28px;
+                font-weight: 650;
+                line-height: 1.45;
+                text-align: center;
+                color: #ead9ae;
+            }
+
+            @text farmer-label {
+                width: 100%;
+                height: auto;
+                content: "[ FARMERS ]";
+                font-family: Inter;
+                font-size: 18px;
+                font-weight: 700;
+                line-height: 1;
+                text-align: center;
+                color: #769b78;
+                white-space: nowrap;
+            }
+
+            @text farmer-names {
+                width: 100%;
+                height: auto;
+                content: "Jonathan Pickett\nTom Carlson\nR Isted";
+                font-family: Inter;
+                font-size: 28px;
+                font-weight: 650;
+                line-height: 1.45;
+                text-align: center;
+                color: #ead9ae;
+            }
+
+            @rect closing-rule {
+                width: 144px;
+                height: 4px;
+                background: #5e6e4d;
+            }
+
+            @text thanks {
+                width: 100%;
+                height: auto;
+                content: "THE REALM GROWS WITH YOU\nELDIRON.COM";
+                font-family: Inter;
+                font-size: 20px;
+                font-weight: 700;
+                line-height: 1.45;
+                text-align: center;
+                color: #d8ad59;
+            }
+        }
+    }
+
+    @rect footer-rule {
+        position: absolute;
+        left: 48px;
+        bottom: 55px;
+        width: 864px;
+        height: 2px;
+        background: #5e6e4d;
+    }
+
+    @text footer {
+        position: absolute;
+        left: 48px;
+        bottom: 37px;
+        width: 864px;
+        height: auto;
+        content: "CREATE YOUR OWN RETRO RPG";
+        font-family: Inter;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1;
+        text-align: center;
+        color: #647a80;
+        white-space: nowrap;
+    }
+}

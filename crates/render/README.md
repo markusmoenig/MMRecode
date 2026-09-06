@@ -65,6 +65,12 @@ boundaries, resumes packet copy between them, concatenates a second source, and 
 resulting 14-frame timeline natively and with FFmpeg. Production VBV continuity, transitions,
 multi-clip audio, and progress/cancellation remain future slices.
 
+The codec-independent audio renderer accepts decoded signed-16 mono/stereo placements with exact
+timeline starts and source ranges. It performs deterministic linear resampling, mono/stereo
+mapping, gain, overlap accumulation, and one final saturation into an exact-duration output frame.
+The YouTube delivery adapter uses this path for MPEG-TS Layer II and MP4/MOV AAC carried alongside
+H.264, converting every project to 48 kHz stereo before native AAC-LC encoding.
+
 The optional `h264` feature adds a deliberately narrower lossless path. It indexes AVC samples in
 an MP4/MOV, accepts only half-open presentation ranges whose start and end are matching container
 sync samples containing IDR pictures, verifies that the selected pictures form complete contiguous
@@ -88,6 +94,56 @@ including across differing frame rates. The editor keys compositor synchronizati
 revision and hierarchy context, so an unchanged graph is not re-flattened in the playback loop.
 The MPEG-2/TS full renderer uses the same projection for nested video and MMFX objects; MMFX assets
 remain cached by reusable media identity and scale variant.
+
+Every RGBA preview and direct YUV export composition now first builds a public `CompositionGraph`.
+`FrameHandle` separates semantic resource identity from `Cpu` or opaque `Device` residency, with an
+explicit pixel/color/alpha descriptor. MMFX canvas frames, preview-size variants, and cached color
+conversions use structured `FrameResourceKey` values derived from media identity, deterministic
+source revision, local frame, dimensions, and scale mode. Graph passes make color conversion,
+positioned compositing, and preview/encoder delivery visible. `FrameResourceProvider` resolves
+handles without exposing compositor cache internals, while `CompositionBackend` owns execution.
+The current `CpuCompositionBackend` runs both RGBA preview and direct YUV delivery through this
+boundary. With the optional `wgpu` feature, `WgpuCompositionBackend` executes positioned
+source-over RGBA passes into a caller-owned RGBA/BGRA render target. It shares the host's existing
+device and queue, batches the graph into one render pass, and retains uploaded sources by the same
+stable keys without changing project or MMFX semantics.
+
+Decoded YUV conformance uses the same contract. `CompositionGraph::scale_yuv420` records the source
+and target handles, fit/fill/stretch/native placement, Lanczos3 or triangle sampling, and final
+delivery. The compatibility `scale_yuv420_to_canvas` entry point now constructs and executes that
+graph with the CPU backend, so existing renderers already cross the acceleration seam. Alternate
+hosts can provide stable media/frame keys and execute the public graph without adopting the CPU
+cache or scaling implementation.
+
+`DeviceResourceCache<T>` supplies the corresponding backend-owned lifetime policy without importing
+a graphics API into the render model. A backend can store its texture/view bundle as `T`, turn CPU
+handles into backend-labelled device handles, reuse entries by stable key, and bound retained bytes
+with deterministic LRU eviction. Resources touched in the current graph generation cannot be
+evicted; incompatible descriptors and handles belonging to another backend are rejected. Explicit
+removal, idle-generation release, clearing, and cache statistics make device lifetime observable.
+The first wgpu slice deliberately accepts an already initialized opaque target and supports RGBA
+`Composite` plus `Deliver` passes only. Both unorm compatibility targets and linear-blended sRGB
+targets are explicit. `WgpuPreviewRenderer` adds three-slot-style asynchronous output textures and
+padded CPU readback for terminal monitors: submission never waits, a full ring declines work, and
+polling returns only the newest completed frame. GPU `Scale`, `ColorConvert`, transparent project
+targets, and direct native-surface integration remain subsequent work. A native host creates the
+composition backend from its existing render state and executes the same graph used by the CPU path:
+
+```rust,ignore
+let mut backend = WgpuCompositionBackend::new(
+    &render_state.device,
+    &render_state.queue,
+    render_state.target_format,
+    256 * 1024 * 1024,
+)?;
+let mut target = WgpuRgbaTarget {
+    view: &output_view,
+    width: graph.target().descriptor.width,
+    height: graph.target().descriptor.height,
+    format: render_state.target_format,
+};
+backend.execute(&graph, &mut target, &project_compositor)?;
+```
 
 The `mmrecode` binary exposes the earlier one-clip path as `render-plan` and `render`. Those
 argument-heavy commands are development and integration-test harnesses, not the intended editor

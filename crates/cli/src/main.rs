@@ -503,8 +503,40 @@ fn execute_editor_line(
             println!("{report}");
             return Ok(false);
         }
-        mmrecode_edit::CommandOutput::FxLoadRequested { .. }
-        | mmrecode_edit::CommandOutput::SceneLinkRequested { .. }
+        mmrecode_edit::CommandOutput::FxLoadRequested { locator } => {
+            let path = resolve_existing_path(base_directory, &locator, "MMFX source")?;
+            let source = std::fs::read_to_string(&path).map_err(|error| {
+                format!("cannot read MMFX source '{}': {error}", path.display())
+            })?;
+            let scene = mmrecode_mmfx::parse_scene(&source).map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+            let intrinsic_duration = scene.intrinsic_duration_frames().map(i64::from);
+            session
+                .replace_current_mmfx_source_and_fit(
+                    mmrecode_edit::MmfxSource {
+                        source,
+                        resource_base: path.parent().map(std::path::Path::to_path_buf),
+                        linked_path: None,
+                        parameter_bindings: std::collections::BTreeMap::new(),
+                    },
+                    intrinsic_duration,
+                )
+                .map_err(|error| error.to_string())?;
+            println!(
+                "ok: loaded {}{}",
+                path.display(),
+                intrinsic_duration.map_or_else(String::new, |frames| {
+                    format!(" and fitted scene placement to {frames} frames")
+                })
+            );
+            return Ok(false);
+        }
+        mmrecode_edit::CommandOutput::SceneLinkRequested { .. }
         | mmrecode_edit::CommandOutput::SceneReloadRequested
         | mmrecode_edit::CommandOutput::SceneUnlinkRequested
         | mmrecode_edit::CommandOutput::FxSaveRequested { .. }

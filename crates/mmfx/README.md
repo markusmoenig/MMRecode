@@ -1,9 +1,11 @@
 # `mmrecode-mmfx`
 
 `mmrecode-mmfx` is MMRecode's renderer-independent scene model, strict CSS-shaped parser, and
-scalar CPU reference renderer. Source must parse and validate into typed values before any backend
-can execute it. Static text is shaped and laid out with Parley, rasterized through Swash/Zeno, and
-composited by the same linear-light backend as vector shapes.
+render-graph API. Source must parse and validate into typed values before any backend can execute
+it. Per-frame evaluation records a backend-neutral `DisplayList`, then lowers isolated layers into
+an explicit `RenderGraph`. The built-in `ScalarCpuBackend` is the reference implementation; future
+tiled/SIMD and wgpu backends consume the same graph. Static text is shaped and laid out with Parley,
+rasterized through Swash/Zeno, and composited by the same linear-light backend as vector shapes.
 
 The executable Scene 0.4 foundation supports:
 
@@ -35,6 +37,7 @@ cargo run -p mmrecode -- render-mmfx examples/mmfx/lower-third.mmfx output.png
 cargo run -p mmrecode -- render-mmfx examples/mmfx/motion-layout.mmfx frame-23.png --frame 23 --frames 60
 cargo run -p mmrecode -- render-mmfx examples/mmfx/rolling-credits.mmfx credits.png --frame 59 --frames 120
 cargo run -p mmrecode -- render-mmfx examples/mmfx/parameterized-title.mmfx title.png --set "title=Launch Day"
+cargo run -p mmrecode -- render-mmfx examples/mmfx/eldiron-patrons-static.mmfx patrons.png
 ```
 
 Example source:
@@ -98,7 +101,8 @@ link, while its starter MMFX source belongs to the generated media definition. F
 with `cd` and use contextual `edit` for the multiline editor and automatic worker preview. `fx edit`
 remains an alias. Source edits are project edits and ordinary project `save` serializes them.
 `scene load` embeds a copy of an external scene in the focused object, while `scene save as` extracts a
-copy without changing ownership. Tab and Shift-Tab move pane focus, Ctrl-S saves the containing
+copy without changing ownership. A scene with a fixed-frame animation or scroll duration fits its
+generated placement to the longest declared duration when loaded or linked. Tab and Shift-Tab move pane focus, Ctrl-S saves the containing
 project, Ctrl-Z/Ctrl-Y use project history, and Esc returns to the prompt. Parse/render errors report
 source line and column while the monitor retains its last valid frame. Run `help`, `man edit`, or
 `man scene` for the complete workflow. The `fx` namespace is reserved for future filters,
@@ -118,7 +122,12 @@ FX layers into MPEG-2/TS export, including FX-only output. It maps parent time t
 animation time, prepares source and resources once, rasterizes static scenes once, and retains a
 bounded cache of animated frame overlays.
 
-Font fallback chains, color glyphs, text decorations, media slots, named reusable styles, richer timing,
-compiler highlighting metadata, Kernel IR, tiled/SIMD CPU backends, and GPU preview are deliberately
-later slices. See the
+Scene evaluation and rendering are already separated by public `DisplayList`, `RenderGraph`,
+`RenderPass`, and `RenderBackend` contracts. `PreparedScene::render_frame` remains the convenient
+scalar entry point, while `display_list`, `render_graph`, and `render_frame_with` expose the portable
+path to alternate backends. Font fallback chains, color glyphs, text decorations, media slots,
+named reusable styles, richer timing, compiler highlighting metadata, Kernel IR, tiled/SIMD CPU
+execution, GPU scene-graph execution, and GPU-aware project frame delivery remain later slices.
+The render crate's optional wgpu backend already proves cached RGBA composition at the outer
+project-graph boundary. See the
 workspace [`mmfx-concept.md`](../../mmfx-concept.md) for the complete direction.

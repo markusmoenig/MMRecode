@@ -115,6 +115,108 @@ The corresponding editor workflow is `scene params`, `scene set title "Launch Da
 `scene reset title`. The binding is stored with the project and the source retains its reusable
 default.
 
+## Eldiron patron credits
+
+[`eldiron-patrons.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/eldiron-patrons.mmfx)
+is a practical rolling-credits scene for Eldiron videos. Its companion
+[`eldiron-patrons-static.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/eldiron-patrons-static.mmfx)
+shows the same roster as a single static card. Both use only deterministic MMFX shapes and the
+built-in font, so they remain portable when embedded in a project. The roster below is an
+active-patron snapshot from September 6, 2026; update only the three `content` lists when the
+membership changes.
+
+```css title="examples/mmfx/eldiron-patrons.mmfx (credits column)"
+@group credits {
+    display: column;
+    width: 100%;
+    height: auto;
+    min-height: 1px;
+    padding: 48px;
+    gap: 18px;
+    align-items: center;
+    mm-scroll-direction: block-start;
+    mm-scroll-range: cover;
+    mm-scroll-duration: 300f;
+
+    @text dragon-label {
+        width: 100%;
+        height: auto;
+        content: "[ DRAGON SLAYERS ]";
+        font-family: Inter;
+        font-size: 18px;
+        font-weight: 700;
+        text-align: center;
+        color: #d36b55;
+    }
+
+    @text dragon-names {
+        width: 100%;
+        height: auto;
+        content: "Scott Hamill\nMike Plaza";
+        font-family: Inter;
+        font-size: 28px;
+        font-weight: 650;
+        line-height: 1.45;
+        text-align: center;
+        color: #ead9ae;
+    }
+
+    @text adventurer-names {
+        width: 100%;
+        height: auto;
+        content: "Fnurrpants\nCharleston Marks\nElias\nThomas Osborne";
+        font-family: Inter;
+        font-size: 28px;
+        font-weight: 650;
+        line-height: 1.45;
+        text-align: center;
+        color: #ead9ae;
+    }
+
+    @text farmer-names {
+        width: 100%;
+        height: auto;
+        content: "Jonathan Pickett\nTom Carlson\nR Isted";
+        font-family: Inter;
+        font-size: 28px;
+        font-weight: 650;
+        line-height: 1.45;
+        text-align: center;
+        color: #ead9ae;
+    }
+}
+```
+
+Render a useful middle frame from a ten-second, 30 fps placement:
+
+```console
+cargo run -p mmrecode -- render-mmfx examples/mmfx/eldiron-patrons.mmfx \
+  docs/static/img/mmfx/eldiron-patrons-130.png --frame 130 --frames 300
+```
+
+![Eldiron patron credits](/img/mmfx/eldiron-patrons-130.png)
+
+The fixed `300f` scroll makes this scene intrinsically ten seconds long in a 30 fps project.
+`scene load` and `scene link` automatically fit the generated timeline object to that duration.
+The static companion deliberately declares no animation duration and therefore keeps the length
+chosen with `add scene`.
+
+The checked-in
+[`projects/eldiron-patrons/build.mmrs`](https://github.com/markusmoenig/MMRecode/blob/main/projects/eldiron-patrons/build.mmrs)
+fixture creates a `youtube-1080p30` project, loads the scroller, saves the readable project, and
+renders the complete timeline with the native `youtube-1080p` H.264/AAC exporter. After the native
+encoder optimization, the 300-frame export completed in 52 seconds on the development Mac (about
+0.19x real-time). The resulting MP4 has valid 1920x1080 H.264 High, BT.709, and 48 kHz AAC-LC
+tracks. It remains an integration fixture rather than a quality reference: inter-predicted frames
+currently show previous-position ghosts around scrolling text, while IDR frames are clean.
+
+```console
+cargo run -p mmrecode -- render-mmfx examples/mmfx/eldiron-patrons-static.mmfx \
+  docs/static/img/mmfx/eldiron-patrons-static.png
+```
+
+![Static Eldiron patron card](/img/mmfx/eldiron-patrons-static.png)
+
 ## Rolling credits with intrinsic layout
 
 This complete [`rolling-credits.mmfx`](https://github.com/markusmoenig/MMRecode/blob/main/examples/mmfx/rolling-credits.mmfx)

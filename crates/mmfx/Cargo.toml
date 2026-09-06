@@ -1,6 +1,6 @@
 [package]
 name = "mmrecode-mmfx"
-description = "Typed scene language and deterministic CPU reference renderer for MMRecode"
+description = "Typed scene language, render graph, and reference backend for MMRecode"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

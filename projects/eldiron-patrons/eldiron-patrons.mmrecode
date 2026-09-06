@@ -1,0 +1,60 @@
+{
+  "format": "mmrecode-project",
+  "version": 1,
+  "project": {
+    "name": "Eldiron Patron Credits",
+    "settings": {
+      "width": 1920,
+      "height": 1080,
+      "frame_rate": {
+        "numerator": 30,
+        "denominator": 1
+      },
+      "pixel_aspect": {
+        "numerator": 1,
+        "denominator": 1
+      },
+      "scan_mode": "progressive",
+      "color_space": "rec709",
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "base_preset": "youtube-1080p30"
+    }
+  },
+  "media": [
+    {
+      "id": "m2",
+      "name": "Patrons",
+      "kind": "scene/mmfx",
+      "time_base": {
+        "numerator": 1,
+        "denominator": 30
+      },
+      "duration": 300,
+      "origin": {
+        "kind": "generated"
+      },
+      "mmfx": {
+        "source": "/*\n * Eldiron patron credits.\n * Active Patreon snapshot: 2026-09-06.\n * Update the display names below when the active audience changes.\n */\n@scene eldiron-patrons {\n    width: 960px;\n    height: 540px;\n    background: #071016f2;\n\n    @font Inter {\n        src: \"builtin:inter\";\n    }\n\n    /* Square, stepped framing keeps the card close to Eldiron's retro UI language. */\n    @rect frame-outer {\n        position: absolute;\n        left: 22px;\n        top: 22px;\n        width: 916px;\n        height: 496px;\n        background: #b48745;\n    }\n\n    @rect frame-inner {\n        position: absolute;\n        left: 26px;\n        top: 26px;\n        width: 908px;\n        height: 488px;\n        background: #0b1720;\n    }\n\n    @rect header-rule {\n        position: absolute;\n        left: 48px;\n        top: 67px;\n        width: 864px;\n        height: 2px;\n        background: #5e6e4d;\n    }\n\n    @text label {\n        position: absolute;\n        left: 48px;\n        top: 40px;\n        width: auto;\n        height: auto;\n        content: \"ELDIRON  //  PATRON GUILD\";\n        font-family: Inter;\n        font-size: 15px;\n        font-weight: 700;\n        line-height: 1;\n        color: #d8ad59;\n        white-space: nowrap;\n    }\n\n    @text edition {\n        position: absolute;\n        right: 48px;\n        top: 40px;\n        width: auto;\n        height: auto;\n        content: \"HALL OF HEROES\";\n        font-family: Inter;\n        font-size: 15px;\n        font-weight: 700;\n        line-height: 1;\n        text-align: end;\n        color: #769b78;\n        white-space: nowrap;\n    }\n\n    @group viewport {\n        position: absolute;\n        left: 48px;\n        top: 70px;\n        width: 864px;\n        height: 412px;\n        overflow: hidden;\n        background: #09141c;\n\n        @group credits {\n            display: column;\n            width: 100%;\n            height: auto;\n            min-height: 1px;\n            padding: 48px;\n            gap: 18px;\n            align-items: center;\n            mm-scroll-direction: block-start;\n            mm-scroll-range: cover;\n            mm-scroll-duration: 300f;\n\n            @text title {\n                width: 100%;\n                height: auto;\n                content: \"THANK YOU, ADVENTURERS\";\n                font-family: Inter;\n                font-size: 36px;\n                font-weight: 700;\n                line-height: 1.1;\n                text-align: center;\n                color: #ead9ae;\n                white-space: nowrap;\n            }\n\n            @text subtitle {\n                width: 100%;\n                height: auto;\n                content: \"YOUR SUPPORT HELPS BUILD THE WORLD OF ELDIRON\";\n                font-family: Inter;\n                font-size: 16px;\n                font-weight: 600;\n                line-height: 1.2;\n                text-align: center;\n                color: #78939a;\n                white-space: nowrap;\n            }\n\n            @rect crest-rule {\n                width: 144px;\n                height: 4px;\n                background: #b48745;\n            }\n\n            @text dragon-label {\n                width: 100%;\n                height: auto;\n                content: \"[ DRAGON SLAYERS ]\";\n                font-family: Inter;\n                font-size: 18px;\n                font-weight: 700;\n                line-height: 1;\n                text-align: center;\n                color: #d36b55;\n                white-space: nowrap;\n            }\n\n            @text dragon-names {\n                width: 100%;\n                height: auto;\n                content: \"Scott Hamill\\nMike Plaza\";\n                font-family: Inter;\n                font-size: 28px;\n                font-weight: 650;\n                line-height: 1.45;\n                text-align: center;\n                color: #ead9ae;\n            }\n\n            @text adventurer-label {\n                width: 100%;\n                height: auto;\n                content: \"[ ADVENTURERS ]\";\n                font-family: Inter;\n                font-size: 18px;\n                font-weight: 700;\n                line-height: 1;\n                text-align: center;\n                color: #d8ad59;\n                white-space: nowrap;\n            }\n\n            @text adventurer-names {\n                width: 100%;\n                height: auto;\n                content: \"Fnurrpants\\nCharleston Marks\\nElias\\nThomas Osborne\";\n                font-family: Inter;\n                font-size: 28px;\n                font-weight: 650;\n                line-height: 1.45;\n                text-align: center;\n                color: #ead9ae;\n            }\n\n            @text farmer-label {\n                width: 100%;\n                height: auto;\n                content: \"[ FARMERS ]\";\n                font-family: Inter;\n                font-size: 18px;\n                font-weight: 700;\n                line-height: 1;\n                text-align: center;\n                color: #769b78;\n                white-space: nowrap;\n            }\n\n            @text farmer-names {\n                width: 100%;\n                height: auto;\n                content: \"Jonathan Pickett\\nTom Carlson\\nR Isted\";\n                font-family: Inter;\n                font-size: 28px;\n                font-weight: 650;\n                line-height: 1.45;\n                text-align: center;\n                color: #ead9ae;\n            }\n\n            @rect closing-rule {\n                width: 144px;\n                height: 4px;\n                background: #5e6e4d;\n            }\n\n            @text thanks {\n                width: 100%;\n                height: auto;\n                content: \"THE REALM GROWS WITH YOU\\nELDIRON.COM\";\n                font-family: Inter;\n                font-size: 20px;\n                font-weight: 700;\n                line-height: 1.45;\n                text-align: center;\n                color: #d8ad59;\n            }\n        }\n    }\n\n    @rect footer-rule {\n        position: absolute;\n        left: 48px;\n        bottom: 55px;\n        width: 864px;\n        height: 2px;\n        background: #5e6e4d;\n    }\n\n    @text footer {\n        position: absolute;\n        left: 48px;\n        bottom: 37px;\n        width: 864px;\n        height: auto;\n        content: \"CREATE YOUR OWN RETRO RPG\";\n        font-family: Inter;\n        font-size: 12px;\n        font-weight: 700;\n        line-height: 1;\n        text-align: center;\n        color: #647a80;\n        white-space: nowrap;\n    }\n}\n",
+        "resource_base": "/Users/markusmoenig/MMRecode/examples/mmfx"
+      }
+    }
+  ],
+  "links": [
+    {
+      "id": "l1",
+      "parent": "m1",
+      "media": "m2",
+      "alias": "Patrons",
+      "source": {
+        "start": 0,
+        "end": 300
+      },
+      "timeline": {
+        "start": 0,
+        "end": 300
+      },
+      "scale_mode": "fit"
+    }
+  ]
+}

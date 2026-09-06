@@ -8,12 +8,17 @@ Applications may synchronize it to rendered audio samples so audio remains the m
 
 Its indexed decode sources cover MPEG-2 elementary video, H.264 in ISO-BMFF, and AAC in ISO-BMFF.
 MPEG-2 and H.264 requests reconstruct bounded presentation windows. AAC indexes exact access-unit
-timing and currently reconstructs a complete short track to PCM through the shared executor. The
-caller owns video frame-cache and audio-device policy; this crate has no GUI or device dependency.
+timing and currently reconstructs a complete short track to PCM through the shared executor.
+
+`decode_audio_source` is the common ingestion boundary for timeline audio. It probes the container,
+demuxes MP4/MOV AAC-LC or MPEG-TS Layer II, reconstructs signed-16 mono/stereo PCM, and expresses its
+start relative to the first video PTS. Callers and the render mixer therefore do not dispatch on the
+original container or codec. The caller owns video frame-cache and audio-device policy; this crate
+has no GUI or device dependency.
 
 Current limits:
 
 - no incremental container packet or audio queues;
 - no device output, resampling, or clock-drift estimation;
-- AAC-LC PCM currently uses an optional native FFmpeg bridge; the Rust spectral decoder and browser
-  output are not implemented yet.
+- uncommon AAC modes may use the optional native-host FFmpeg fallback in playback; export uses the
+  native AAC-LC subset, and browser audio-device output is not implemented yet.

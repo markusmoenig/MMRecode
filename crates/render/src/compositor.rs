@@ -4,6 +4,12 @@ use image::{GrayImage, imageops::FilterType};
 use mmrecode_core::{ColorRange, Error, PixelFormat, Plane, Result, VideoFrame};
 use mmrecode_edit::VisualScaleMode;
 
+use crate::{
+    CompositionBackend, CompositionGraph, CpuCompositionBackend, FrameDelivery, FrameDescriptor,
+    FrameHandle, FrameResidency, FrameResourceKey, FrameResourceNamespace, FrameResourceProvider,
+    FrameResourceView, FrameScaleFilter, Yuv420ResourceView,
+};
+
 /// Maps one progressive planar 4:2:0 frame into an even-sized project canvas.
 ///
 /// `Fit` and `Fill` preserve coded-pixel aspect ratio, `Stretch` uses the complete canvas, and
@@ -21,15 +27,75 @@ pub fn scale_yuv420_to_canvas(
     mode: VisualScaleMode,
 ) -> Result<VideoFrame> {
     validate_frame(frame)?;
-    if canvas_width == 0
-        || canvas_height == 0
-        || !canvas_width.is_multiple_of(2)
-        || !canvas_height.is_multiple_of(2)
-    {
-        return Err(Error::Unsupported(
-            "Yuv420p8 project canvas dimensions must be positive and even".into(),
-        ));
-    }
+    validate_canvas(canvas_width, canvas_height)?;
+    let source = FrameHandle {
+        key: FrameResourceKey {
+            namespace: FrameResourceNamespace::DecodedVideo,
+            owner: 0,
+            revision: 0,
+            local_frame: frame.timing.pts.map_or(-1, |timestamp| timestamp.value),
+            width: u32::try_from(frame.width).map_err(integer_error)?,
+            height: u32::try_from(frame.height).map_err(integer_error)?,
+            variant: 0,
+        },
+        descriptor: FrameDescriptor::yuv420p8(
+            u32::try_from(frame.width).map_err(integer_error)?,
+            u32::try_from(frame.height).map_err(integer_error)?,
+            frame.color.clone(),
+        ),
+        residency: FrameResidency::Cpu,
+    };
+    let target = FrameHandle {
+        key: FrameResourceKey {
+            namespace: FrameResourceNamespace::Transient,
+            owner: 0,
+            revision: 0,
+            local_frame: source.key.local_frame,
+            width: u32::try_from(canvas_width).map_err(integer_error)?,
+            height: u32::try_from(canvas_height).map_err(integer_error)?,
+            variant: mode_key(mode),
+        },
+        descriptor: FrameDescriptor::yuv420p8(
+            u32::try_from(canvas_width).map_err(integer_error)?,
+            u32::try_from(canvas_height).map_err(integer_error)?,
+            frame.color.clone(),
+        ),
+        residency: FrameResidency::Cpu,
+    };
+    let graph = CompositionGraph::scale_yuv420(
+        source.clone(),
+        target,
+        mode,
+        FrameScaleFilter::Lanczos3,
+        FrameDelivery::Encoder,
+    )?;
+    let resources = SingleFrameResource {
+        handle: source,
+        frame,
+    };
+    let mut output = VideoFrame {
+        format: PixelFormat::Yuv420p8,
+        width: 0,
+        height: 0,
+        planes: Vec::new(),
+        timing: frame.timing,
+        color: frame.color.clone(),
+        field_order: frame.field_order,
+    };
+    CpuCompositionBackend.execute(&graph, &mut output, &resources)?;
+    Ok(output)
+}
+
+pub(crate) fn scale_yuv420_to_canvas_cpu(
+    frame: &VideoFrame,
+    canvas_width: usize,
+    canvas_height: usize,
+    mode: VisualScaleMode,
+    filter: FrameScaleFilter,
+) -> Result<VideoFrame> {
+    validate_frame(frame)?;
+    validate_canvas(canvas_width, canvas_height)?;
+    let filter = image_filter(filter);
     let (scaled_width, scaled_height) =
         scaled_dimensions(frame.width, frame.height, canvas_width, canvas_height, mode);
     let luma_black = match frame.color.range {
@@ -48,7 +114,7 @@ pub fn scale_yuv420_to_canvas(
                     &source,
                     u32::try_from(scaled_width / divisor).map_err(integer_error)?,
                     u32::try_from(scaled_height / divisor).map_err(integer_error)?,
-                    FilterType::Lanczos3,
+                    filter,
                 )
             };
         let width = canvas_width / divisor;
@@ -71,6 +137,48 @@ pub fn scale_yuv420_to_canvas(
         color: frame.color.clone(),
         field_order: frame.field_order,
     })
+}
+
+struct SingleFrameResource<'a> {
+    handle: FrameHandle,
+    frame: &'a VideoFrame,
+}
+
+impl FrameResourceProvider for SingleFrameResource<'_> {
+    fn resource(&self, handle: &FrameHandle) -> Option<FrameResourceView<'_>> {
+        (handle.key == self.handle.key).then_some(FrameResourceView::Yuv420p8(Yuv420ResourceView {
+            frame: self.frame,
+        }))
+    }
+}
+
+fn validate_canvas(canvas_width: usize, canvas_height: usize) -> Result<()> {
+    if canvas_width == 0
+        || canvas_height == 0
+        || !canvas_width.is_multiple_of(2)
+        || !canvas_height.is_multiple_of(2)
+    {
+        return Err(Error::Unsupported(
+            "Yuv420p8 project canvas dimensions must be positive and even".into(),
+        ));
+    }
+    Ok(())
+}
+
+const fn image_filter(filter: FrameScaleFilter) -> FilterType {
+    match filter {
+        FrameScaleFilter::Lanczos3 => FilterType::Lanczos3,
+        FrameScaleFilter::Triangle => FilterType::Triangle,
+    }
+}
+
+const fn mode_key(mode: VisualScaleMode) -> u32 {
+    match mode {
+        VisualScaleMode::Fill => 1,
+        VisualScaleMode::Stretch => 2,
+        VisualScaleMode::Native => 3,
+        _ => 0,
+    }
 }
 
 fn validate_frame(frame: &VideoFrame) -> Result<()> {

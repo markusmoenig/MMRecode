@@ -690,6 +690,96 @@ impl MediaProject {
         Ok(())
     }
 
+    /// Resizes the generated placement selected by `path` to an exact source duration.
+    ///
+    /// This is used when a generated scene declares an intrinsic fixed-frame animation. The
+    /// placement start is preserved, while its source range is reset to the complete generated
+    /// source. Root duration is recalculated when the placement lives directly on the project
+    /// timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error at the project root, for non-generated media, or for a non-positive or
+    /// unrepresentable duration.
+    pub fn fit_generated_placement_duration(
+        &mut self,
+        path: &MediaPath,
+        duration: i64,
+    ) -> Result<()> {
+        if duration <= 0 {
+            return Err(Error::InvalidData(
+                "generated media duration must be positive".into(),
+            ));
+        }
+        let link_id = path.current_link().ok_or_else(|| {
+            Error::Unsupported("the project root is not a generated placement".into())
+        })?;
+        let link = self
+            .links
+            .get(&link_id)
+            .cloned()
+            .ok_or_else(|| Error::InvalidData("current media link is missing".into()))?;
+        let child = self
+            .media
+            .get(&link.media_id)
+            .ok_or_else(|| Error::InvalidState("linked media disappeared".into()))?;
+        if child.origin != MediaOrigin::Generated {
+            return Err(Error::Unsupported(
+                "only generated media can adopt an intrinsic duration".into(),
+            ));
+        }
+        let child_time_base = child.time_base;
+        let parent_time_base = self
+            .media
+            .get(&link.parent_id)
+            .ok_or_else(|| Error::InvalidState("placement parent disappeared".into()))?
+            .time_base;
+        let timeline_duration = timestamp(duration, child_time_base)
+            .rescale(parent_time_base, TimestampRounding::NearestTiesAway)?;
+        if timeline_duration.value <= 0 {
+            return Err(Error::InvalidData(
+                "intrinsic duration is shorter than one parent timeline frame".into(),
+            ));
+        }
+        let timeline_end = link
+            .timeline_range
+            .start
+            .value
+            .checked_add(timeline_duration.value)
+            .ok_or_else(|| Error::InvalidData("generated placement duration overflows".into()))?;
+
+        self.media
+            .get_mut(&link.media_id)
+            .ok_or_else(|| Error::InvalidState("linked media disappeared".into()))?
+            .duration
+            .value = duration;
+        let current = self
+            .links
+            .get_mut(&link_id)
+            .ok_or_else(|| Error::InvalidState("current media link disappeared".into()))?;
+        current.source_range = time_range(0, duration, child_time_base)?;
+        current.timeline_range.end = timestamp(timeline_end, parent_time_base);
+
+        if link.parent_id == self.root_id {
+            let root_duration = self
+                .media
+                .get(&self.root_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+                .children
+                .iter()
+                .filter_map(|child_id| self.links.get(child_id))
+                .map(|child| child.timeline_range.end.value)
+                .max()
+                .unwrap_or(0);
+            self.media
+                .get_mut(&self.root_id)
+                .ok_or_else(|| Error::InvalidState("project root disappeared".into()))?
+                .duration
+                .value = root_duration;
+        }
+        Ok(())
+    }
+
     /// Places media in a parent's local timeline.
     ///
     /// # Errors
@@ -1148,6 +1238,35 @@ mod tests {
 
         assert_eq!(project.display_path(&clip_path).unwrap(), "/Clip0/Title");
         assert_eq!(project.list(&MediaPath::root()).unwrap()[0].alias, "Clip0");
+    }
+
+    #[test]
+    fn generated_placement_adopts_intrinsic_duration_and_updates_root() {
+        let mut project = project();
+        let placement = project
+            .add_generated(
+                project.root_id(),
+                MediaKind::new("scene/mmfx").unwrap(),
+                "Credits",
+                10,
+                20,
+            )
+            .unwrap();
+        let mut path = MediaPath::root();
+        path.push(placement);
+
+        project.fit_generated_placement_duration(&path, 90).unwrap();
+
+        let link = project.link(placement).unwrap();
+        assert_eq!(link.source_range.start.value, 0);
+        assert_eq!(link.source_range.end.value, 90);
+        assert_eq!(link.timeline_range.start.value, 10);
+        assert_eq!(link.timeline_range.end.value, 100);
+        assert_eq!(project.media(link.media_id).unwrap().duration.value, 90);
+        assert_eq!(
+            project.media(project.root_id()).unwrap().duration.value,
+            100
+        );
     }
 
     #[test]

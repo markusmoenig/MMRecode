@@ -205,7 +205,10 @@ a property across stops; mixed `px` and `%` values currently switch discretely a
 `mm-scroll-range: cover` moves the entire object from beyond one edge of its containing box to
 beyond the opposite edge. Layout and intrinsic measurement happen first, so an automatic-height
 column can be used directly for rolling credits. Duration uses the same exact `Nf` or `scene`
-syntax as animation.
+syntax as animation. A fixed duration such as `300f` also becomes the scene's intrinsic duration:
+when the source is loaded or linked, MMRecode automatically fits the generated timeline placement
+to the longest fixed animation or scroll. A `scene` duration remains placement-relative and cannot
+resize its own placement.
 
 ## Time and caching
 
@@ -218,5 +221,50 @@ Static scenes are rasterized once. Animated scenes are parsed and prepared once,
 frames are kept in a bounded cache. Fonts and images are loaded once per source/canvas revision;
 timeline scrubbing does not reparse source or resize resources for a cached frame.
 
+## Rendering backends
+
+Scene syntax and layout do not call a graphics API. Evaluation first records a `DisplayList` of
+resolved rectangles, image placements, shaped glyph masks, clips, and isolated layers. It then
+lowers that list to a `RenderGraph` with explicit draw, transform, and composite passes over logical
+surfaces. Its surface descriptor fixes linear-sRGB working color, premultiplied alpha, dimensions,
+transparent initialization, and normalized 16-bit reference precision. The public `RenderBackend`
+contract executes that graph; an accelerated preview backend may declare reduced physical
+precision, but it remains comparable to the reference contract.
+
+`ScalarCpuBackend` is currently the only implementation and defines reference pixels in linear
+premultiplied RGBA. `PreparedScene::render_frame` uses it automatically. Embedders can inspect
+`PreparedScene::display_list` or `PreparedScene::render_graph`, or call
+`PreparedScene::render_frame_with` with another backend. Immutable glyph masks can become GPU
+textures and named decoded images are available through a read-only resource view, so a future
+wgpu backend will not need to parse MMFX or repeat scene layout.
+
+Project composition has a second, outer graph boundary. Every current RGBA preview and YUV export
+composition creates a `CompositionGraph` whose `FrameHandle` values describe pixel format, color,
+alpha, stable resource identity, and either CPU or opaque device residency. Its passes expose MMFX
+color conversion, positioned composition, and preview or encoder delivery. The CPU path executes
+this graph through the public `CompositionBackend` contract. The compositor implements
+`FrameResourceProvider`, so `CpuCompositionBackend` can resolve RGBA or preconverted YUV views
+without accessing its cache representation. The optional wgpu project backend retains uploaded
+textures using the same media/revision/frame/size keys without changing scene files. Project-wide
+decoded-video conformance also runs as an explicit `Scale` then `Deliver` composition graph. Its
+pass records fit/fill/stretch/native placement and the Lanczos3 or triangle sampling choice.
+Existing export
+paths use the graph-backed CPU executor; stable caller-supplied keys allow a future device backend
+to cache the corresponding upload and scaled texture. The generic `DeviceResourceCache<T>` now
+defines that lifetime policy: bounded bytes, deterministic least-recently-used eviction,
+current-graph protection, descriptor/backend validation, explicit idle release, and reuse
+statistics. `T` remains owned by the concrete backend, so wgpu texture types do not leak into MMFX
+or project files. The optional `WgpuCompositionBackend` now proves that boundary with positioned
+source-over composition into an explicit unorm or sRGB RGBA/BGRA render target. It shares an
+existing device/queue, submits one render pass per graph, and reuses uploaded sources across
+executions. The terminal application enables `wgpu-preview` by default: video-plus-MMFX monitor
+frames use a three-slot asynchronous output/readback ring, the editor never blocks waiting for a
+mapped frame, and stale completions are discarded after fast playhead changes. A
+`--no-default-features` build and runtime device failures use the CPU compositor. GPU scaling/color
+conversion, transparent output semantics, scene-graph execution, and direct native-monitor
+presentation remain subsequent work.
+
 Current limits include no media slots, gradients, paths, borders, margins, animation
-delay/repetition, named reusable styles, fallback fonts, color glyphs, Kernel IR, or GPU backend.
+delay/repetition, named reusable styles, fallback fonts, color glyphs, Kernel IR, or accelerated
+scene-graph backend. The optional project-graph wgpu backend currently handles RGBA composition
+only.
